@@ -72,6 +72,17 @@ npm run dev
 
 页面检查只访问公网地址，每次连接使用校验后的 IP。系统 DNS 只返回 Fake-IP 时，会向 Google Public DNS 的 HTTPS 接口查询目标域名；该兼容方式需要能访问此 DNS 服务。
 
+### Docker 启动后端
+
+```bash
+docker build -t seo-diagnosis-agent .
+docker run --rm -p 127.0.0.1:8000:8000 -v seo-agent-data:/app/data seo-diagnosis-agent
+```
+
+镜像只包含后端，前端仍按上面的步骤启动。命名卷 `seo-agent-data` 保存容器的 SQLite 和其他运行数据。容器不会自动读取宿主机的 `.env.local`；需要真实调用时，可创建不提交的 `.env.docker`，每行写 `KEY=value`，并在 `docker run` 中增加 `--env-file .env.docker`。Docker 会把值两侧的引号当成内容，不要在这个文件的值上加引号。
+
+未配置可选数据源时，或者 Ahrefs 仍处于 pseudo 模式时，`/health` 的总体状态可能为 `degraded`；可查看其中各数据源的具体状态。
+
 ### 可选：Langfuse Cloud 运行记录
 
 在 `.env.local` 配置 `LANGFUSE_HOST`、`LANGFUSE_PUBLIC_KEY` 和 `LANGFUSE_SECRET_KEY` 后重启后端。`LANGFUSE_HOST` 使用项目所在地区的地址，例如美国区域为 `https://us.cloud.langfuse.com`；密钥从 Langfuse 项目设置获取，不要提交到 Git。未配置完整密钥时，原有 SQLite 记录仍可使用；配置了完整密钥时，Langfuse 优先于通用 `OBSERVABILITY_OTLP_ENDPOINT`。
@@ -95,7 +106,6 @@ python -m pytest tests/agent tests/agent_evals -q
 ## 目前的边界
 
 - 这是单机 MVP，SQLite 不适合多实例生产部署；真实站点的长期成功率、费用和限流仍需持续验证。
-- Dockerfile 只构建后端服务；镜像构建和容器启动尚未完成验证，建议先使用上述本地启动步骤。
 - 审批、任务、发布和监控已有基础实现，但不等于整条业务闭环已经完成真实端到端验收。
 - 批准机会不会自动创建任务。创建任务时，所有关联机会必须属于当前站点，且对应的最新“将机会加入生产”审批已通过。新发现的中低价值机会不会自动发起此审批，可通过审批接口手动创建审批；工作台尚无申请入口。
 - HTML 发布要求交付中已有经审核的 `structured_content.html`，请求中的 `html_content` 必须与其完全一致。
