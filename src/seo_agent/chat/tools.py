@@ -6,8 +6,10 @@ from urllib.parse import urlparse
 
 from src.agent.tools.base import AgentTool, RenderHint, ToolResult, ToolRuntimeContext
 from src.agent.tools.registry import ToolRegistry
+from src.core.config import settings
 from src.models.common import Capability
 from src.seo_agent.chat.presentation import build_presentation, can_render
+from src.seo_agent.workflows.site_audit import SiteAuditWorkflow
 
 
 class FacadeProtocol(Protocol):
@@ -461,13 +463,22 @@ class SeoFacadeTool(AgentTool):
 
 def build_seo_agent_registry(facade: FacadeProtocol, site: dict[str, Any]) -> ToolRegistry:
     live_capabilities = facade.live_capabilities()
-    return ToolRegistry(
+    registry = ToolRegistry(
         [
             SeoFacadeTool(facade, site, definition)
             for definition in SEO_TOOL_DEFINITIONS
             if definition.capability in live_capabilities
         ]
     )
+    if Capability.PAGE_METADATA in live_capabilities:
+        performance = (
+            registry.get("seo_page_performance")
+            if Capability.PAGE_PERFORMANCE in live_capabilities else None
+        )
+        registry.register(SiteAuditWorkflow(
+            registry.get("seo_page_metadata"), performance, settings.agent_tool_timeout
+        ))
+    return registry
 
 
 def _hostname(value: str) -> str:

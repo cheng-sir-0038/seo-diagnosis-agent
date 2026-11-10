@@ -11,6 +11,7 @@
 - **轨迹评测**：`src/agent/evals/` 检查工具调用与预期轨迹，例如页面 TDK 问题不能用 SERP 冒充页面源码，模拟数据不能作为正式诊断工具。样例见 [`tests/agent_evals/`](tests/agent_evals/)。
 - **审批工作流**：`src/seo_agent/approvals/graph.py` 使用 LangGraph 中断等待审批，并在收到决定后恢复；机会、任务、交付、发布和监控也有业务代码和接口，完整真实业务链路仍需验收。
 - **工作台和接口**：`frontend/` 提供 React 对话与结构化结果展示；FastAPI 提供 SEO Chat、SSE、审批和兼容的 `POST /api/v1/query` 查询接口。
+- **页面基础体检**：`src/seo_agent/workflows/site_audit.py` 复用页面元信息工具；用户同时要求性能检查时，再调用已配置的 PageSpeed 工具，并保留各项证据和失败状态。
 
 ## 一次诊断如何运行
 
@@ -66,6 +67,10 @@ python -m pytest tests/agent tests/agent_evals -q
 ```
 
 项目开发与诊断链路的 Agent 协作指引见 [`.agents/workflows/`](.agents/workflows/)。
+
+在工作台中可以要求“对当前页面做 SEO 基础体检”。Agent 可调用 `seo_site_audit`：先读取页面源 HTML；如果用户同时要求性能检查，再读取 PageSpeed。页面结果会以卡片展示，性能不可用或超时时会保留页面结果并标记为部分完成。单独查询 TDK 或性能仍可使用原有工具。
+
+这项体检只覆盖一个页面，不读取 robots.txt、sitemap 或 Google 收录状态。PageSpeed 需要配置凭据，耗时可能超过默认的 15 秒工具超时；可根据环境在 `.env.local` 中调整 `AGENT_TOOL_TIMEOUT`。两步检查作为一次工具调用记录，进程在调用完成前中断时，页面步骤没有独立检查点。
 
 ## 目前的边界
 

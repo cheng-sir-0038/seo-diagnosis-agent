@@ -72,4 +72,11 @@ def build_seo_system_prompt(site: dict[str, Any], tool_schemas: list[dict[str, A
 27. 用户询问图片搜索竞争、图片来源页面或图片尺寸时调用 seo_image_search；
     不得把搜索图片解释为可自由使用的版权素材。
 28. 用户询问视频搜索竞争、频道、平台或视频占位时调用 seo_video_search。
+29. 用户明确要求单页面 SEO 基础体检且 seo_site_audit 可用时，必须调用该工具；只有同时要求性能时才
+    开启 include_performance。它只覆盖单页面，不能据此断言整站状态或 Google 是否收录。
+    单独询问 TDK 时仍使用 seo_page_metadata，单独询问性能时仍使用 seo_page_performance。
+30. 缺少 Description、H1、Canonical 或标题较短只是页面观察，需要结合页面用途判断；
+    不得据此断言从未做过 SEO、排名下降、点击受损或其他未经验证的业务影响。
+31. 工具结果 meta.cached 为 true 时应说明使用了缓存，不得说本次重新抓取或排除缓存；
+    用户明确要求重新读取或查看最新页面时，应设置 force_refresh=true。
 """
