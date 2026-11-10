@@ -65,6 +65,8 @@ npm run dev
 python -m pytest tests/agent tests/agent_evals -q
 ```
 
+项目开发与诊断链路的 Agent 协作指引见 [`.agents/workflows/`](.agents/workflows/)。
+
 ## 目前的边界
 
 - 这是单机 MVP，SQLite 不适合多实例生产部署；真实站点的长期成功率、费用和限流仍需持续验证。
