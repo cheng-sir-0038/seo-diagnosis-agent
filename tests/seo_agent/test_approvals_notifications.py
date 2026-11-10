@@ -34,20 +34,20 @@ async def test_approval_is_idempotent_and_keeps_decision_history(context) -> Non
     service = ApprovalService(db)
     action = await service.create_action(
         site_id=site["id"],
-        action_type="ADD_OPPORTUNITY_TO_PRODUCTION",
+        action_type="PUBLISH_CONTENT",
         risk_level="HIGH",
-        target_type="opportunity",
-        target_id="opp-1",
+        target_type="delivery",
+        target_id="delivery-1",
         requested_payload={"task_type": "article"},
         approver_actor_id=owner["id"],
         idempotency_key="approval:1",
     )
     repeated = await service.create_action(
         site_id=site["id"],
-        action_type="ADD_OPPORTUNITY_TO_PRODUCTION",
+        action_type="PUBLISH_CONTENT",
         risk_level="HIGH",
-        target_type="opportunity",
-        target_id="opp-1",
+        target_type="delivery",
+        target_id="delivery-1",
         requested_payload={"task_type": "article"},
         approver_actor_id=owner["id"],
         idempotency_key="approval:1",
@@ -63,6 +63,21 @@ async def test_approval_is_idempotent_and_keeps_decision_history(context) -> Non
     assert decision["decision"] == "EDIT_AND_APPROVE"
     assert (await service.get_action(action["id"]))["status"] == "EDITED_AND_APPROVED"
     assert len(await service.list_decisions(action["id"])) == 1
+
+
+@pytest.mark.asyncio
+async def test_opportunity_approval_rejects_missing_target(context) -> None:
+    db, site, owner = context
+    service = ApprovalService(db)
+    action = await service.create_action(
+        site_id=site["id"], action_type="ADD_OPPORTUNITY_TO_PRODUCTION", risk_level="HIGH",
+        target_type="opportunity", target_id="missing", requested_payload={},
+        approver_actor_id=owner["id"], idempotency_key="approval:missing",
+    )
+    with pytest.raises(KeyError, match="机会不存在"):
+        await service.decide(action_id=action["id"], actor_id=owner["id"], decision="APPROVE")
+    assert (await service.get_action(action["id"]))["status"] == "WAITING_FOR_APPROVAL"
+    assert await service.list_decisions(action["id"]) == []
 
 
 @pytest.mark.asyncio

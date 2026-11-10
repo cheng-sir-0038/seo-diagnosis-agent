@@ -52,3 +52,5 @@ async def decide_approval(action_id: str, body: DecideApprovalRequest) -> dict:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

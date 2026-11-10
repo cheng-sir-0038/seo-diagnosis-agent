@@ -530,6 +530,18 @@ class OpportunityService:
         self, opportunity_id: str, *, reason: str, actor_id: str
     ) -> dict[str, Any]:
         opportunity = await self.get(opportunity_id)
+        if self.approvals is not None:
+            action = await self.database.fetch_one(
+                "SELECT id FROM approval_actions WHERE target_type = 'opportunity' "
+                "AND target_id = ? AND action_type = 'ADD_OPPORTUNITY_TO_PRODUCTION' "
+                "AND status = 'WAITING_FOR_APPROVAL' ORDER BY requested_at DESC LIMIT 1",
+                (opportunity_id,),
+            )
+            if action is not None:
+                await self.approvals.decide(
+                    action_id=action["id"], actor_id=actor_id, decision="REJECT", reason=reason
+                )
+                return await self.get(opportunity_id)
         now = _now()
         await self.database.execute(
             "UPDATE opportunities SET status = 'REJECTED', rejected_at = ?, rejection_reason = ?, "
