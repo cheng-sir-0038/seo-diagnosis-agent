@@ -30,6 +30,10 @@ def test_prompt_requires_evidence_before_claiming_business_impact() -> None:
     assert "不能据此断言整站状态或 Google 是否收录" in prompt
     assert "不得说本次重新抓取或排除缓存" in prompt
     assert "seo_site_audit 可用时，必须调用该工具" in prompt
+    assert "Canonical 指向其他 URL 可能是正常的重复页面归一" in prompt
+    assert "不能仅凭非自引用判定错误或建议修改" in prompt
+    assert "目标页面内容和站点希望使用的主地址" in prompt
+    assert "不得把待核实的差异列为优先问题或给出改写、重定向方案" in prompt
 
 
 class ExternalDataFixture:
