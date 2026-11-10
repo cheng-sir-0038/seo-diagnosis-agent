@@ -1,76 +1,34 @@
 # SEO Diagnosis Agent
 
-一个网站增长诊断 Agent MVP：用户用自然语言提出 SEO 问题，Agent 选择需要的只读工具，结合真实数据给出结论，并保存调查过程，方便继续查看或恢复。
+一个网站 SEO 诊断 Agent MVP。用户用自然语言提问，Agent 选择只读工具查询数据、整理回答，并记录运行过程。项目使用 Python、FastAPI、React 和 SQLite。
 
-项目同时包含 Agent 和 SEO 数据适配层。前者负责理解问题、选择工具和组织回答；后者负责查询、统一不同来源的数据及标明来源。技术栈为 Python、FastAPI、React、LangGraph、SQLite、SSE 和 pytest。
+## SEO Agent 工作流
 
-## 已实现的部分
-
-- **Agent Loop**：`src/agent/loop.py` 让模型根据问题和已有结果决定下一步工具调用；限制迭代次数、去重已成功的调用，并在达到预算时收束回答。
-- **运行与恢复**：`src/agent/harness/` 保存 Task、Thread、Run、事件、Checkpoint 和 Survival Summary；SEO Chat 支持服务重启后恢复、取消和 SSE 断线重连。
-- **轨迹评测**：`src/agent/evals/` 的 `evaluate_agent_run` 根据实际运行事件检查问题、工具调用、失败和终态，例如页面 TDK 问题不能用 SERP 冒充页面源码，模拟数据不能作为正式诊断工具。样例见 [`tests/agent_evals/`](tests/agent_evals/)；自动化测试使用模拟模型，不代表真实模型的选工具准确率。
-- **审批工作流**：审批接口记录决定，并同步“将机会加入生产”动作对应的机会状态。`src/seo_agent/approvals/graph.py` 的 LangGraph 中断和恢复已有独立测试，但当前审批接口尚未接入该图。机会、任务、交付、发布和监控已有业务代码和接口，完整真实业务链路仍需验收。
-- **工作台和接口**：`frontend/` 提供 React 对话与结构化结果展示；FastAPI 提供 SEO Chat、SSE、审批和兼容的 `POST /api/v1/query` 查询接口。
-- **页面基础体检**：`src/seo_agent/workflows/site_audit.py` 复用页面元信息工具；用户同时要求性能检查时，再调用已配置的 PageSpeed 工具，并保留各项证据和失败状态。
-
-## 一次诊断如何运行
+业务工作流目录是 [`src/seo_agent/workflows/`](src/seo_agent/workflows/)，目前有一个单页面体检工作流 [`site_audit.py`](src/seo_agent/workflows/site_audit.py)，以 `seo_site_audit` 工具提供：
 
 ```text
-React 工作台 / API
-        ↓
-SEO Chat：站点上下文 + Agent Loop
-        ↓  选择只读工具，必要时继续查询
-DataFacade / Provider Router
-        ↓
-页面 HTML、Serper、DataForSEO、PageSpeed 等数据来源
-        ↓
-SSE 返回过程和结论；SQLite 保存事件与检查点
+seo_site_audit
+  ├─ seo_page_metadata：读取页面源 HTML 和元信息
+  └─ seo_page_performance：用户要求性能检查时调用 PageSpeed
 ```
 
-长期业务的审批决定通过审批接口记录；LangGraph 审批图目前只做过独立验证，尚未接入该接口。当前 Chat 工具只读，不会自动修改网站或发布内容。
+工具在 [`src/seo_agent/chat/tools.py`](src/seo_agent/chat/tools.py) 注册，由 Agent 根据问题决定是否调用。性能检查不可用或超时时，会保留页面结果并标记为部分完成。运行事件和检查点保存在 SQLite，支持恢复；运行过程可以在工作台查看，也可以通过 Langfuse 查看模型输入、工具调用及实际执行的子步骤。
 
-| 数据来源 | 当前状态 |
-| --- | --- |
-| 页面源 HTML | 可直接读取；不执行页面 JavaScript |
-| Serper | 配置 Key 后提供 Google 搜索结果及相关搜索能力 |
-| DataForSEO | 配置凭证后提供关键词、SERP、外链和竞品等数据；未配置时兼容查询可进入 pseudo 模式 |
-| PageSpeed | 配置 Key 后提供页面性能诊断 |
-| Ahrefs | 当前为 pseudo 模式，不进入正式 SEO Chat 诊断 |
-
-正式 SEO Chat 只使用 live 工具；pseudo 结果适用于适配层和测试，不应当作真实数据。Provider 的实际可用性取决于凭证、权限和第三方服务状态。
+数据来源包括页面 HTML、Serper、DataForSEO 和 PageSpeed；后面三者需要配置对应凭据。页面读取不执行 JavaScript。正式 SEO Chat 只使用 live 工具，Ahrefs 当前仅为 pseudo 模式，不进入正式诊断。工具只读，不会自动修改网站或发布内容。
 
 ## 本地启动
 
-需要 Python 3.11+、Node.js 20.19+ 或 22.12+，以及 npm。macOS / Linux 可以在仓库根目录运行一条命令；首次运行会安装依赖：
+需要 Python 3.11+、Node.js 20.19+ 或 22.12+，以及 npm。在本地 `.env.local` 配置 `DEEPSEEK_API_KEY`，其他数据源按需配置；配置项见 [`.env.example`](.env.example)。不要将密钥提交到 Git。
+
+macOS / Linux 在仓库根目录运行：
 
 ```bash
 sh start.sh
 ```
 
-脚本复用已有虚拟环境和 `frontend/node_modules`。依赖发生变化时，可手动重新运行 `npm ci --prefix frontend`。
+访问 `http://localhost:5173`，API 文档位于 `http://localhost:8000/docs`。脚本会复用已有虚拟环境和前端依赖；前端依赖变化时，可运行 `npm ci --prefix frontend`。
 
-也可以分开启动。后端从仓库根目录运行：
-
-```bash
-python3.11 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-uvicorn src.server:app --reload
-```
-
-前端另开一个终端：
-
-```bash
-cd frontend
-npm ci
-npm run dev
-```
-
-访问 `http://localhost:5173`；API 文档位于 `http://localhost:8000/docs`。SEO Chat 需要在不会提交的 `.env.local` 中配置 `DEEPSEEK_API_KEY`；按需配置 `SERPER_API_KEY`、`DATAFORSEO_LOGIN`、`DATAFORSEO_API_KEY` 和 `PAGESPEED_API_KEY`。完整配置项见 [`.env.example`](.env.example)，其中示例值需要替换或留空。
-
-默认只在本机启动，浏览器请求仅允许来自本机前端。API 没有登录或鉴权，不要直接暴露到局域网或公网；Docker 使用时应将端口绑定到本机，例如 `-p 127.0.0.1:8000:8000`。本项目尚不提供安全的多人远程部署方案。
-
-页面检查只访问公网地址，每次连接使用校验后的 IP。系统 DNS 只返回 Fake-IP 时，会向 Google Public DNS 的 HTTPS 接口查询目标域名；该兼容方式需要能访问此 DNS 服务。
+API 没有登录或鉴权，默认仅供本机使用，不要直接暴露到局域网或公网。
 
 ### Docker 启动后端
 
@@ -79,37 +37,37 @@ docker build -t seo-diagnosis-agent .
 docker run --rm -p 127.0.0.1:8000:8000 -v seo-agent-data:/app/data seo-diagnosis-agent
 ```
 
-镜像只包含后端，前端仍按上面的步骤启动。命名卷 `seo-agent-data` 保存容器的 SQLite 和其他运行数据。容器不会自动读取宿主机的 `.env.local`；需要真实调用时，可创建不提交的 `.env.docker`，每行写 `KEY=value`，并在 `docker run` 中增加 `--env-file .env.docker`。Docker 会把值两侧的引号当成内容，不要在这个文件的值上加引号。
+镜像只包含后端，`seo-agent-data` 卷保存运行数据。容器不会自动读取宿主机的 `.env.local`：需要真实调用时，可创建不提交的 `.env.docker`，每行写 `KEY=value`（值不要加引号），并给 `docker run` 添加 `--env-file .env.docker`。
 
-未配置可选数据源时，或者 Ahrefs 仍处于 pseudo 模式时，`/health` 的总体状态可能为 `degraded`；可查看其中各数据源的具体状态。
-
-### 可选：Langfuse Cloud 运行记录
-
-在 `.env.local` 配置 `LANGFUSE_HOST`、`LANGFUSE_PUBLIC_KEY` 和 `LANGFUSE_SECRET_KEY` 后重启后端。`LANGFUSE_HOST` 使用项目所在地区的地址，例如美国区域为 `https://us.cloud.langfuse.com`；密钥从 Langfuse 项目设置获取，不要提交到 Git。未配置完整密钥时，原有 SQLite 记录仍可使用；配置了完整密钥时，Langfuse 优先于通用 `OBSERVABILITY_OTLP_ENDPOINT`。
-
-云端记录 Agent 每轮的模型输入消息、可见输出、工具选择、工具输入和结果，以及工具执行或复用、结束原因、状态、耗时和模型返回的 Token 用量。页面体检展开为实际执行的页面元信息和可选性能检查子步骤。模型上下文和工具结果可能包含站点及业务数据，会发送到所配置的 Langfuse 项目；常见凭据字段和密钥格式会被脱敏，但无法保证识别所有敏感内容。单个文本字段超过 50,000 字符、列表或对象超过 100 项、嵌套超过 12 层时会被截断。模型的内部推理内容不在记录中。
-
-模型没有返回用量时不会填成零；费用需要 Langfuse 正确识别模型和价格后才能估算。上传在后台进行，记录开启状态不代表云端已成功接收。关闭程序过快或网络故障时，云端可能缺少记录，本地 SQLite 仍是运行记录的来源；启用前的旧记录不会自动回填。本地观测数据库写入失败时，本次 Agent 运行会返回失败状态，而不是一直等待。
-
-本地测试可运行：
+前端另开终端启动：
 
 ```bash
-python -m pytest tests/agent tests/agent_evals -q
+cd frontend
+npm ci
+npm run dev
 ```
 
-项目开发与诊断链路的 Agent 协作指引见 [`.agents/workflows/`](.agents/workflows/)。
+未配置可选数据源或 Ahrefs 仍为 pseudo 模式时，`/health` 的总体状态可能为 `degraded`，可查看各数据源状态。
 
-在工作台中可以要求“对当前页面做 SEO 基础体检”。Agent 可调用 `seo_site_audit`：先读取页面源 HTML；如果用户同时要求性能检查，再读取 PageSpeed。页面结果会以卡片展示，性能不可用或超时时会保留页面结果并标记为部分完成。单独查询 TDK 或性能仍可使用原有工具。
+### 可选：Langfuse Cloud
 
-这项体检只覆盖一个页面，不读取 robots.txt、sitemap 或 Google 收录状态。PageSpeed 需要配置凭据，耗时可能超过默认的 15 秒工具超时；可根据环境在 `.env.local` 中调整 `AGENT_TOOL_TIMEOUT`。对 Agent 来说体检仍是一次工具调用；观测记录会展示实际执行的内部步骤，但进程在调用完成前中断时，页面步骤没有独立检查点。
+在 `.env.local` 中配置 `LANGFUSE_HOST`、`LANGFUSE_PUBLIC_KEY` 和 `LANGFUSE_SECRET_KEY` 并重启后端。Host 需对应项目所在区域；未配置时仍使用本地 SQLite 记录。
+
+云端记录每轮模型输入（包括用户问题和系统提示词）、可见回答、工具选择及输入输出、执行或复用、结束原因、状态、耗时和模型返回的 Token 用量。`seo_site_audit` 还会展示实际执行的子工具。模型内部推理不在记录中。
+
+记录可能包含站点和业务数据并发送到云端；常见凭据会脱敏，但不能保证识别所有敏感内容，超长内容会被截断。上传在后台进行，网络故障或程序过早关闭可能导致云端缺少记录，启用前的旧记录不会自动回填。
 
 ## 目前的边界
 
-- 这是单机 MVP，SQLite 不适合多实例生产部署；真实站点的长期成功率、费用和限流仍需持续验证。
-- 审批、任务、发布和监控已有基础实现，但不等于整条业务闭环已经完成真实端到端验收。
-- 批准机会不会自动创建任务。创建任务时，所有关联机会必须属于当前站点，且对应的最新“将机会加入生产”审批已通过。新发现的中低价值机会不会自动发起此审批，可通过审批接口手动创建审批；工作台尚无申请入口。
-- HTML 发布要求交付中已有经审核的 `structured_content.html`，请求中的 `html_content` 必须与其完全一致。
-- PRD 生成、交付审核等结构化任务的 DeepSeek 请求关闭 thinking，以支持工具调用；SEO Chat 保持模型默认模式。
-- [seo-audit-plugin](https://github.com/cheng-sir-0038/seo-audit-plugin) 是独立的只读 SEO 插件；当前仓库尚未接入该插件的 MCP，两个项目不能描述为已联通。独立 Agent 尚未实现 GSC 或 GA4 数据源，插件的 OAuth 凭据复制到本仓库也不会生效。
+- 页面体检只检查当前站点的一个公网页面，不检查 robots.txt、sitemap 或 Google 收录。PageSpeed 可能超过默认超时，可通过 `AGENT_TOOL_TIMEOUT` 调整。
+- 审批、任务、发布和监控已有基础实现，但完整业务链路尚未完成真实端到端验收。[LangGraph 审批图](src/seo_agent/approvals/graph.py)已独立测试，尚未接入审批接口。
+- 创建任务时，所有关联机会必须属于当前站点，且最新的“将机会加入生产”审批已通过。中低价值机会不会自动发起审批，可通过审批接口手动创建，工作台尚无申请入口。HTML 发布要求提交内容与已审核内容一致。
+- 这是单机 MVP，SQLite 不适合多实例生产部署。[seo-audit-plugin](https://github.com/cheng-sir-0038/seo-audit-plugin) 是独立项目，本仓库尚未接入其 MCP，也不支持 GSC 或 GA4 数据源。
+
+## 测试
+
+```bash
+.venv/bin/python -m pytest tests/agent tests/agent_evals tests/seo_agent/test_site_audit_workflow.py -q
+```
 
 本项目采用 [MIT 许可证](LICENSE)。
