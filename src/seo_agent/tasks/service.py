@@ -406,6 +406,8 @@ class TaskDeliveryService:
         )
         if delivery is None:
             raise KeyError(f"交付不存在: {delivery_id}")
+        if status == "ACCEPTED" and (failed_items or missing_items):
+            status = "REVISION_REQUIRED"
         review_id = _id("review")
         now = _now()
         await self.database.execute(

@@ -83,6 +83,68 @@ def sample_prd() -> TaskPrdContent:
 
 
 @pytest.mark.asyncio
+async def test_prd_api_preserves_validated_content(context, monkeypatch) -> None:
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+
+    from src.api.routes import seo_agent_tasks
+
+    db, site, owner, _, opportunity_ids, tmp_path = context
+    service = TaskDeliveryService(db, artifact_root=tmp_path / "artifacts")
+    task = await service.create_task(
+        site_id=site["id"], title="Guide", task_type="ARTICLE", priority="HIGH",
+        opportunity_ids=[opportunity_ids[0]], owner_actor_id=owner["id"],
+    )
+    monkeypatch.setattr(seo_agent_tasks, "task_delivery_service", service)
+    app = FastAPI()
+    app.include_router(seo_agent_tasks.router)
+    payload = {
+        "title": "PRD", "content": sample_prd().model_dump(),
+        "created_by_actor_id": owner["id"],
+    }
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        first = await client.post(f"/seo-agent/tasks/{task['id']}/prd-versions", json=payload)
+        assert first.status_code == 201
+        assert first.json()["version_no"] == 1
+        second = await client.post(
+            f"/seo-agent/tasks/{task['id']}/prd-versions",
+            json={**payload, "source_version_id": first.json()["id"]},
+        )
+        assert second.status_code == 201
+        assert second.json()["source_version_id"] == first.json()["id"]
+        invalid = await client.post(
+            f"/seo-agent/tasks/{task['id']}/prd-versions",
+            json={**payload, "content": {"background": "incomplete"}},
+        )
+        assert invalid.status_code == 422
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("problem", ["failed_items", "missing_items"])
+async def test_review_with_unmet_criteria_cannot_accept_delivery(context, problem: str) -> None:
+    db, site, owner, executor, opportunity_ids, tmp_path = context
+    service = TaskDeliveryService(db, artifact_root=tmp_path / "artifacts")
+    task = await service.create_task(
+        site_id=site["id"], title="Guide", task_type="ARTICLE", priority="HIGH",
+        opportunity_ids=[opportunity_ids[0]], owner_actor_id=owner["id"],
+    )
+    prd = await service.create_prd_version(
+        task_id=task["id"], title="PRD", content=sample_prd(), created_by_actor_id=owner["id"]
+    )
+    delivery = await service.submit_delivery(
+        task_id=task["id"], prd_version_id=prd["id"], title="Draft", summary="ready",
+        structured_content={"html": "<h1>Draft</h1>"}, submitted_by_actor_id=executor["id"],
+    )
+    review = await service.review_delivery(
+        delivery_id=delivery["id"], prd_version_id=prd["id"], reviewer_actor_id=owner["id"],
+        status="ACCEPTED", score=95, **{problem: [{"item": "缺少必要证据"}]},
+    )
+    assert review["status"] == "REVISION_REQUIRED"
+    assert await db.fetch_value("SELECT status FROM deliveries WHERE id = ?", (delivery["id"],)) == "REVISION_REQUIRED"
+    assert (await service.get_task(task["id"]))["status"] == "REVISION_REQUIRED"
+
+
+@pytest.mark.asyncio
 async def test_task_rejects_pending_opportunity_without_creating_records(context) -> None:
     db, site, owner, _, opportunity_ids, _ = context
     opportunity_id = opportunity_ids[0]

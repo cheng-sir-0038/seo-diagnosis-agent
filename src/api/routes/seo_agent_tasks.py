@@ -86,7 +86,9 @@ async def get_task_detail(task_id: str) -> dict:
 
 @router.post("/{task_id}/prd-versions", status_code=201)
 async def create_prd(task_id: str, body: CreatePrdRequest) -> dict:
-    return await task_delivery_service.create_prd_version(task_id=task_id, **body.model_dump())
+    return await task_delivery_service.create_prd_version(
+        task_id=task_id, content=body.content, **body.model_dump(exclude={"content"})
+    )
 
 
 @router.post("/prd-versions/{prd_version_id}/artifacts", status_code=201)
