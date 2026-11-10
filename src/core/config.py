@@ -169,6 +169,9 @@ class Settings(BaseSettings):
     observability_jsonl_enabled: bool = False
     observability_jsonl_path: Path = Path("data/observability/events.jsonl")
     observability_otlp_endpoint: str = ""
+    langfuse_host: str = "https://cloud.langfuse.com"
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
 
     # ---- 日志 ----
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"

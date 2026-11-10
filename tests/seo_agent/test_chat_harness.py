@@ -328,9 +328,9 @@ async def test_durable_chat_api_exposes_task_and_run_status(tmp_path: Path, monk
     monkeypatch.setattr(
         route,
         "build_seo_agent_registry",
-        lambda _facade, site_data: __import__(
+        lambda _facade, site_data, **kwargs: __import__(
             "src.seo_agent.chat.tools", fromlist=["build_seo_agent_registry"]
-        ).build_seo_agent_registry(LiveFacade(), site_data),
+        ).build_seo_agent_registry(LiveFacade(), site_data, **kwargs),
     )
     try:
         transport = ASGITransport(app=app)

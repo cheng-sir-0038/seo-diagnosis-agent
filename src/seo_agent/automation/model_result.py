@@ -4,6 +4,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+def model_provider_name(model: Any) -> str:
+    if getattr(model, "_llm_type", None) == "chat-deepseek":
+        return "deepseek"
+    return str(getattr(model, "provider_name", model.__class__.__name__)).lower()
+
+
 @dataclass(slots=True)
 class StructuredInvocationResult:
     parsed: Any
@@ -56,30 +62,29 @@ def _extract_usage(raw: Any) -> dict[str, int]:
     usage = dict(getattr(raw, "usage_metadata", None) or {})
     response_metadata = dict(getattr(raw, "response_metadata", None) or {})
     token_usage = dict(response_metadata.get("token_usage") or {})
+    if not usage and not token_usage:
+        return {}
     input_details = dict(usage.get("input_token_details") or {})
     output_details = dict(usage.get("output_token_details") or {})
-    input_tokens = int(usage.get("input_tokens") or token_usage.get("prompt_tokens") or 0)
-    output_tokens = int(usage.get("output_tokens") or token_usage.get("completion_tokens") or 0)
-    total_tokens = int(
-        usage.get("total_tokens")
-        or token_usage.get("total_tokens")
-        or (input_tokens + output_tokens)
-    )
-    cached_tokens = int(
-        input_details.get("cache_read") or token_usage.get("prompt_cache_hit_tokens") or 0
-    )
-    reasoning_tokens = int(
-        output_details.get("reasoning")
-        or dict(token_usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
-        or 0
-    )
-    return {
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "total_tokens": total_tokens,
-        "cached_tokens": cached_tokens,
-        "reasoning_tokens": reasoning_tokens,
+    candidates = {
+        "input_tokens": (usage.get("input_tokens"), token_usage.get("prompt_tokens")),
+        "output_tokens": (usage.get("output_tokens"), token_usage.get("completion_tokens")),
+        "total_tokens": (usage.get("total_tokens"), token_usage.get("total_tokens")),
+        "cached_tokens": (
+            input_details.get("cache_read"), token_usage.get("prompt_cache_hit_tokens")
+        ),
+        "reasoning_tokens": (
+            output_details.get("reasoning"),
+            dict(token_usage.get("completion_tokens_details") or {}).get("reasoning_tokens"),
+        ),
     }
+    counts = {
+        key: int(next(value for value in values if value is not None))
+        for key, values in candidates.items() if any(value is not None for value in values)
+    }
+    if "total_tokens" not in counts and "input_tokens" in counts and "output_tokens" in counts:
+        counts["total_tokens"] = counts["input_tokens"] + counts["output_tokens"]
+    return counts
 
 
 def _extract_finish_reason(raw: Any) -> str | None:

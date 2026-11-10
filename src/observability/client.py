@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from src.observability.context import reset_current_context, set_current_context
@@ -21,8 +22,10 @@ from src.observability.models import (
     Status,
 )
 from src.observability.otel_ids import new_span_id_hex, new_trace_id_hex
-from src.observability.sanitizer import sanitize_payload, sanitized_json
+from src.observability.sanitizer import observation_json, sanitize_payload, sanitized_json
 from src.observability.storage import ObservabilityDatabase
+
+logger = logging.getLogger(__name__)
 
 
 def _id(prefix: str) -> str:
@@ -50,6 +53,8 @@ def _event_for_status(prefix: str, status: Status) -> str:
         return f"{prefix}.completed"
     if status == Status.CANCELLED:
         return f"{prefix}.cancelled"
+    if status == Status.INTERRUPTED:
+        return f"{prefix}.interrupted"
     return f"{prefix}.failed"
 
 
@@ -225,6 +230,7 @@ class ObservabilityClient:
         output_tokens: int | None = None,
         reasoning_tokens: int | None = None,
         cached_tokens: int | None = None,
+        total_tokens: int | None = None,
         estimated_cost: float | None = None,
         latency_ms: float | None = None,
         time_to_first_token_ms: float | None = None,
@@ -238,8 +244,10 @@ class ObservabilityClient:
         output_summary: Any = None,
     ) -> dict[str, Any]:
         call_id = _id("modelcall")
-        now = _now()
-        total_tokens = sum(value or 0 for value in (input_tokens, output_tokens, reasoning_tokens))
+        completed_at = datetime.now(UTC)
+        started_at = completed_at - timedelta(milliseconds=latency_ms or 0)
+        if total_tokens is None and input_tokens is not None and output_tokens is not None:
+            total_tokens = input_tokens + output_tokens
         await self.database.execute(
             "INSERT INTO obs_model_calls(id, trace_id, run_id, span_id, provider, model, "
             "operation, prompt_key, prompt_version, prompt_version_id, evaluation_case_id, "
@@ -276,25 +284,26 @@ class ObservabilityClient:
                 status.value,
                 error_code,
                 error_message,
-                sanitized_json(input_summary or {}),
-                sanitized_json(output_summary or {}),
-                now,
-                now,
+                observation_json(input_summary or {}),
+                observation_json(output_summary or {}),
+                started_at.isoformat(),
+                completed_at.isoformat(),
             ),
         )
         row = await self.database.fetch_one(
             "SELECT * FROM obs_model_calls WHERE id = ?", (call_id,)
         )
         assert row is not None
-        await self.record_metric(
-            metric_name="model.tokens.total",
-            value=float(total_tokens),
-            unit="tokens",
-            trace_id=trace_id,
-            run_id=run_id,
-            span_id=span_id,
-            dimensions={"provider": provider, "model": model, "operation": operation},
-        )
+        if total_tokens is not None:
+            await self.record_metric(
+                metric_name="model.tokens.total",
+                value=float(total_tokens),
+                unit="tokens",
+                trace_id=trace_id,
+                run_id=run_id,
+                span_id=span_id,
+                dimensions={"provider": provider, "model": model, "operation": operation},
+            )
         if latency_ms is not None:
             await self.record_metric(
                 metric_name="model.latency_ms",
@@ -329,7 +338,8 @@ class ObservabilityClient:
         error_message: str | None = None,
     ) -> dict[str, Any]:
         row_id = _id("toolcall")
-        now = _now()
+        completed_at = datetime.now(UTC)
+        started_at = completed_at - timedelta(milliseconds=latency_ms or 0)
         await self.database.execute(
             "INSERT INTO obs_tool_calls(id, trace_id, run_id, span_id, tool_call_id, tool_name, "
             "adapter_key, operation, arguments_json, result_summary_json, status, retry_count, "
@@ -345,8 +355,8 @@ class ObservabilityClient:
                 tool_name,
                 adapter_key,
                 operation,
-                sanitized_json(arguments or {}),
-                sanitized_json(result_summary or {}),
+                observation_json(arguments or {}),
+                observation_json(result_summary or {}),
                 status.value,
                 retry_count,
                 timeout_seconds,
@@ -354,8 +364,8 @@ class ObservabilityClient:
                 external_request_id,
                 error_code,
                 error_message,
-                now,
-                now,
+                started_at.isoformat(),
+                completed_at.isoformat(),
             ),
         )
         row = await self.database.fetch_one("SELECT * FROM obs_tool_calls WHERE id = ?", (row_id,))
@@ -673,14 +683,29 @@ class ObservabilityClient:
     async def _export(self, entity_type: str, payload: dict[str, Any]) -> None:
         if not self.exporters:
             return
+        json_fields = {
+            key: value for key, value in payload.items()
+            if key.endswith("_json") and isinstance(value, str)
+        }
+        safe_payload = sanitize_payload({
+            key: value for key, value in payload.items() if key not in json_fields
+        })
+        for key, value in json_fields.items():
+            try:
+                safe_payload[key] = observation_json(json.loads(value))
+            except (TypeError, ValueError):
+                safe_payload[key] = "{}"
         envelope = ExportEnvelope(
             entity_type=entity_type,
             project_key=self.project_key,
             emitted_at=_now(),
-            payload=sanitize_payload(payload),
+            payload=safe_payload,
         )
         for exporter in self.exporters:
-            await exporter.export(envelope)
+            try:
+                await exporter.export(envelope)
+            except Exception as exc:
+                logger.warning("Observability export failed: %s", type(exc).__name__)
 
 
 @dataclass
@@ -694,6 +719,8 @@ class TraceScope:
     trace_id: str = field(default_factory=lambda: _id("trace"))
     otel_trace_id: str = field(default_factory=new_trace_id_hex)
     otel_root_span_id: str = field(default_factory=new_span_id_hex)
+    status_override: Status | None = field(default=None, init=False)
+    output_data: Any = field(default=None, init=False)
     _started_perf: float = field(default=0.0, init=False)
     _token: Any = field(default=None, init=False)
 
@@ -711,7 +738,7 @@ class TraceScope:
                 self.operation_name,
                 self.session_id,
                 self.user_id,
-                sanitized_json(self.input_data or {}),
+                observation_json(self.input_data or {}),
                 self.otel_trace_id,
                 self.otel_root_span_id,
                 sanitized_json(self.metadata),
@@ -729,18 +756,20 @@ class TraceScope:
         return self
 
     async def __aexit__(self, exc_type: Any, exc: BaseException | None, tb: Any) -> bool:
-        status = _status_for_exception(exc)
+        status = self.status_override or _status_for_exception(exc)
         duration = _duration_ms(self._started_perf)
         now = _now()
         await self.client.database.execute(
             "UPDATE obs_traces SET status = ?, error_code = ?, error_message = ?, "
-            "completed_at = ?, duration_ms = ? WHERE id = ?",
+            "completed_at = ?, duration_ms = ?, metadata_json = ?, output_json = ? WHERE id = ?",
             (
                 status.value,
                 type(exc).__name__ if exc else None,
                 str(exc)[:2000] if exc else None,
                 now,
                 duration,
+                sanitized_json(self.metadata),
+                observation_json(self.output_data or {}),
                 self.trace_id,
             ),
         )
@@ -821,6 +850,7 @@ class RunScope:
     model_name: str | None
     metadata: dict[str, Any]
     run_id: str = field(default_factory=lambda: _id("run"))
+    status_override: Status | None = field(default=None, init=False)
     _started_perf: float = field(default=0.0, init=False)
     _token: Any = field(default=None, init=False)
 
@@ -859,7 +889,7 @@ class RunScope:
         return self
 
     async def __aexit__(self, exc_type: Any, exc: BaseException | None, tb: Any) -> bool:
-        status = _status_for_exception(exc)
+        status = self.status_override or _status_for_exception(exc)
         duration = _duration_ms(self._started_perf)
         await self.client.database.execute(
             "UPDATE obs_runs SET status = ?, error_code = ?, error_message = ?, completed_at = ?, "
@@ -932,6 +962,7 @@ class SpanScope:
     input_data: Any
     metadata: dict[str, Any]
     span_id: str = field(default_factory=lambda: _id("span"))
+    output_data: Any = field(default=None, init=False)
     _started_perf: float = field(default=0.0, init=False)
     _token: Any = field(default=None, init=False)
     _captured_error: tuple[str, str] | None = field(default=None, init=False)
@@ -951,7 +982,7 @@ class SpanScope:
                 self.kind.value,
                 self.component_name,
                 self.operation_name,
-                sanitized_json(self.input_data or {}),
+                observation_json(self.input_data or {}),
                 sanitized_json(self.metadata),
                 _now(),
             ),
@@ -972,7 +1003,10 @@ class SpanScope:
         effective_error = exc or (
             RuntimeError(self._captured_error[1]) if self._captured_error is not None else None
         )
-        status = Status.COMPLETED if effective_error is None else Status.FAILED
+        status = (
+            _status_for_exception(exc) if exc is not None else
+            Status.FAILED if self._captured_error is not None else Status.COMPLETED
+        )
         duration = _duration_ms(self._started_perf)
         error_code = (
             type(exc).__name__
@@ -982,14 +1016,17 @@ class SpanScope:
         error_message = str(effective_error)[:2000] if effective_error is not None else None
         await self.client.database.execute(
             "UPDATE obs_spans SET status = ?, error_code = ?, error_message = ?, completed_at = ?, "
-            "duration_ms = ? WHERE id = ?",
-            (status.value, error_code, error_message, _now(), duration, self.span_id),
+            "duration_ms = ?, output_json = ? WHERE id = ?",
+            (
+                status.value, error_code, error_message, _now(), duration,
+                observation_json(self.output_data or {}), self.span_id,
+            ),
         )
         await self.metric("span.duration_ms", duration, unit="ms")
         await self.event(
-            "span.completed" if status == Status.COMPLETED else "span.failed",
+            _event_for_status("span", status),
             {"duration_ms": duration, "status": status.value},
-            severity=Severity.INFO if status == Status.COMPLETED else Severity.ERROR,
+            severity=Severity.INFO if status != Status.FAILED else Severity.ERROR,
         )
         row = await self.client.database.fetch_one(
             "SELECT * FROM obs_spans WHERE id = ?", (self.span_id,)

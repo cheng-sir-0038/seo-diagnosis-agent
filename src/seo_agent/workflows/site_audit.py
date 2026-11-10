@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import asyncio
 import time
 from typing import Any
 
+from src.agent.observability import run_observed_tool
 from src.agent.tools.base import AgentTool, ToolProtocol, ToolResult, ToolRuntimeContext
 from src.core.exceptions import InternalAdapterError
+from src.observability.client import ObservabilityClient
 from src.seo_presentation.contracts import base_contract
 
 
@@ -32,11 +33,13 @@ class SiteAuditWorkflow(AgentTool):
     }
 
     def __init__(
-        self, page: ToolProtocol, performance: ToolProtocol | None, timeout: float
+        self, page: ToolProtocol, performance: ToolProtocol | None, timeout: float,
+        *, observability: ObservabilityClient | None = None,
     ) -> None:
         self.page = page
         self.performance = performance
         self.timeout = timeout
+        self.observability = observability
 
     async def execute(
         self, arguments: dict[str, Any], runtime: ToolRuntimeContext | None = None
@@ -53,7 +56,9 @@ class SiteAuditWorkflow(AgentTool):
 
         started = time.monotonic()
         page_args = {key: arguments[key] for key in ("url", "force_refresh") if key in arguments}
-        page_result = await self.page.execute(page_args, runtime=runtime)
+        page_result = await run_observed_tool(
+            self.observability, self.page, page_args, runtime=runtime, component_name="page_html"
+        )
         if not page_result.success:
             return page_result
         page = page_result.data
@@ -88,11 +93,9 @@ class SiteAuditWorkflow(AgentTool):
                 try:
                     if remaining <= 0:
                         raise TimeoutError
-                    result = await asyncio.wait_for(
-                        self.performance.execute(
-                            {**page_args, "strategy": strategy}, runtime=runtime
-                        ),
-                        timeout=remaining,
+                    result = await run_observed_tool(
+                        self.observability, self.performance, {**page_args, "strategy": strategy},
+                        runtime=runtime, component_name="pagespeed", timeout=remaining,
                     )
                     performance = result.data if result.success else {
                         "error_code": "TOOL_FAILED", "message": "性能检查失败。"

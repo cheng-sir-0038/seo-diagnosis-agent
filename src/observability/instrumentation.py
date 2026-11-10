@@ -1,12 +1,43 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from typing import Any
 
 from src.observability.client import ObservabilityClient, SpanScope
 from src.observability.context import get_current_context
-from src.observability.models import SpanKind
+from src.observability.models import SpanKind, Status
+
+_TOKEN_FIELDS = (
+    "input_tokens", "output_tokens", "reasoning_tokens", "cached_tokens", "total_tokens"
+)
+
+
+def model_error_code(exc: Exception) -> str:
+    status = getattr(exc, "status_code", None)
+    return f"HTTP_{status}" if isinstance(status, int) else type(exc).__name__
+
+
+def model_usage_fields(usage: Mapping[str, int]) -> dict[str, int]:
+    return {key: usage[key] for key in _TOKEN_FIELDS if key in usage}
+
+
+async def record_model_failure(
+    span: SpanScope,
+    exc: Exception,
+    *,
+    component: str,
+    issue_type: str | None = None,
+    context: Any = None,
+    **details: Any,
+) -> None:
+    error_code = model_error_code(exc)
+    await span.model_call(
+        status=Status.FAILED, error_code=error_code, error_message=str(exc), **details
+    )
+    await span.capture_exception(
+        exc, issue_type=issue_type, component=component, error_code=error_code, context=context
+    )
 
 
 @asynccontextmanager

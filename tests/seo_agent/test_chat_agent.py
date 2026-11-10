@@ -186,7 +186,7 @@ async def test_seo_chat_api_creates_site_bound_run(monkeypatch) -> None:
     monkeypatch.setattr(
         route,
         "build_seo_agent_registry",
-        lambda _facade, _site: build_seo_agent_registry(FakeFacade(), SITE),
+        lambda _facade, _site, **kwargs: build_seo_agent_registry(FakeFacade(), SITE, **kwargs),
     )
 
     transport = ASGITransport(app=app)
@@ -234,7 +234,9 @@ async def test_seo_chat_api_rejects_when_no_live_tools(monkeypatch) -> None:
     monkeypatch.setattr(
         route,
         "build_seo_agent_registry",
-        lambda _facade, _site: build_seo_agent_registry(FakeFacade(set()), SITE),
+        lambda _facade, _site, **kwargs: build_seo_agent_registry(
+            FakeFacade(set()), SITE, **kwargs
+        ),
     )
 
     transport = ASGITransport(app=app)

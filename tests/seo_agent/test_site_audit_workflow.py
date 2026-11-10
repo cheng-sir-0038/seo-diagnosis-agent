@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 import pytest
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from src.agent.loop import AgentLoop
 from src.agent.models import RunStatus
+from src.agent.observability import AgentRunObserver
 from src.agent.providers.base import ModelChunk, ToolCall
 from src.agent.providers.fake import FakeModelProvider
 from src.agent.run_manager import RunManager
 from src.core.exceptions import InternalProviderRequestError
 from src.models.common import Capability
+from src.observability.client import ObservabilityClient
+from src.observability.exporters import OpenTelemetryExporter
+from src.observability.storage import ObservabilityDatabase
 from src.seo_agent.chat.runtime import build_seo_system_prompt
 from src.seo_agent.chat.tools import build_seo_agent_registry
 
@@ -169,3 +175,82 @@ async def test_performance_timeout_returns_page_before_agent_tool_timeout(monkey
     assert event.payload["result"]["data"]["workflow_status"] == "partial"
     performance = event.payload["result"]["data"]["evidence"]["performance"]
     assert performance["error_code"] == "TOOL_TIMEOUT"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_performance", [False, True])
+async def test_audit_records_only_executed_tools_as_child_spans(
+    tmp_path: Path, include_performance: bool
+) -> None:
+    memory = InMemorySpanExporter()
+    database = ObservabilityDatabase(tmp_path / "observability.db")
+    exporter = OpenTelemetryExporter(
+        service_name="seo-agent", endpoint=None, span_exporter=memory, database=database
+    )
+    observer = ObservabilityClient(database, project_key="seo-agent", exporters=[exporter])
+    facade = ExternalDataFixture()
+    registry = build_seo_agent_registry(facade, SITE, observability=observer)
+    provider = FakeModelProvider([
+        [ModelChunk(tool_calls=[ToolCall(
+            id="audit", name="seo_site_audit",
+            arguments={
+                "url": "https://example.com/private", "include_performance": include_performance
+            },
+        )], finish_reason="tool_calls")],
+        [ModelChunk(text="完成。"), ModelChunk(finish_reason="stop")],
+    ])
+    run = RunManager().create_run([{"role": "user", "content": "检查页面"}])
+    try:
+        await AgentLoop(
+            provider, registry, observer=AgentRunObserver(observer, operation_name="seo_agent.chat")
+        ).run(run)
+        rows = await database.fetch_all(
+            "SELECT id, parent_span_id, operation_name, status FROM obs_spans"
+        )
+        by_name = {row["operation_name"]: row for row in rows}
+        assert by_name["seo_page_metadata"]["parent_span_id"] == by_name["seo_site_audit"]["id"]
+        assert by_name["seo_page_metadata"]["status"] == "COMPLETED"
+        assert ("seo_page_performance" in by_name) is include_performance
+        if include_performance:
+            assert (
+                by_name["seo_page_performance"]["parent_span_id"] == by_name["seo_site_audit"]["id"]
+            )
+        spans = {span.name: span for span in memory.get_finished_spans()}
+        assert spans["seo_page_metadata"].attributes["agent.component_name"] == "page_html"
+        assert spans["seo_page_metadata"].attributes["langfuse.observation.type"] == "tool"
+        if include_performance:
+            assert spans["seo_page_performance"].attributes["agent.component_name"] == "pagespeed"
+            assert spans["seo_page_performance"].attributes["langfuse.observation.type"] == "tool"
+        assert "example.com/private" in str([dict(span.attributes) for span in spans.values()])
+    finally:
+        await observer.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_performance_failure_marks_child_span_but_keeps_workflow_partial(
+    tmp_path: Path,
+) -> None:
+    database = ObservabilityDatabase(tmp_path / "observability.db")
+    observer = ObservabilityClient(database, project_key="seo-agent")
+    registry = build_seo_agent_registry(
+        ExternalDataFixture(fail_performance=True), SITE, observability=observer
+    )
+    provider = FakeModelProvider([
+        [ModelChunk(tool_calls=[ToolCall(
+            id="audit", name="seo_site_audit", arguments={"include_performance": True}
+        )], finish_reason="tool_calls")],
+        [ModelChunk(text="性能未获取。"), ModelChunk(finish_reason="stop")],
+    ])
+    run = RunManager().create_run([{"role": "user", "content": "检查页面和性能"}])
+    try:
+        await AgentLoop(
+            provider, registry, observer=AgentRunObserver(observer, operation_name="seo_agent.chat")
+        ).run(run)
+        row = await database.fetch_one(
+            "SELECT status FROM obs_spans WHERE operation_name = 'seo_page_performance'"
+        )
+        assert row is not None and row["status"] == "FAILED"
+        event = next(event for event in run.events if event.type == "tool.completed")
+        assert event.payload["result"]["data"]["workflow_status"] == "partial"
+    finally:
+        await observer.shutdown()

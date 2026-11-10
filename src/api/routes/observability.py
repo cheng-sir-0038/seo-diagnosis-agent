@@ -5,6 +5,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
+from src.observability.exporters import OpenTelemetryExporter
 from src.observability.models import IssueStatus
 from src.observability.runtime import observability_client, observability_database
 
@@ -21,6 +22,10 @@ async def status() -> dict[str, Any]:
         "database_started": observability_database.started,
         "project_key": observability_client.project_key,
         "exporters": [exporter.__class__.__name__ for exporter in observability_client.exporters],
+        "otlp_enabled": any(
+            isinstance(exporter, OpenTelemetryExporter) and exporter.enabled
+            for exporter in observability_client.exporters
+        ),
     }
 
 

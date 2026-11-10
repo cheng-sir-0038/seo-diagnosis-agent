@@ -8,6 +8,7 @@ from src.agent.tools.base import AgentTool, RenderHint, ToolResult, ToolRuntimeC
 from src.agent.tools.registry import ToolRegistry
 from src.core.config import settings
 from src.models.common import Capability
+from src.observability.client import ObservabilityClient
 from src.seo_agent.chat.presentation import build_presentation, can_render
 from src.seo_agent.workflows.site_audit import SiteAuditWorkflow
 
@@ -461,7 +462,10 @@ class SeoFacadeTool(AgentTool):
         }
 
 
-def build_seo_agent_registry(facade: FacadeProtocol, site: dict[str, Any]) -> ToolRegistry:
+def build_seo_agent_registry(
+    facade: FacadeProtocol, site: dict[str, Any], *,
+    observability: ObservabilityClient | None = None,
+) -> ToolRegistry:
     live_capabilities = facade.live_capabilities()
     registry = ToolRegistry(
         [
@@ -476,7 +480,8 @@ def build_seo_agent_registry(facade: FacadeProtocol, site: dict[str, Any]) -> To
             if Capability.PAGE_PERFORMANCE in live_capabilities else None
         )
         registry.register(SiteAuditWorkflow(
-            registry.get("seo_page_metadata"), performance, settings.agent_tool_timeout
+            registry.get("seo_page_metadata"), performance, settings.agent_tool_timeout,
+            observability=observability,
         ))
     return registry
 

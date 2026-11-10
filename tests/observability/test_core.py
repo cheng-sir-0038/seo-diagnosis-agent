@@ -12,6 +12,51 @@ from src.observability.storage import ObservabilityDatabase
 
 
 @pytest.mark.asyncio
+async def test_model_usage_preserves_total_and_missing_usage(tmp_path: Path) -> None:
+    database = ObservabilityDatabase(tmp_path / "observability.db")
+    await database.startup()
+    client = ObservabilityClient(database, project_key="seo-agent")
+    try:
+        async with client.trace("seo.chat") as trace:
+            async with trace.run(trigger_type="test") as run:
+                async with run.span("model", kind=SpanKind.MODEL) as span:
+                    usage = await span.model_call(
+                        provider="deepseek", model="deepseek-v4-flash", operation="stream",
+                        input_tokens=100, output_tokens=50, reasoning_tokens=20, total_tokens=150,
+                    )
+                    missing = await span.model_call(
+                        provider="deepseek", model="deepseek-v4-flash", operation="stream"
+                    )
+        assert usage["total_tokens"] == 150
+        assert missing["total_tokens"] is None
+        assert await database.fetch_value(
+            "SELECT COUNT(*) FROM obs_metric_points WHERE metric_name = 'model.tokens.total'"
+        ) == 1
+    finally:
+        await client.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_failed_export_does_not_break_agent_recording(tmp_path: Path) -> None:
+    class FailingExporter:
+        async def export(self, envelope):
+            raise OSError("destination unavailable")
+
+        async def shutdown(self):
+            pass
+
+    database = ObservabilityDatabase(tmp_path / "observability.db")
+    await database.startup()
+    client = ObservabilityClient(database, project_key="seo-agent", exporters=[FailingExporter()])
+    try:
+        async with client.trace("seo.chat") as trace:
+            pass
+        assert (await client.get_trace(trace.trace_id))["status"] == "COMPLETED"
+    finally:
+        await client.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_trace_run_span_model_tool_event_and_metrics_are_persisted(tmp_path: Path) -> None:
     database = ObservabilityDatabase(tmp_path / "observability.db")
     await database.startup()

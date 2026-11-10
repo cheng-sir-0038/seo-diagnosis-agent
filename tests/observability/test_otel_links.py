@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import re
+from datetime import datetime
 from pathlib import Path
 
 import aiosqlite
@@ -9,10 +11,109 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 
 from src.observability.client import ObservabilityClient
 from src.observability.exporters import OpenTelemetryExporter
+from src.observability.models import SpanKind
 from src.observability.storage import ObservabilityDatabase
 
 TRACE_ID = re.compile(r"^[0-9a-f]{32}$")
 SPAN_ID = re.compile(r"^[0-9a-f]{16}$")
+
+
+@pytest.mark.asyncio
+async def test_otel_exports_correlated_model_and_tool_calls(tmp_path: Path) -> None:
+    memory = InMemorySpanExporter()
+    database = ObservabilityDatabase(tmp_path / "observability.db")
+    await database.startup()
+    exporter = OpenTelemetryExporter(
+        service_name="seo-agent", endpoint=None, span_exporter=memory, database=database
+    )
+    client = ObservabilityClient(database, project_key="seo-agent", exporters=[exporter])
+    try:
+        async with client.trace("seo.chat", input_data={"message": "private-example"}) as trace:
+            async with trace.run(trigger_type="test") as run:
+                async with run.span("model.iteration.1", kind=SpanKind.MODEL) as model:
+                    await model.model_call(
+                        provider="deepseek", model="deepseek-v4-flash", operation="stream",
+                        input_tokens=100, output_tokens=50, reasoning_tokens=20, cached_tokens=30,
+                        total_tokens=150, latency_ms=125, time_to_first_token_ms=50,
+                        input_summary={"text": "private-example"},
+                    )
+                async with run.span("inspect_page", kind=SpanKind.TOOL) as tool:
+                    await tool.tool_call(
+                        tool_call_id="call-1", tool_name="inspect_page", operation="query",
+                        arguments={
+                            "url": "https://private-example.test/", "force_refresh": True,
+                            "include_performance": False, "strategy": "mobile",
+                        },
+                        result_summary={
+                            "success": True,
+                            "data": {"workflow_status": "partial", "provenance": {"cached": False}},
+                        },
+                        latency_ms=20,
+                    )
+
+        await exporter.force_flush()
+        spans = memory.get_finished_spans()
+        by_type = {
+            span.attributes.get("agent.observability.entity_type"): span
+            for span in spans
+            if span.attributes.get("agent.observability.entity_type")
+            in {"trace", "model_call", "tool_call"}
+        }
+        root, generation, tool_call = (by_type[k] for k in ("trace", "model_call", "tool_call"))
+        assert generation.context.trace_id == root.context.trace_id == tool_call.context.trace_id
+        parents = {span.context.span_id: span for span in spans}
+        assert parents[generation.parent.span_id].parent.span_id == root.context.span_id
+        assert parents[tool_call.parent.span_id].parent.span_id == root.context.span_id
+        assert generation.attributes["langfuse.observation.type"] == "generation"
+        assert generation.attributes["gen_ai.request.model"] == "deepseek-v4-flash"
+        usage = json.loads(generation.attributes["langfuse.observation.usage_details"])
+        assert usage == {"input": 70, "cache_read_input_tokens": 30, "output": 50, "total": 150}
+        assert abs(generation.end_time - generation.start_time - 125_000_000) < 1_000
+        first_token = datetime.fromisoformat(
+            generation.attributes["langfuse.observation.completion_start_time"]
+        )
+        assert (
+            abs(first_token.timestamp() * 1_000_000_000 - generation.start_time - 50_000_000)
+            < 2_000
+        )
+        assert tool_call.attributes["langfuse.observation.type"] == "tool"
+        assert tool_call.attributes["langfuse.observation.metadata.force_refresh"] is True
+        assert tool_call.attributes["langfuse.observation.metadata.include_performance"] is False
+        assert tool_call.attributes["langfuse.observation.metadata.strategy"] == "mobile"
+        assert tool_call.attributes["langfuse.observation.metadata.workflow_status"] == "partial"
+        assert tool_call.attributes["langfuse.observation.metadata.cached"] is False
+        assert "private-example" in str([dict(span.attributes) for span in spans])
+    finally:
+        await client.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_unexpected_tool_arguments_do_not_break_export(tmp_path: Path) -> None:
+    memory = InMemorySpanExporter()
+    database = ObservabilityDatabase(tmp_path / "observability.db")
+    exporter = OpenTelemetryExporter(
+        service_name="seo-agent", endpoint=None, span_exporter=memory, database=database
+    )
+    client = ObservabilityClient(database, project_key="seo-agent", exporters=[exporter])
+    try:
+        await client.startup()
+        async with client.trace("seo.chat") as trace:
+            async with trace.run(trigger_type="test") as run:
+                async with run.span("tool", kind=SpanKind.TOOL) as tool:
+                    await tool.tool_call(
+                        tool_call_id="bad", tool_name="tool", operation="execute",
+                        arguments={
+                            "strategy": ["private"], "force_refresh": {"value": "x"},
+                            "password": "fake-secret-value",
+                        },
+                        result_summary={"data": {"workflow_status": ["private"]}},
+                    )
+        calls = [span for span in memory.get_finished_spans() if span.name == "tool"]
+        assert len(calls) == 2
+        assert "private" in str([dict(span.attributes) for span in calls])
+        assert "fake-secret-value" not in str([dict(span.attributes) for span in calls])
+    finally:
+        await client.shutdown()
 
 
 @pytest.mark.asyncio
@@ -38,7 +139,10 @@ async def test_trace_link_is_exported_as_real_otel_span_link(tmp_path: Path) -> 
                 source_trace_id=publish_trace.trace_id,
                 target_trace_id=monitoring_trace.trace_id,
                 relation_type="FOLLOW_UP",
-                attributes={"monitoring_plan_id": "plan-1", "check_type": "INDEXING"},
+                attributes={
+                    "monitoring_plan_id": "plan-1", "check_type": "INDEXING",
+                    "url": "https://private-example.test/",
+                },
             )
 
         await exporter.force_flush()
@@ -76,6 +180,7 @@ async def test_trace_link_is_exported_as_real_otel_span_link(tmp_path: Path) -> 
         assert link.attributes["agent.link.relation_type"] == "FOLLOW_UP"
         assert link.attributes["agent.link.monitoring_plan_id"] == "plan-1"
         assert link.attributes["agent.link.check_type"] == "INDEXING"
+        assert "private-example" not in str(link.attributes)
     finally:
         await client.shutdown()
 

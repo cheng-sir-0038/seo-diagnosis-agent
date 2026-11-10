@@ -13,7 +13,7 @@ def get_current_context() -> ObservationContext | None:
     return _current_context.get()
 
 
-def set_current_context(context: ObservationContext) -> Token:
+def set_current_context(context: ObservationContext | None) -> Token:
     return _current_context.set(context)
 
 

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import json
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -7,14 +10,18 @@ import pytest
 from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from src.agent.loop import AgentLoop
 from src.agent.observability import AgentRunObserver
-from src.agent.providers.deepseek import DeepSeekProvider
+from src.agent.providers.base import ModelChunk, ToolCall
+from src.agent.providers.deepseek import DeepSeekProvider, DeepSeekRequestError
 from src.agent.providers.fake import FakeModelProvider
 from src.agent.run_manager import RunManager
 from src.agent.tools.registry import build_default_registry
 from src.observability.client import ObservabilityClient
+from src.observability.context import get_current_context
+from src.observability.exporters import OpenTelemetryExporter
 from src.observability.storage import ObservabilityDatabase
 from src.promptops.models import CandidatePrompt
 from src.promptops.registry import PromptRegistry
@@ -81,6 +88,103 @@ class FailingStructuredModel:
 
 
 @pytest.mark.asyncio
+async def test_observability_start_failure_ends_agent_run(tmp_path: Path, monkeypatch) -> None:
+    database = ObservabilityDatabase(tmp_path / "observability.db")
+    client = ObservabilityClient(database, project_key="seo-agent")
+    await client.startup()
+    run = RunManager().create_run([{"role": "user", "content": "test"}])
+
+    async def fail(*_args, **_kwargs):
+        raise sqlite3.OperationalError("synthetic observability storage failure")
+
+    monkeypatch.setattr(database, "execute", fail)
+    try:
+        await AgentLoop(
+            FakeModelProvider.text("ok"), build_default_registry(),
+            observer=AgentRunObserver(client, operation_name="agent.chat"),
+        ).run(run)
+        assert run.status.value == "failed"
+        assert run.terminal
+        assert run.events[-1].type == "run.failed"
+    finally:
+        await client.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_observability_start_failure_does_not_leak_trace_context(
+    tmp_path: Path, monkeypatch
+) -> None:
+    database = ObservabilityDatabase(tmp_path / "observability.db")
+    client = ObservabilityClient(database, project_key="seo-agent")
+    await client.startup()
+    execute = database.execute
+
+    async def fail_start_event(sql, params=()):
+        if "INSERT INTO obs_events" in sql and "trace.started" in params:
+            raise sqlite3.OperationalError("synthetic observability storage failure")
+        await execute(sql, params)
+
+    monkeypatch.setattr(database, "execute", fail_start_event)
+    run = RunManager().create_run([{"role": "user", "content": "test"}])
+    try:
+        await AgentLoop(
+            FakeModelProvider.text("ok"), build_default_registry(),
+            observer=AgentRunObserver(client, operation_name="agent.chat"),
+        ).run(run)
+        assert run.status.value == "failed"
+        assert run.events[-1].type == "run.failed"
+        assert get_current_context() is None
+    finally:
+        await client.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_agent_records_partial_usage_and_missing_usage(tmp_path: Path) -> None:
+    database = ObservabilityDatabase(tmp_path / "observability.db")
+    client = ObservabilityClient(database, project_key="seo-agent")
+    try:
+        for chunks in (
+            [ModelChunk(text="ok"), ModelChunk(usage={"input_tokens": 100, "output_tokens": 50,
+                                                      "reasoning_tokens": 20})],
+            [ModelChunk(text="ok")],
+        ):
+            run = RunManager().create_run([{"role": "user", "content": "test"}])
+            provider = FakeModelProvider([chunks])
+            await AgentLoop(
+                provider, build_default_registry(),
+                observer=AgentRunObserver(client, operation_name="agent.chat"),
+            ).run(run)
+        calls = await database.fetch_all("SELECT * FROM obs_model_calls ORDER BY completed_at")
+        assert [row["total_tokens"] for row in calls] == [150, None]
+        assert all(row["time_to_first_token_ms"] is not None for row in calls)
+    finally:
+        await client.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_agent_records_deepseek_http_status(tmp_path: Path) -> None:
+    class FailingProvider(FakeModelProvider):
+        async def stream(self, messages, tools, *, tool_choice="auto"):
+            raise DeepSeekRequestError(429)
+            yield  # pragma: no cover
+
+    database = ObservabilityDatabase(tmp_path / "observability.db")
+    client = ObservabilityClient(database, project_key="seo-agent")
+    run = RunManager().create_run([{"role": "user", "content": "test"}])
+    try:
+        await AgentLoop(
+            FailingProvider([]), build_default_registry(),
+            observer=AgentRunObserver(client, operation_name="agent.chat"),
+        ).run(run)
+        call = await database.fetch_one("SELECT * FROM obs_model_calls")
+        assert call is not None
+        assert call["status"] == "FAILED" and call["error_code"] == "HTTP_429"
+        assert call["total_tokens"] is None
+    finally:
+        await client.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_agent_loop_persists_model_tool_events_and_sanitizes_arguments(
     tmp_path: Path,
 ) -> None:
@@ -134,6 +238,201 @@ async def test_agent_loop_persists_model_tool_events_and_sanitizes_arguments(
         await database.shutdown()
 
 
+@pytest.mark.asyncio
+async def test_agent_exports_decisions_reuse_and_stop_reason(tmp_path: Path) -> None:
+    memory = InMemorySpanExporter()
+    database = ObservabilityDatabase(tmp_path / "observability.db")
+    exporter = OpenTelemetryExporter(
+        service_name="seo-agent", endpoint=None, span_exporter=memory, database=database
+    )
+    client = ObservabilityClient(database, project_key="seo-agent", exporters=[exporter])
+    provider = FakeModelProvider([
+        [ModelChunk(tool_calls=[ToolCall(
+            id="first", name="calculator", arguments={"expression": "1 + 1"}
+        )], finish_reason="tool_calls")],
+        [ModelChunk(tool_calls=[ToolCall(
+            id="second", name="calculator", arguments={"expression": "1 + 1"}
+        )], finish_reason="tool_calls")],
+        [ModelChunk(text="完成"), ModelChunk(finish_reason="stop")],
+    ])
+    run = RunManager().create_run([{
+        "role": "user", "content": "private-request API_KEY=sk-example-sensitive-123456789"
+    }])
+    try:
+        await AgentLoop(
+            provider, build_default_registry(), max_iterations=4,
+            observer=AgentRunObserver(client, operation_name="agent.chat"),
+        ).run(run)
+        spans = memory.get_finished_spans()
+        generations = sorted(
+            (span for span in spans
+             if span.attributes.get("langfuse.observation.type") == "generation"),
+            key=lambda span: span.start_time,
+        )
+        assert [s.attributes["langfuse.observation.metadata.decision"] for s in generations] == [
+            "call_tools", "call_tools", "forced_summary"
+        ]
+        assert generations[0].attributes["langfuse.observation.metadata.selected_tools"] == (
+            "calculator",
+        )
+        assert generations[2].attributes["langfuse.observation.metadata.decision_reason"] == (
+            "duplicate_tool_guard"
+        )
+        root = next(
+            s for s in spans if s.attributes.get("agent.observability.entity_type") == "trace"
+        )
+        assert (
+            root.attributes["langfuse.observation.metadata.completion_mode"]
+            == "duplicate_tool_guard"
+        )
+        assert root.attributes["langfuse.observation.metadata.tool_calls"] == 1
+        assert root.attributes["langfuse.observation.metadata.iterations"] == 3
+        assert root.attributes["langfuse.observation.metadata.reused_tool_calls"] == 1
+        calls = [
+            s for s in spans if s.attributes.get("agent.observability.entity_type") == "tool_call"
+        ]
+        assert len(calls) == 1
+        assert calls[0].attributes["langfuse.observation.metadata.operation"] == "execute"
+        reused = next(s for s in spans if s.name == "calculator.reused")
+        assert reused.attributes["langfuse.observation.metadata.reused"] is True
+        assert "1 + 1" in reused.attributes["langfuse.observation.input"]
+        assert "2" in reused.attributes["langfuse.observation.output"]
+        serialized = str([dict(span.attributes) for span in spans])
+        assert "private-request" in serialized
+        assert "sk-example-sensitive-123456789" not in serialized
+    finally:
+        await client.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_agent_trace_explains_budget_forced_summary(tmp_path: Path) -> None:
+    memory = InMemorySpanExporter()
+    database = ObservabilityDatabase(tmp_path / "observability.db")
+    exporter = OpenTelemetryExporter(
+        service_name="seo-agent", endpoint=None, span_exporter=memory, database=database
+    )
+    client = ObservabilityClient(database, project_key="seo-agent", exporters=[exporter])
+    run = RunManager().create_run([{"role": "user", "content": "计算"}])
+    try:
+        await AgentLoop(
+            FakeModelProvider.calculator_then_text("1 + 1", "完成"), build_default_registry(),
+            max_iterations=2, observer=AgentRunObserver(client, operation_name="agent.chat"),
+        ).run(run)
+        spans = memory.get_finished_spans()
+        root = next(
+            s for s in spans if s.attributes.get("agent.observability.entity_type") == "trace"
+        )
+        assert root.attributes["langfuse.observation.metadata.completion_mode"] == "budget_limit"
+        assert root.attributes["langfuse.observation.metadata.partial"] is True
+        forced = next(
+            s for s in spans
+            if s.attributes.get("langfuse.observation.metadata.decision") == "forced_summary"
+        )
+        assert forced.attributes["langfuse.observation.metadata.decision_reason"] == "budget_limit"
+        assert forced.attributes["langfuse.observation.metadata.tool_choice"] == "none"
+    finally:
+        await client.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_model_prompt_and_tool_io_are_recorded_and_credentials_masked(tmp_path: Path) -> None:
+    memory = InMemorySpanExporter()
+    database = ObservabilityDatabase(tmp_path / "observability.db")
+    exporter = OpenTelemetryExporter(
+        service_name="seo-agent", endpoint=None, span_exporter=memory, database=database
+    )
+    client = ObservabilityClient(database, project_key="seo-agent", exporters=[exporter])
+    prompt = "long-prompt:" + "x" * 5_000 + " API_KEY=sk-example-sensitive-123456789"
+    run = RunManager().create_run([{"role": "user", "content": prompt}])
+    try:
+        await AgentLoop(
+            FakeModelProvider.calculator_then_text("1234 * 56", "结果是 69104。"),
+            build_default_registry(),
+            observer=AgentRunObserver(client, operation_name="agent.chat"),
+        ).run(run)
+        spans = memory.get_finished_spans()
+        generations = [
+            s for s in spans if s.attributes.get("langfuse.observation.type") == "generation"
+        ]
+        assert len(generations) == 2
+        rendered = str([dict(s.attributes) for s in spans])
+        assert "x" * 5_000 in rendered
+        assert "sk-example-sensitive-123456789" not in rendered
+        assert "[REDACTED]" in rendered
+        assert "1234 * 56" in rendered
+        assert "69104" in rendered
+        assert all("langfuse.observation.input" in s.attributes for s in generations)
+        assert all("langfuse.observation.output" in s.attributes for s in generations)
+        tool = next(
+            s for s in spans if s.attributes.get("agent.observability.entity_type") == "tool_call"
+        )
+        assert "1234 * 56" in tool.attributes["langfuse.observation.input"]
+        assert "69104" in tool.attributes["langfuse.observation.output"]
+    finally:
+        await client.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_agent_unknown_tool_is_marked_but_model_output_is_preserved(tmp_path: Path) -> None:
+    memory = InMemorySpanExporter()
+    database = ObservabilityDatabase(tmp_path / "observability.db")
+    exporter = OpenTelemetryExporter(
+        service_name="seo-agent", endpoint=None, span_exporter=memory, database=database
+    )
+    client = ObservabilityClient(database, project_key="seo-agent", exporters=[exporter])
+    provider = FakeModelProvider([
+        [ModelChunk(tool_calls=[ToolCall(
+            id="bad", name="private_unknown_tool", arguments={}
+        )], finish_reason="tool_calls")],
+        [ModelChunk(text="无法执行"), ModelChunk(finish_reason="stop")],
+    ])
+    run = RunManager().create_run([{"role": "user", "content": "test"}])
+    try:
+        await AgentLoop(
+            provider, build_default_registry(),
+            observer=AgentRunObserver(client, operation_name="chat"),
+        ).run(run)
+        spans = memory.get_finished_spans()
+        assert "private_unknown_tool" in str([dict(s.attributes) for s in spans])
+        assert any(s.name == "unknown_tool" for s in spans)
+    finally:
+        await client.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_paused_agent_trace_is_interrupted_not_completed(tmp_path: Path) -> None:
+    database = ObservabilityDatabase(tmp_path / "observability.db")
+    client = ObservabilityClient(database, project_key="seo-agent")
+    run = RunManager().create_run([{"role": "user", "content": "test"}])
+
+    class PausingProvider(FakeModelProvider):
+        async def stream(self, messages, tools, *, tool_choice="auto"):
+            run.request_pause()
+            raise asyncio.CancelledError()
+            yield  # pragma: no cover
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await AgentLoop(
+                PausingProvider([]), build_default_registry(),
+                observer=AgentRunObserver(client, operation_name="agent.chat"),
+            ).run(run)
+        trace = await database.fetch_one("SELECT status, metadata_json FROM obs_traces")
+        assert trace is not None and trace["status"] == "INTERRUPTED"
+        run_row = await database.fetch_one("SELECT status FROM obs_runs")
+        assert run_row is not None and run_row["status"] == "INTERRUPTED"
+        model = await database.fetch_one(
+            "SELECT status FROM obs_spans WHERE operation_name = 'model.iteration.1'"
+        )
+        assert model is not None and model["status"] == "CANCELLED"
+        event = await database.fetch_one(
+            "SELECT severity FROM obs_events WHERE event_type = 'run.interrupted'"
+        )
+        assert event is not None and event["severity"] == "INFO"
+    finally:
+        await client.shutdown()
+
+
 def test_deepseek_parser_emits_usage_chunk() -> None:
     provider = DeepSeekProvider(api_key="test", model="deepseek-chat")
     chunks = provider.parse_payload(
@@ -152,6 +451,12 @@ def test_deepseek_parser_emits_usage_chunk() -> None:
     assert chunks[0].usage["cached_tokens"] == 20
 
 
+def test_deepseek_parser_does_not_invent_missing_usage() -> None:
+    provider = DeepSeekProvider(api_key="test", model="deepseek-chat")
+    chunks = provider.parse_payload({"usage": {"prompt_tokens": 12, "completion_tokens": None}})
+    assert chunks[0].usage == {"input_tokens": 12}
+
+
 @pytest.mark.asyncio
 async def test_structured_prd_resolves_prompt_version_and_records_model_call(
     tmp_path: Path, approve_opportunity,
@@ -164,7 +469,11 @@ async def test_structured_prd_resolves_prompt_version_and_records_model_call(
     await registry.startup()
     seeder = SeoPromptSeeder(registry)
     seeded = await seeder.seed()
-    observer = ObservabilityClient(observability, project_key="seo-agent")
+    memory = InMemorySpanExporter()
+    exporter = OpenTelemetryExporter(
+        service_name="seo-agent", endpoint=None, span_exporter=memory, database=observability
+    )
+    observer = ObservabilityClient(observability, project_key="seo-agent", exporters=[exporter])
     system = SeoAgentSystemService(business)
     site = await system.create_site(
         name="Demo",
@@ -236,9 +545,17 @@ async def test_structured_prd_resolves_prompt_version_and_records_model_call(
         assert model_call is not None
         assert model_call["prompt_version_id"] == seeded["seo.prd.generate"]["id"]
         assert model_call["prompt_key"] == "seo.prd.generate"
+        messages = json.loads(model_call["input_summary_json"])["messages"]
+        assert {message["type"] for message in messages} == {"system", "human"}
+        generation = next(
+            s for s in memory.get_finished_spans()
+            if s.attributes.get("langfuse.observation.type") == "generation"
+        )
+        assert "maintenance cost" in generation.attributes["langfuse.observation.input"]
+        assert "Maintenance Cost" in generation.attributes["langfuse.observation.output"]
     finally:
         await business.shutdown()
-        await observability.shutdown()
+        await observer.shutdown()
 
 
 @pytest.mark.asyncio
@@ -389,6 +706,18 @@ async def test_structured_raw_message_usage_is_extracted() -> None:
 
 
 @pytest.mark.asyncio
+async def test_structured_raw_message_does_not_invent_missing_usage() -> None:
+    raw = AIMessage(content="", response_metadata={"token_usage": {"prompt_tokens": 12}})
+
+    class RawModel:
+        def with_structured_output(self, schema: Any, **_: Any) -> FakeRunnable:
+            return FakeRunnable({"raw": raw, "parsed": {}, "parsing_error": None})
+
+    result = await invoke_structured_model(RawModel(), CandidatePrompt, [])
+    assert result.usage == {"input_tokens": 12}
+
+
+@pytest.mark.asyncio
 async def test_prompt_evaluation_failure_records_model_call_and_issue(tmp_path: Path) -> None:
     database = ObservabilityDatabase(tmp_path / "prompt-evaluation-failure.db")
     await database.startup()
@@ -424,6 +753,8 @@ async def test_prompt_evaluation_failure_records_model_call_and_issue(tmp_path: 
         assert call is not None and call["status"] == "FAILED"
         assert call["prompt_version_id"] == version["id"]
         assert call["evaluation_case_id"] == case["id"]
+        assert "system" in call["input_summary_json"]
+        assert "question" in call["input_summary_json"]
         assert issue is not None
         assert issue["issue_type"] == "PROMPT_EVALUATION_MODEL_FAILED"
     finally:

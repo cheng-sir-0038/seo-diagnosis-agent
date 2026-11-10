@@ -8,11 +8,12 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from src.observability.client import ObservabilityClient
-from src.observability.models import SpanKind, Status
+from src.observability.instrumentation import model_usage_fields, record_model_failure
+from src.observability.models import SpanKind
 from src.promptops.evaluation import ExecutionResult
 from src.promptops.models import CandidatePrompt
 from src.promptops.registry import PromptRegistry
-from src.seo_agent.automation.model_result import invoke_structured_model
+from src.seo_agent.automation.model_result import invoke_structured_model, model_provider_name
 
 
 class DeepSeekCandidateGenerator:
@@ -92,22 +93,17 @@ class DeepSeekCandidateGenerator:
                             raise invocation.parsing_error
                         result = CandidatePrompt.model_validate(invocation.parsed)
                     except Exception as exc:
-                        await span.model_call(
+                        await record_model_failure(
+                            span, exc, issue_type="PROMPT_CANDIDATE_GENERATION_FAILED",
+                            component="prompt_optimizer",
                             provider=_provider_name(model),
                             model=_model_name(model),
                             operation="generate_challenger",
                             prompt_key="agent.prompt.optimize",
                             prompt_version=meta_prompt["version_label"],
                             prompt_version_id=meta_prompt["id"],
-                            status=Status.FAILED,
                             structured_output_valid=False,
-                            error_code=type(exc).__name__,
-                            error_message=str(exc),
-                        )
-                        await span.capture_exception(
-                            exc,
-                            issue_type="PROMPT_CANDIDATE_GENERATION_FAILED",
-                            component="prompt_optimizer",
+                            input_summary={"messages": messages},
                         )
                         raise
                     await span.model_call(
@@ -117,13 +113,11 @@ class DeepSeekCandidateGenerator:
                         prompt_key="agent.prompt.optimize",
                         prompt_version=meta_prompt["version_label"],
                         prompt_version_id=meta_prompt["id"],
-                        input_tokens=invocation.usage.get("input_tokens"),
-                        output_tokens=invocation.usage.get("output_tokens"),
-                        reasoning_tokens=invocation.usage.get("reasoning_tokens"),
-                        cached_tokens=invocation.usage.get("cached_tokens"),
+                        **model_usage_fields(invocation.usage),
                         latency_ms=round((time.perf_counter() - started) * 1000, 3),
                         finish_reason=invocation.finish_reason,
                         structured_output_valid=True,
+                        input_summary={"messages": messages},
                         output_summary=result.model_dump(mode="json"),
                     )
                     return result
@@ -184,30 +178,25 @@ class DeepSeekPromptExecutor:
                                     raise invocation.parsing_error
                                 output = invocation.parsed
                             except Exception as exc:
-                                await span.model_call(
+                                await record_model_failure(
+                                    span, exc, issue_type="PROMPT_EVALUATION_MODEL_FAILED",
+                                    component="prompt_evaluator",
+                                    context={
+                                        "prompt_version_id": version["id"],
+                                        "evaluation_case_id": case["id"],
+                                    },
                                     provider=_provider_name(model),
                                     model=_model_name(model),
                                     operation="evaluate_case",
                                     prompt_version=version["version_label"],
                                     prompt_version_id=version["id"],
                                     evaluation_case_id=case["id"],
-                                    status=Status.FAILED,
                                     structured_output_valid=False,
                                     latency_ms=round(
                                         (time.perf_counter() - started) * 1000,
                                         3,
                                     ),
-                                    error_code=type(exc).__name__,
-                                    error_message=str(exc),
-                                )
-                                await span.capture_exception(
-                                    exc,
-                                    issue_type="PROMPT_EVALUATION_MODEL_FAILED",
-                                    component="prompt_evaluator",
-                                    context={
-                                        "prompt_version_id": version["id"],
-                                        "evaluation_case_id": case["id"],
-                                    },
+                                    input_summary={"messages": messages},
                                 )
                                 raise
                             await span.model_call(
@@ -217,13 +206,11 @@ class DeepSeekPromptExecutor:
                                 prompt_version=version["version_label"],
                                 prompt_version_id=version["id"],
                                 evaluation_case_id=case["id"],
-                                input_tokens=invocation.usage.get("input_tokens"),
-                                output_tokens=invocation.usage.get("output_tokens"),
-                                reasoning_tokens=invocation.usage.get("reasoning_tokens"),
-                                cached_tokens=invocation.usage.get("cached_tokens"),
+                                **model_usage_fields(invocation.usage),
                                 latency_ms=round((time.perf_counter() - started) * 1000, 3),
                                 finish_reason=invocation.finish_reason,
                                 structured_output_valid=True,
+                                input_summary={"messages": messages},
                                 output_summary=output,
                             )
             usage = invocation.usage if "invocation" in locals() else {}
@@ -242,7 +229,7 @@ class DeepSeekPromptExecutor:
 
 
 def _provider_name(model: Any) -> str:
-    return str(getattr(model, "provider_name", model.__class__.__name__)).lower()
+    return model_provider_name(model)
 
 
 def _model_name(model: Any) -> str:

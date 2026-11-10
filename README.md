@@ -8,7 +8,7 @@
 
 - **Agent Loop**：`src/agent/loop.py` 让模型根据问题和已有结果决定下一步工具调用；限制迭代次数、去重已成功的调用，并在达到预算时收束回答。
 - **运行与恢复**：`src/agent/harness/` 保存 Task、Thread、Run、事件、Checkpoint 和 Survival Summary；SEO Chat 支持服务重启后恢复、取消和 SSE 断线重连。
-- **轨迹评测**：`src/agent/evals/` 检查工具调用与预期轨迹，例如页面 TDK 问题不能用 SERP 冒充页面源码，模拟数据不能作为正式诊断工具。样例见 [`tests/agent_evals/`](tests/agent_evals/)。
+- **轨迹评测**：`src/agent/evals/` 的 `evaluate_agent_run` 根据实际运行事件检查问题、工具调用、失败和终态，例如页面 TDK 问题不能用 SERP 冒充页面源码，模拟数据不能作为正式诊断工具。样例见 [`tests/agent_evals/`](tests/agent_evals/)；自动化测试使用模拟模型，不代表真实模型的选工具准确率。
 - **审批工作流**：审批接口记录决定，并同步“将机会加入生产”动作对应的机会状态。`src/seo_agent/approvals/graph.py` 的 LangGraph 中断和恢复已有独立测试，但当前审批接口尚未接入该图。机会、任务、交付、发布和监控已有业务代码和接口，完整真实业务链路仍需验收。
 - **工作台和接口**：`frontend/` 提供 React 对话与结构化结果展示；FastAPI 提供 SEO Chat、SSE、审批和兼容的 `POST /api/v1/query` 查询接口。
 - **页面基础体检**：`src/seo_agent/workflows/site_audit.py` 复用页面元信息工具；用户同时要求性能检查时，再调用已配置的 PageSpeed 工具，并保留各项证据和失败状态。
@@ -72,6 +72,14 @@ npm run dev
 
 页面检查只访问公网地址，每次连接使用校验后的 IP。系统 DNS 只返回 Fake-IP 时，会向 Google Public DNS 的 HTTPS 接口查询目标域名；该兼容方式需要能访问此 DNS 服务。
 
+### 可选：Langfuse Cloud 运行记录
+
+在 `.env.local` 配置 `LANGFUSE_HOST`、`LANGFUSE_PUBLIC_KEY` 和 `LANGFUSE_SECRET_KEY` 后重启后端。`LANGFUSE_HOST` 使用项目所在地区的地址，例如美国区域为 `https://us.cloud.langfuse.com`；密钥从 Langfuse 项目设置获取，不要提交到 Git。未配置完整密钥时，原有 SQLite 记录仍可使用；配置了完整密钥时，Langfuse 优先于通用 `OBSERVABILITY_OTLP_ENDPOINT`。
+
+云端记录 Agent 每轮的模型输入消息、可见输出、工具选择、工具输入和结果，以及工具执行或复用、结束原因、状态、耗时和模型返回的 Token 用量。页面体检展开为实际执行的页面元信息和可选性能检查子步骤。模型上下文和工具结果可能包含站点及业务数据，会发送到所配置的 Langfuse 项目；常见凭据字段和密钥格式会被脱敏，但无法保证识别所有敏感内容。单个文本字段超过 50,000 字符、列表或对象超过 100 项、嵌套超过 12 层时会被截断。模型的内部推理内容不在记录中。
+
+模型没有返回用量时不会填成零；费用需要 Langfuse 正确识别模型和价格后才能估算。上传在后台进行，记录开启状态不代表云端已成功接收。关闭程序过快或网络故障时，云端可能缺少记录，本地 SQLite 仍是运行记录的来源；启用前的旧记录不会自动回填。本地观测数据库写入失败时，本次 Agent 运行会返回失败状态，而不是一直等待。
+
 本地测试可运行：
 
 ```bash
@@ -82,13 +90,13 @@ python -m pytest tests/agent tests/agent_evals -q
 
 在工作台中可以要求“对当前页面做 SEO 基础体检”。Agent 可调用 `seo_site_audit`：先读取页面源 HTML；如果用户同时要求性能检查，再读取 PageSpeed。页面结果会以卡片展示，性能不可用或超时时会保留页面结果并标记为部分完成。单独查询 TDK 或性能仍可使用原有工具。
 
-这项体检只覆盖一个页面，不读取 robots.txt、sitemap 或 Google 收录状态。PageSpeed 需要配置凭据，耗时可能超过默认的 15 秒工具超时；可根据环境在 `.env.local` 中调整 `AGENT_TOOL_TIMEOUT`。两步检查作为一次工具调用记录，进程在调用完成前中断时，页面步骤没有独立检查点。
+这项体检只覆盖一个页面，不读取 robots.txt、sitemap 或 Google 收录状态。PageSpeed 需要配置凭据，耗时可能超过默认的 15 秒工具超时；可根据环境在 `.env.local` 中调整 `AGENT_TOOL_TIMEOUT`。对 Agent 来说体检仍是一次工具调用；观测记录会展示实际执行的内部步骤，但进程在调用完成前中断时，页面步骤没有独立检查点。
 
 ## 目前的边界
 
 - 这是单机 MVP，SQLite 不适合多实例生产部署；真实站点的长期成功率、费用和限流仍需持续验证。
 - 审批、任务、发布和监控已有基础实现，但不等于整条业务闭环已经完成真实端到端验收。
-- 批准机会不会自动创建任务。创建任务时，所有关联机会必须属于当前站点，且对应的最新“将机会加入生产”审批已通过。新发现的中低价值机会目前不会自动发起此审批，也没有现成的审批入口。
+- 批准机会不会自动创建任务。创建任务时，所有关联机会必须属于当前站点，且对应的最新“将机会加入生产”审批已通过。新发现的中低价值机会不会自动发起此审批，可通过审批接口手动创建审批；工作台尚无申请入口。
 - HTML 发布要求交付中已有经审核的 `structured_content.html`，请求中的 `html_content` 必须与其完全一致。
 - [seo-audit-plugin](https://github.com/cheng-sir-0038/seo-audit-plugin) 是独立的只读 SEO 插件；当前仓库尚未接入该插件的 MCP，两个项目不能描述为已联通。独立 Agent 尚未实现 GSC 或 GA4 数据源，插件的 OAuth 凭据复制到本仓库也不会生效。
 

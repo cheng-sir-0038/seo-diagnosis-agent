@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from datetime import UTC, datetime
 from typing import Any
@@ -14,7 +15,15 @@ from src.agent.observability import AgentRunObserver
 from src.agent.providers.base import ModelProvider, ToolCall
 from src.agent.tools.base import ToolRuntimeContext, resolve_render_hint
 from src.agent.tools.registry import ToolRegistry
+from src.observability.context import (
+    get_current_context,
+    reset_current_context,
+    set_current_context,
+)
+from src.observability.instrumentation import model_usage_fields, record_model_failure
 from src.observability.models import Severity, SpanKind, Status
+
+logger = logging.getLogger(__name__)
 
 _BUDGET_SUMMARY_PROMPT = """你已到达本次调查的模型循环预算上限。
 现在必须停止调用任何工具，只能基于已经获得的证据形成最终答案。
@@ -51,15 +60,8 @@ class AgentLoop:
         self.context_character_limit = context_character_limit
 
     async def run(self, run: AgentRun) -> None:
-        if self.observer is not None:
-            await self.observer.start(run, self.provider)
+        context_token = set_current_context(get_current_context()) if self.observer else None
         resumed = run.status == RunStatus.RECOVERING
-        run.status = RunStatus.RUNNING
-        await self._emit(
-            run,
-            "run.resumed" if resumed else "run.started",
-            {"status": run.status.value, "iteration": run.iteration},
-        )
         messages = [dict(message) for message in run.messages]
         iteration = int(run.iteration)
         tool_count = int(run.tool_count)
@@ -68,6 +70,14 @@ class AgentLoop:
         run.partial = False
         run.completion_mode = None
         try:
+            if self.observer is not None:
+                await self.observer.start(run, self.provider)
+            run.status = RunStatus.RUNNING
+            await self._emit(
+                run,
+                "run.resumed" if resumed else "run.started",
+                {"status": run.status.value, "iteration": run.iteration},
+            )
             if self.max_iterations <= 0:
                 raise RuntimeError("最大模型循环次数必须大于 0")
             if run.pending_tool_calls:
@@ -117,6 +127,8 @@ class AgentLoop:
                     "total_tokens": 0,
                 }
                 finish_reason: str | None = None
+                first_token_ms: float | None = None
+                usage_keys: set[str] = set()
                 started = time.perf_counter()
                 model_messages = compact_model_context(
                     messages,
@@ -127,6 +139,10 @@ class AgentLoop:
                 if force_summary:
                     model_messages = _inject_budget_summary_prompt(model_messages)
                 tool_choice = "none" if force_summary else "auto"
+                tool_schemas = self.tools.schemas()
+                model_input = {
+                    "messages": model_messages, "tools": tool_schemas, "tool_choice": tool_choice
+                }
                 model_span = (
                     self.observer.span(
                         f"model.iteration.{iteration + 1}",
@@ -135,7 +151,7 @@ class AgentLoop:
                         input_data={
                             "message_count": len(model_messages),
                             "full_message_count": len(messages),
-                            "tool_schema_count": len(self.tools.schemas()),
+                            "tool_schema_count": len(tool_schemas),
                             "tool_choice": tool_choice,
                         },
                     )
@@ -144,14 +160,16 @@ class AgentLoop:
                 )
 
                 async def consume_model() -> None:
-                    nonlocal finish_reason
+                    nonlocal finish_reason, first_token_ms
                     async for chunk in self.provider.stream(
                         model_messages,
-                        self.tools.schemas(),
+                        tool_schemas,
                         tool_choice=tool_choice,
                     ):
                         self._check_cancel(run)
                         if chunk.text:
+                            if first_token_ms is None:
+                                first_token_ms = round((time.perf_counter() - started) * 1000, 3)
                             assistant_text.append(chunk.text)
                             if not force_summary:
                                 await self._emit(run, "message.delta", {"delta": chunk.text})
@@ -159,6 +177,7 @@ class AgentLoop:
                             pending_calls.extend(chunk.tool_calls)
                         if chunk.finish_reason:
                             finish_reason = chunk.finish_reason
+                        usage_keys.update(chunk.usage)
                         for key, value in chunk.usage.items():
                             usage[key] = max(usage.get(key, 0), int(value or 0))
 
@@ -167,39 +186,50 @@ class AgentLoop:
                         try:
                             await consume_model()
                         except Exception as exc:
-                            await span.model_call(
+                            await record_model_failure(
+                                span, exc, component=f"model.{self.provider.provider_name}",
                                 provider=self.provider.provider_name,
                                 model=self.provider.model_name or "unknown",
                                 operation="stream",
                                 latency_ms=round((time.perf_counter() - started) * 1000, 3),
+                                time_to_first_token_ms=first_token_ms,
                                 finish_reason=finish_reason,
-                                status=Status.FAILED,
-                                error_code=type(exc).__name__,
-                                error_message=str(exc),
-                                input_summary={"message_count": len(model_messages)},
-                            )
-                            await span.capture_exception(
-                                exc,
-                                component=f"model.{self.provider.provider_name}",
+                                input_summary=model_input,
+                                output_summary={"content": "".join(assistant_text)},
                             )
                             raise
                         await span.model_call(
                             provider=self.provider.provider_name,
                             model=self.provider.model_name or "unknown",
                             operation="stream",
-                            input_tokens=usage["input_tokens"],
-                            output_tokens=usage["output_tokens"],
-                            reasoning_tokens=usage["reasoning_tokens"],
-                            cached_tokens=usage["cached_tokens"],
+                            **model_usage_fields({key: usage[key] for key in usage_keys}),
                             latency_ms=round((time.perf_counter() - started) * 1000, 3),
+                            time_to_first_token_ms=first_token_ms,
                             finish_reason=finish_reason,
-                            input_summary={
-                                "message_count": len(model_messages),
-                                "roles": [message.get("role") for message in model_messages],
-                            },
+                            input_summary=model_input,
                             output_summary={
+                                "content": "".join(assistant_text),
+                                "tool_calls": [
+                                    {
+                                        "id": call.id,
+                                        "name": call.name,
+                                        "arguments": call.arguments,
+                                    }
+                                    for call in pending_calls
+                                ],
                                 "text_length": sum(len(part) for part in assistant_text),
                                 "tool_call_count": len(pending_calls),
+                                "iteration": iteration + 1,
+                                "tool_choice": tool_choice,
+                                "selected_tools": [
+                                    call.name if call.name in self.tools.names() else "unknown_tool"
+                                    for call in pending_calls
+                                ],
+                                "decision": (
+                                    "forced_summary" if force_summary else
+                                    "call_tools" if pending_calls else "final_answer"
+                                ),
+                                "decision_reason": completion_mode if force_summary else None,
                             },
                         )
                 else:
@@ -324,26 +354,37 @@ class AgentLoop:
             run.status = RunStatus.FAILED
             run.error = str(exc)
             run.finished_at = datetime.now(UTC)
-            await self._save_checkpoint(
-                run,
-                messages,
-                iteration=iteration,
-                tool_count=tool_count,
-                stage="failed",
-            )
-            if self.persistence is not None:
-                await self.persistence.finalize(run)
-            await self._emit(
-                run,
-                "run.failed",
-                {"status": run.status.value, "message": str(exc)},
-                severity=Severity.ERROR,
-            )
+            try:
+                await self._save_checkpoint(
+                    run, messages, iteration=iteration, tool_count=tool_count, stage="failed"
+                )
+                if self.persistence is not None:
+                    await self.persistence.finalize(run)
+            except Exception as checkpoint_exc:
+                logger.warning("Failed to persist failed run: %s", type(checkpoint_exc).__name__)
+            try:
+                await self._emit(
+                    run,
+                    "run.failed",
+                    {"status": run.status.value, "message": str(exc)},
+                    severity=Severity.ERROR,
+                )
+            except Exception as event_exc:
+                logger.warning("Failed to persist failure event: %s", type(event_exc).__name__)
         finally:
-            if self.persistence is not None:
-                await self.persistence.finalize(run)
-            if self.observer is not None:
-                await self.observer.finish(run)
+            try:
+                if self.persistence is not None:
+                    await self.persistence.finalize(run)
+                if self.observer is not None:
+                    try:
+                        await self.observer.finish(run)
+                    except Exception as observer_exc:
+                        logger.warning(
+                            "Failed to finish observation: %s", type(observer_exc).__name__
+                        )
+            finally:
+                if context_token is not None:
+                    reset_current_context(context_token)
 
     async def _execute_pending_tools(
         self,
@@ -423,6 +464,10 @@ class AgentLoop:
             if render_hint is not None:
                 event_payload["render_hint"] = render_hint
         await self._emit(run, "tool.completed", event_payload)
+        if self.observer is not None:
+            await self.observer.reused_tool(
+                call.name if tool is not None else "unknown_tool", call.arguments, result_payload
+            )
         messages.append(
             {
                 "role": "tool",
@@ -474,9 +519,9 @@ class AgentLoop:
         started = time.perf_counter()
         tool_span = (
             self.observer.span(
-                call.name,
+                call.name if tool is not None else "unknown_tool",
                 kind=SpanKind.TOOL,
-                component_name=call.name,
+                component_name=call.name if tool is not None else "unknown_tool",
                 input_data={"arguments": call.arguments},
             )
             if self.observer
@@ -533,7 +578,7 @@ class AgentLoop:
                 latency_ms = round((time.perf_counter() - started) * 1000, 3)
                 await span.tool_call(
                     tool_call_id=call.id,
-                    tool_name=call.name,
+                    tool_name=call.name if tool is not None else "unknown_tool",
                     operation="execute",
                     arguments=call.arguments,
                     result_summary=result_payload,

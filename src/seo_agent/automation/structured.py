@@ -9,9 +9,10 @@ from typing import Any, Protocol
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from src.observability.client import ObservabilityClient
-from src.observability.models import SpanKind, Status
+from src.observability.instrumentation import model_usage_fields, record_model_failure
+from src.observability.models import SpanKind
 from src.promptops.registry import PromptRegistry
-from src.seo_agent.automation.model_result import invoke_structured_model
+from src.seo_agent.automation.model_result import invoke_structured_model, model_provider_name
 from src.seo_agent.automation.models import DeliveryReviewOutput
 from src.seo_agent.automation.prompts import builtin_prompt
 from src.seo_agent.db.database import SeoAgentDatabase
@@ -167,7 +168,7 @@ class StructuredModelAutomation:
         await self.system.append_work_record(
             site_id=task["site_id"],
             title="完成交付验收",
-            summary=f"{delivery['title']} 验收结果：{output.status}，{output.score} 分",
+            summary=f"{delivery['title']} 验收结果：{review['status']}，{review['score']} 分",
             record_type="delivery_reviewed",
             actor_id=reviewer_actor_id,
             idempotency_key=f"delivery-reviewed:{review['id']}",
@@ -234,28 +235,25 @@ class StructuredModelAutomation:
                     kind=SpanKind.MODEL,
                     component_name=self._model_provider_name(model),
                 ) as span:
+                    started = time.perf_counter()
                     try:
                         invocation, latency_ms = await invoke()
                         validated = schema.model_validate(invocation.parsed)
                     except Exception as exc:
-                        await span.model_call(
+                        await record_model_failure(
+                            span, exc, issue_type="STRUCTURED_OUTPUT_FAILED", component=operation,
+                            context={"prompt_version_id": prompt.get("id")},
                             provider=self._model_provider_name(model),
                             model=self._model_name(model),
                             operation=operation,
                             prompt_key=prompt_key,
                             prompt_version=prompt["version_label"],
                             prompt_version_id=prompt.get("id"),
-                            status=Status.FAILED,
-                            error_code=type(exc).__name__,
-                            error_message=str(exc),
+                            latency_ms=round((time.perf_counter() - started) * 1000, 3),
                             structured_output_valid=False,
-                            input_summary={"business_object": business_object},
-                        )
-                        await span.capture_exception(
-                            exc,
-                            issue_type="STRUCTURED_OUTPUT_FAILED",
-                            component=operation,
-                            context={"prompt_version_id": prompt.get("id")},
+                            input_summary={
+                                "business_object": business_object, "messages": messages
+                            },
                         )
                         raise
                     await span.model_call(
@@ -265,14 +263,11 @@ class StructuredModelAutomation:
                         prompt_key=prompt_key,
                         prompt_version=prompt["version_label"],
                         prompt_version_id=prompt.get("id"),
-                        input_tokens=invocation.usage.get("input_tokens"),
-                        output_tokens=invocation.usage.get("output_tokens"),
-                        reasoning_tokens=invocation.usage.get("reasoning_tokens"),
-                        cached_tokens=invocation.usage.get("cached_tokens"),
+                        **model_usage_fields(invocation.usage),
                         latency_ms=latency_ms,
                         finish_reason=invocation.finish_reason,
                         structured_output_valid=True,
-                        input_summary={"business_object": business_object},
+                        input_summary={"business_object": business_object, "messages": messages},
                         output_summary=validated.model_dump(mode="json"),
                     )
                     return _StructuredBusinessResult(
@@ -284,7 +279,7 @@ class StructuredModelAutomation:
 
     @staticmethod
     def _model_provider_name(model: Any) -> str:
-        return str(getattr(model, "provider_name", model.__class__.__name__)).lower()
+        return model_provider_name(model)
 
     @staticmethod
     def _model_name(model: Any) -> str:

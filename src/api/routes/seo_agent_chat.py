@@ -101,7 +101,9 @@ async def _schedule_restored_run(run: AgentRun) -> None:
     if not run.site_id:
         raise RuntimeError("恢复运行缺少 site_id")
     site = await seo_agent_system_service.get_site(run.site_id)
-    registry = build_seo_agent_registry(facade, site)
+    registry = build_seo_agent_registry(
+        facade, site, observability=observability_client if observability_database.started else None
+    )
     if not registry.schemas():
         raise RuntimeError("恢复运行没有真实 SEO 数据工具可用")
     provider = build_seo_model_provider()
@@ -125,7 +127,9 @@ async def create_run(body: CreateSeoAgentRunRequest) -> CreateSeoAgentRunRespons
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     if str(site.get("status") or "ACTIVE") != "ACTIVE":
         raise HTTPException(status_code=409, detail="站点当前不可用于 SEO Agent 调查")
-    registry = build_seo_agent_registry(facade, site)
+    registry = build_seo_agent_registry(
+        facade, site, observability=observability_client if observability_database.started else None
+    )
     if not registry.schemas():
         raise HTTPException(
             status_code=503,
