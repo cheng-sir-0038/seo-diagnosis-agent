@@ -137,6 +137,35 @@ async def test_html_site_publish_is_persisted_as_observed_tool_call(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stored_content", "html_content"),
+    [(None, "<h1>Unreviewed</h1>"), ("{}", "<h1>Guide</h1>"), ("invalid", "<h1>Guide</h1>")],
+)
+async def test_publish_rejects_html_that_was_not_in_the_accepted_delivery(
+    context, stored_content: str | None, html_content: str
+) -> None:
+    db, _, owner, task, delivery, tmp_path = context
+    adapter = HtmlSitePublishAdapter(
+        HtmlSiteSettings(root_path=tmp_path / "site", base_url="https://example.com")
+    )
+    service = PublishingService(db, adapter, MonitoringService(db))
+    if stored_content is not None:
+        await db.execute(
+            "UPDATE deliveries SET structured_content_json = ? WHERE id = ?",
+            (stored_content, delivery["id"]),
+        )
+
+    with pytest.raises(ValueError, match="验收"):
+        await service.publish_delivery(
+            task_id=task["id"], delivery_id=delivery["id"], slug="guide",
+            html_content=html_content, submitted_by_actor_id=owner["id"],
+            idempotency_key="publish:unreviewed", target_environment="preview",
+        )
+    assert not (tmp_path / "site/guide.html").exists()
+    assert await db.fetch_value("SELECT COUNT(*) FROM publish_records") == 0
+
+
+@pytest.mark.asyncio
 async def test_publish_confirmation_creates_default_indexing_checks(context) -> None:
     db, _, owner, task, delivery, tmp_path = context
     adapter = HtmlSitePublishAdapter(

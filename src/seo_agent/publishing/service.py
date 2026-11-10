@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 
 # ruff: noqa: E501
@@ -125,6 +126,16 @@ class PublishingService:
             raise KeyError(f"交付不存在或不属于任务: {delivery_id}")
         if delivery["status"] != "ACCEPTED":
             raise ValueError("只有验收通过的交付才能发布")
+        try:
+            content = json.loads(delivery["structured_content_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("验收通过的交付内容无效") from exc
+        if (
+            not isinstance(content, dict)
+            or not isinstance(content.get("html"), str)
+            or content["html"] != html_content
+        ):
+            raise ValueError("发布 HTML 必须与验收通过的交付内容一致")
         policy = self.action_policy.evaluate(
             action_type="PUBLISH_CONTENT",
             target_environment=target_environment,
