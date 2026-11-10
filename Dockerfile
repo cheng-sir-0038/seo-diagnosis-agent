@@ -37,4 +37,4 @@ RUN mkdir -p /app/data
 EXPOSE 8000
 
 # 生产环境使用 uvicorn 不加 --reload
-CMD ["uvicorn", "src.server:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "-m", "uvicorn", "src.server:app", "--host", "0.0.0.0", "--port", "8000"]
