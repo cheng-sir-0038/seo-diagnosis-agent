@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -9,7 +10,7 @@ from src.core.exceptions import (
     InternalDataNotAvailableError,
     InternalProviderResponseError,
 )
-from src.providers.page_metadata.client import PageMetadataClient
+from src.providers.page_metadata.client import PageMetadataClient, _PublicResolver
 from src.providers.page_metadata.config import PageMetadataConfig
 
 
@@ -109,3 +110,39 @@ async def test_client_rejects_non_html_and_oversized_body() -> None:
     client._session = FakeSession([FakeResponse(200, {"Content-Type": "text/html"}, b"123456")])
     with pytest.raises(InternalProviderResponseError, match="大小限制"):
         await client.fetch(site_id="example.com")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "target", ["localhost", "127.0.0.1", "169.254.169.254", "private.internal"]
+)
+async def test_client_rejects_local_and_private_targets(target: str) -> None:
+    client = PageMetadataClient()
+    client._session = FakeSession([])
+    with pytest.raises(InternalAdapterError, match="公网"):
+        await client.fetch(site_id=target)
+    assert client._session.urls == []
+
+
+@pytest.mark.asyncio
+async def test_resolver_rejects_mixed_public_and_private_dns_answers() -> None:
+    resolver = _PublicResolver()
+    resolver._resolver.resolve = AsyncMock(return_value=[
+        {"host": "93.184.216.34"}, {"host": "127.0.0.1"},
+    ])
+    with pytest.raises(OSError, match="公网"):
+        await resolver.resolve("example.com", 443)
+    await resolver.close()
+
+
+@pytest.mark.asyncio
+async def test_resolver_uses_validated_public_answers_for_fake_ip(monkeypatch) -> None:
+    resolver = _PublicResolver()
+    resolver._resolver.resolve = AsyncMock(return_value=[{"host": "198.18.0.1"}])
+    monkeypatch.setattr(
+        "src.providers.page_metadata.client._query_public_dns",
+        lambda _host, record_type: ["93.184.216.34"] if record_type == "A" else [],
+    )
+    result = await resolver.resolve("example.com", 443)
+    assert [record["host"] for record in result] == ["93.184.216.34"]
+    await resolver.close()

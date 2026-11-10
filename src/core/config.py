@@ -60,7 +60,7 @@ class Settings(BaseSettings):
     debug: bool = True
 
     # ---- 服务绑定 ----
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = 8000
 
     # ---- 缓存与存储 ----
@@ -110,12 +110,11 @@ class Settings(BaseSettings):
     python_seo_analyzer_timeout: float = 8.0
     python_seo_analyzer_max_output_bytes: int = 1_000_000
 
-    # ---- GSC API ----
+    # ---- GSC / GA4 配置预留：当前没有对应数据源实现 ----
     gsc_client_id: str = ""
     gsc_client_secret: str = ""
     gsc_refresh_token: str = ""
 
-    # ---- GA4 API ----
     ga4_property_id: str = ""
     ga4_credentials_file: str = ""
 

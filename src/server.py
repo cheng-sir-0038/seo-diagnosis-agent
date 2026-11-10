@@ -3,7 +3,7 @@ FastAPI 服务入口
 
 启动命令::
 
-    uv run uvicorn src.server:app --reload --host 0.0.0.0 --port 8000
+    uv run uvicorn src.server:app --reload --host 127.0.0.1 --port 8000
 
 API 文档自动生成:
   - Swagger UI: http://localhost:8000/docs
@@ -42,6 +42,7 @@ API 文档自动生成:
 
 from __future__ import annotations
 
+import re
 import uuid
 from contextlib import asynccontextmanager
 
@@ -182,7 +183,7 @@ app = FastAPI(
     - **Ahrefs**: 当前仍为伪模式，不进入正式 SEO Chat 诊断
 
     ### 后续扩展
-    完整能力与限制见仓库中的 tool-contracts 和 known-limitations 文档。
+    完整能力与限制见仓库 README。
     """,
     version="1.0.0-alpha",
     lifespan=lifespan,
@@ -190,14 +191,23 @@ app = FastAPI(
     redoc_url="/redoc" if settings.debug else None,
 )
 
-# CORS（开源后允许前端调用）
+LOCAL_ORIGIN_PATTERN = r"https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::[0-9]{1,5})?"
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"] if settings.debug else [],
-    allow_credentials=True,
+    allow_origin_regex=LOCAL_ORIGIN_PATTERN,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def reject_external_browser_origins(request: Request, call_next):
+    origin = request.headers.get("origin")
+    if origin and not re.fullmatch(LOCAL_ORIGIN_PATTERN, origin):
+        return JSONResponse(status_code=403, content={"detail": "只允许本机前端访问"})
+    return await call_next(request)
 
 
 # ============================================================

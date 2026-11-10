@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
+import ipaddress
+import json
+import socket
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlencode, urljoin, urlparse
+from urllib.request import Request, urlopen
+
+from aiohttp.abc import AbstractResolver
+from aiohttp.resolver import DefaultResolver
 
 from src.core.exceptions import (
     ErrorCode,
@@ -15,6 +23,74 @@ from src.core.exceptions import (
     InternalProviderResponseError,
 )
 from src.providers.page_metadata.config import PageMetadataConfig
+
+
+def _public_address(value: str) -> bool:
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return address.is_global and not address.is_multicast
+
+
+def _fake_ip(value: str) -> bool:
+    try:
+        return ipaddress.ip_address(value) in ipaddress.ip_network("198.18.0.0/15")
+    except ValueError:
+        return False
+
+
+def _query_public_dns(host: str, record_type: str) -> list[str]:
+    # shortcut: one public DNS service; add configurable providers if it is unavailable.
+    query = urlencode({"name": host, "type": record_type})
+    request = Request(
+        f"https://dns.google/resolve?{query}", headers={"Accept": "application/dns-json"}
+    )
+    with urlopen(request, timeout=5) as response:
+        body = response.read(65_537)
+    if len(body) > 65_536:
+        raise OSError("公网 DNS 响应超过大小限制")
+    data = json.loads(body)
+    if not isinstance(data, dict) or data.get("Status") != 0:
+        raise OSError("公网 DNS 查询失败")
+    expected = 1 if record_type == "A" else 28
+    return [
+        str(item["data"])
+        for item in data.get("Answer", [])
+        if isinstance(item, dict) and item.get("type") == expected and "data" in item
+    ]
+
+
+class _PublicResolver(AbstractResolver):
+    """Return only validated addresses to aiohttp, avoiding a second DNS lookup."""
+
+    def __init__(self) -> None:
+        self._resolver = DefaultResolver()
+
+    async def resolve(
+        self, host: str, port: int = 0, family: int = socket.AF_INET
+    ) -> list[dict[str, Any]]:
+        records = await self._resolver.resolve(host, port, family)
+        addresses = [record["host"] for record in records]
+        if addresses and all(_fake_ip(address) for address in addresses):
+            answers = await asyncio.gather(
+                *(asyncio.to_thread(_query_public_dns, host, kind) for kind in ("A", "AAAA"))
+            )
+            addresses = list(dict.fromkeys(address for group in answers for address in group))
+            records = [
+                {
+                    "hostname": host, "host": address, "port": port,
+                    "family": socket.AF_INET6 if ":" in address else socket.AF_INET,
+                    "proto": 0, "flags": 0,
+                }
+                for address in addresses
+            ]
+        if not addresses or any(not _public_address(address) for address in addresses):
+            raise OSError("页面目标必须解析为公网地址")
+        return records
+
+    async def close(self) -> None:
+        await self._resolver.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +108,7 @@ class PageMetadataClient:
     def __init__(self, config: PageMetadataConfig | None = None) -> None:
         self.config = config or PageMetadataConfig()
         self._session: Any = None
+        self._resolver: _PublicResolver | None = None
         self._request_count = 0
 
     async def startup(self) -> None:
@@ -39,7 +116,9 @@ class PageMetadataClient:
 
         if self._session is not None:
             return
+        self._resolver = _PublicResolver()
         self._session = aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(resolver=self._resolver, use_dns_cache=False),
             timeout=aiohttp.ClientTimeout(total=self.config.request_timeout),
             headers={
                 "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.1",
@@ -51,6 +130,9 @@ class PageMetadataClient:
         if self._session is not None:
             await self._session.close()
             self._session = None
+        if self._resolver is not None:
+            await self._resolver.close()
+            self._resolver = None
 
     async def fetch(self, *, site_id: str, url: str | None = None) -> FetchedHtmlPage:
         if self._session is None:
@@ -178,14 +260,31 @@ def normalize_site_url(value: str) -> str:
     if "://" not in text:
         text = f"https://{text}"
     parsed = urlparse(text)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise _invalid("页面 URL 必须是有效的 HTTP/HTTPS 站内地址", text) from exc
     if (
         parsed.scheme not in {"http", "https"}
         or not parsed.hostname
         or parsed.username
         or parsed.password
-        or parsed.port not in {None, 80, 443}
+        or port not in {None, 80, 443}
     ):
         raise _invalid("页面 URL 必须是有效的 HTTP/HTTPS 站内地址", text)
+    host = parsed.hostname.lower().rstrip(".")
+    if host == "localhost" or host.endswith(
+        (".localhost", ".local", ".internal", ".lan", ".home.arpa")
+    ):
+        raise _invalid("页面 URL 必须是公网地址", text)
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        if "." not in host:
+            raise _invalid("页面 URL 必须是公网地址", text) from None
+    else:
+        if not _public_address(host):
+            raise _invalid("页面 URL 必须是公网地址", text)
     return parsed._replace(path=parsed.path or "/", fragment="").geturl()
 
 
