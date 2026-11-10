@@ -151,6 +151,39 @@ async def test_seo_data_tool_bridge_persists_adapter_observation(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_ingest_candidate_api_preserves_validated_candidate(context, monkeypatch) -> None:
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+
+    from src.api.routes import seo_agent_opportunities
+
+    db, site, owner, agent, schedule, approvals, notifications = context
+    scan = await ScanRunService(db).start(
+        schedule_id=schedule["id"], trigger_type="MANUAL", idempotency_key="scan:api-ingest"
+    )
+    service = OpportunityService(db, approvals=approvals, notifications=notifications)
+    monkeypatch.setattr(seo_agent_opportunities, "opportunity_service", service)
+    app = FastAPI()
+    app.include_router(seo_agent_opportunities.router)
+    payload = {
+        "site_id": site["id"], "scan_run_id": scan["id"], "candidate": candidate().model_dump(),
+        "changed_by_actor_id": agent["id"], "default_approver_actor_id": owner["id"],
+        "idempotency_key": "candidate:api-ingest",
+    }
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        first = await client.post("/seo-agent/opportunities/ingest", json=payload)
+        assert first.status_code == 201
+        repeated = await client.post("/seo-agent/opportunities/ingest", json=payload)
+        assert repeated.status_code == 201
+        assert repeated.json()["id"] == first.json()["id"]
+        invalid = await client.post(
+            "/seo-agent/opportunities/ingest", json={**payload, "candidate": {"title": "bad"}}
+        )
+        assert invalid.status_code == 422
+    assert await db.fetch_value("SELECT COUNT(*) FROM opportunities") == 1
+
+
+@pytest.mark.asyncio
 async def test_opportunity_upsert_adds_observation_keywords_approval_and_notification(
     context,
 ) -> None:
@@ -262,6 +295,52 @@ async def test_opportunity_decision_does_not_request_approval_again(
         "from_status": "WAITING_FOR_DECISION", "to_status": expected_status,
         "changed_by_actor_id": owner["id"],
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("factor", "expected_initial"), [(30, "OBSERVED"), (65, "OPPORTUNITY_POOL")]
+)
+@pytest.mark.parametrize(
+    ("decision", "expected_final"), [("APPROVE", "APPROVED"), ("REJECT", "REJECTED")]
+)
+async def test_manual_approval_for_non_high_opportunity(
+    context, factor: int, expected_initial: str, decision: str, expected_final: str
+) -> None:
+    from src.seo_agent.tasks.service import TaskDeliveryService
+
+    db, site, owner, agent, schedule, approvals, notifications = context
+    scan = await ScanRunService(db).start(
+        schedule_id=schedule["id"], trigger_type="MANUAL", idempotency_key="scan:manual"
+    )
+    proposal = candidate()
+    proposal.score_factors = OpportunityScoreFactors(
+        search_demand=factor, business_intent=factor, content_gap=factor,
+        difficulty_fit=factor, site_fit=factor, evidence_confidence=factor,
+    )
+    opportunities = OpportunityService(db, approvals=approvals, notifications=notifications)
+    opportunity = await opportunities.upsert_candidate(
+        site_id=site["id"], scan_run_id=scan["id"], candidate=proposal,
+        changed_by_actor_id=agent["id"], idempotency_key="candidate:manual",
+        default_approver_actor_id=owner["id"],
+    )
+    assert opportunity["status"] == expected_initial
+    assert await approvals.list_pending(site["id"]) == []
+    action = await approvals.create_action(
+        site_id=site["id"], action_type="ADD_OPPORTUNITY_TO_PRODUCTION", risk_level="HIGH",
+        target_type="opportunity", target_id=opportunity["id"], requested_payload={},
+        approver_actor_id=owner["id"], idempotency_key="approval:manual",
+    )
+    with pytest.raises(PermissionError):
+        await approvals.decide(action_id=action["id"], actor_id=agent["id"], decision=decision)
+    await approvals.decide(action_id=action["id"], actor_id=owner["id"], decision=decision)
+    assert (await opportunities.get(opportunity["id"]))["status"] == expected_final
+    if decision == "APPROVE":
+        task = await TaskDeliveryService(db).create_task(
+            site_id=site["id"], title="Guide", task_type="ARTICLE", priority="LOW",
+            opportunity_ids=[opportunity["id"]], owner_actor_id=owner["id"],
+        )
+        assert task["status"] == "DRAFT"
 
 
 @pytest.mark.asyncio

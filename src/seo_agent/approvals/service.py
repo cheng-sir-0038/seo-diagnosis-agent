@@ -170,12 +170,12 @@ class ApprovalService:
                 if opportunity is None:
                     raise KeyError("审批对应的机会不存在或不属于当前站点")
                 expected = {
-                    "WAITING_FOR_APPROVAL": "WAITING_FOR_DECISION",
-                    "APPROVED": "APPROVED",
-                    "EDITED_AND_APPROVED": "APPROVED",
-                    "REJECTED": "REJECTED",
-                }.get(action["status"])
-                if opportunity["status"] != expected:
+                    "WAITING_FOR_APPROVAL": {"WAITING_FOR_DECISION", "OPPORTUNITY_POOL", "OBSERVED"},
+                    "APPROVED": {"APPROVED"},
+                    "EDITED_AND_APPROVED": {"APPROVED"},
+                    "REJECTED": {"REJECTED"},
+                }.get(action["status"], set())
+                if opportunity["status"] not in expected:
                     raise ValueError("审批动作与机会状态不一致，请刷新后重试")
                 if action["status"] != "WAITING_FOR_APPROVAL" and normalized != "DECISION_CORRECTED":
                     async with connection.execute(

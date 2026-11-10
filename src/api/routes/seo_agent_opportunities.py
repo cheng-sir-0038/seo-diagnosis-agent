@@ -45,7 +45,9 @@ async def complete_scan(run_id: str) -> dict:
 
 @router.post("/opportunities/ingest", status_code=201)
 async def ingest_candidate(body: CandidateRequest) -> dict:
-    return await opportunity_service.upsert_candidate(**body.model_dump())
+    return await opportunity_service.upsert_candidate(
+        candidate=body.candidate, **body.model_dump(exclude={"candidate"})
+    )
 
 
 @router.get("/opportunities")
