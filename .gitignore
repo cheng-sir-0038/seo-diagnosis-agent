@@ -6,6 +6,7 @@ dist/
 build/
 .worktrees/
 .superpowers/
+/.agents/workflows/
 
 # 环境变量（含敏感信息）
 .env
