@@ -28,6 +28,7 @@
     "user_input": "查询当前自然关键词",
     "required_tools": ["seo_organic_keywords"],
     "forbidden_tools": ["seo_search_history", "seo_audit_issues"],
+    "forbidden_available_tools": ["seo_search_history", "seo_audit_issues"],
     "ordered_tools": ["seo_organic_keywords"],
     "terminal_status": "completed"
   }
