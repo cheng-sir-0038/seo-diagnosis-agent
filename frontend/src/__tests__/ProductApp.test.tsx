@@ -80,10 +80,11 @@ describe('SEO specialist product app', () => {
     expect(createdSitePayload).toMatchObject({ default_country: 'US', default_language: 'en-US' })
   })
 
-  it('opens the GPT-style chat first and switches product tabs', async () => {
+  it('opens chat when an unavailable product route is requested', async () => {
     const productConfig = { siteId: 'site-1', ownerActorId: 'owner-1', agentActorId: 'agent-1', executorActorId: 'executor-1' }
     saveProductConfig(productConfig)
     window.localStorage.setItem('seo-agent-product-config-v1', JSON.stringify(productConfig))
+    window.history.replaceState(null, '', '/#/schedules')
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
       const url = String(input)
       if (url.includes('/sites/site-1')) return json({ id: 'site-1', name: 'Demo', domain: 'example.com' })
@@ -100,9 +101,6 @@ describe('SEO specialist product app', () => {
     render(<App />)
     expect(await screen.findByText('向 SEO 优化专员提问')).toBeInTheDocument()
     expect(screen.getByRole('tab', { name: /对话/ })).toHaveAttribute('aria-selected', 'true')
-    expect(screen.getByRole('tab', { name: /数据总览/ })).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('tab', { name: /工作计划/ }))
-    expect(await screen.findByRole('heading', { name: '工作计划' })).toBeInTheDocument()
     await waitFor(() => expect(fetchMock).toHaveBeenCalled())
   })
 })
