@@ -9,7 +9,7 @@
 - **Agent Loop**：`src/agent/loop.py` 让模型根据问题和已有结果决定下一步工具调用；限制迭代次数、去重已成功的调用，并在达到预算时收束回答。
 - **运行与恢复**：`src/agent/harness/` 保存 Task、Thread、Run、事件、Checkpoint 和 Survival Summary；SEO Chat 支持服务重启后恢复、取消和 SSE 断线重连。
 - **轨迹评测**：`src/agent/evals/` 检查工具调用与预期轨迹，例如页面 TDK 问题不能用 SERP 冒充页面源码，模拟数据不能作为正式诊断工具。样例见 [`tests/agent_evals/`](tests/agent_evals/)。
-- **审批工作流**：`src/seo_agent/approvals/graph.py` 使用 LangGraph 中断等待审批，并在收到决定后恢复；机会、任务、交付、发布和监控也有业务代码和接口，完整真实业务链路仍需验收。
+- **审批工作流**：审批接口记录决定，并同步“将机会加入生产”动作对应的机会状态。`src/seo_agent/approvals/graph.py` 的 LangGraph 中断和恢复已有独立测试，但当前审批接口尚未接入该图。机会、任务、交付、发布和监控已有业务代码和接口，完整真实业务链路仍需验收。
 - **工作台和接口**：`frontend/` 提供 React 对话与结构化结果展示；FastAPI 提供 SEO Chat、SSE、审批和兼容的 `POST /api/v1/query` 查询接口。
 - **页面基础体检**：`src/seo_agent/workflows/site_audit.py` 复用页面元信息工具；用户同时要求性能检查时，再调用已配置的 PageSpeed 工具，并保留各项证据和失败状态。
 
@@ -27,7 +27,7 @@ DataFacade / Provider Router
 SSE 返回过程和结论；SQLite 保存事件与检查点
 ```
 
-需要人工决定的长期业务流程另由 LangGraph 审批图处理。当前 Chat 工具只读，不会自动修改网站或发布内容。
+长期业务的审批决定通过审批接口记录；LangGraph 审批图目前只做过独立验证，尚未接入该接口。当前 Chat 工具只读，不会自动修改网站或发布内容。
 
 | 数据来源 | 当前状态 |
 | --- | --- |
@@ -88,6 +88,8 @@ python -m pytest tests/agent tests/agent_evals -q
 
 - 这是单机 MVP，SQLite 不适合多实例生产部署；真实站点的长期成功率、费用和限流仍需持续验证。
 - 审批、任务、发布和监控已有基础实现，但不等于整条业务闭环已经完成真实端到端验收。
+- 批准机会不会自动创建任务；当前任务创建接口也不会检查关联机会的审批状态。
+- HTML 发布要求交付中已有经审核的 `structured_content.html`，请求中的 `html_content` 必须与其完全一致。
 - [seo-audit-plugin](https://github.com/cheng-sir-0038/seo-audit-plugin) 是独立的只读 SEO 插件；当前仓库尚未接入该插件的 MCP，两个项目不能描述为已联通。独立 Agent 尚未实现 GSC 或 GA4 数据源，插件的 OAuth 凭据复制到本仓库也不会生效。
 
 本项目采用 [MIT 许可证](LICENSE)。
