@@ -1,0 +1,3 @@
+# Isolated runtime only. Do not merge into requirements.txt because pyseoanalyzer
+# pins LangChain 0.3.x while the main Agent runtime uses LangChain 1.x.
+pyseoanalyzer==2025.4.3

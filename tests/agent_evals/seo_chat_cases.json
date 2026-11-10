@@ -1,0 +1,34 @@
+[
+  {
+    "case_id": "tdk",
+    "user_input": "检查当前首页的 TDK 情况",
+    "required_tools": ["seo_page_metadata"],
+    "forbidden_tools": ["seo_serp_overview", "seo_page_performance"],
+    "ordered_tools": ["seo_page_metadata"],
+    "terminal_status": "completed"
+  },
+  {
+    "case_id": "pagespeed",
+    "user_input": "检测首页移动端加载速度",
+    "required_tools": ["seo_page_performance"],
+    "forbidden_tools": ["seo_page_metadata"],
+    "ordered_tools": ["seo_page_performance"],
+    "terminal_status": "completed"
+  },
+  {
+    "case_id": "serp-display",
+    "user_input": "查看百度搜索结果里首页如何展示",
+    "required_tools": ["seo_serp_overview"],
+    "forbidden_tools": ["seo_page_metadata"],
+    "ordered_tools": ["seo_serp_overview"],
+    "terminal_status": "completed"
+  },
+  {
+    "case_id": "organic-keywords",
+    "user_input": "查询当前自然关键词",
+    "required_tools": ["seo_organic_keywords"],
+    "forbidden_tools": ["seo_search_history", "seo_audit_issues"],
+    "ordered_tools": ["seo_organic_keywords"],
+    "terminal_status": "completed"
+  }
+]

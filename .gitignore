@@ -1,0 +1,38 @@
+# 排除版本控制
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.worktrees/
+.superpowers/
+
+# 环境变量（含敏感信息）
+.env
+.env.*
+!.env.example
+
+# 数据文件
+data/
+*.db
+*.sqlite3
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 虚拟环境
+.venv/
+venv/
+/uv.lock
+
+# 测试
+.coverage
+htmlcov/
+.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db
