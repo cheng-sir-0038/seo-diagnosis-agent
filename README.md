@@ -2,6 +2,18 @@
 
 一个网站 SEO 诊断 Agent MVP。用户用自然语言提问，Agent 选择只读工具查询数据、整理回答，并记录运行过程。项目使用 Python、FastAPI、React 和 SQLite。
 
+## 受控的工具循环
+
+Agent 的核心不是「能调工具」，是**知道什么时候停**。三条约束写死在代码里，不依赖提示词自觉：
+
+| 约束 | 位置 | 值 |
+|---|---|---|
+| 单次调查工具调用上限 | `AgentLoop.max_tool_calls` | 12 |
+| 单次工具超时 | `AgentLoop.tool_timeout` | 15s |
+| 重复调用检测 | `_DUPLICATE_GUARD_PREFIX` | 命中即停，改为基于已有证据作答 |
+
+到达预算不是静默截断：循环切换到总结模式，只基于已获得的证据作答，并必须输出「已确认结论 / 关键证据 / 数据不足或失败项 / 下一步建议」四段，不得继续补查、不得编造数据。
+
 ## SEO Agent 工作流
 
 业务工作流目录是 [`src/seo_agent/workflows/`](src/seo_agent/workflows/)，目前有一个单页面体检工作流 [`site_audit.py`](src/seo_agent/workflows/site_audit.py)，以 `seo_site_audit` 工具提供：
