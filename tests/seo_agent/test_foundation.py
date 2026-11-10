@@ -172,6 +172,53 @@ def test_langchain_deepseek_factory_is_configured_without_network() -> None:
 
 
 @pytest.mark.asyncio
+async def test_structured_deepseek_request_uses_supported_thinking_mode(monkeypatch) -> None:
+    import json
+
+    from httpx import AsyncClient, MockTransport, Response
+    from langchain_core.messages import HumanMessage
+    from langchain_deepseek import ChatDeepSeek
+    from pydantic import BaseModel
+
+    from src.seo_agent.automation.model_result import invoke_structured_model
+    from src.seo_agent.models import deepseek
+
+    class Result(BaseModel):
+        answer: str
+
+    requests = []
+
+    async def handle(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        if body.get("thinking") != {"type": "disabled"}:
+            return Response(400, json={"error": {"message": "unsupported tool_choice"}})
+        return Response(200, json={
+            "id": "test", "object": "chat.completion", "model": "deepseek-v4-flash",
+            "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+                "role": "assistant", "content": None, "tool_calls": [{
+                    "id": "call-1", "type": "function",
+                    "function": {"name": "Result", "arguments": '{"answer":"ok"}'},
+                }],
+            }}],
+        })
+
+    async with AsyncClient(transport=MockTransport(handle)) as client:
+        monkeypatch.setattr(
+            deepseek, "ChatDeepSeek",
+            lambda **kwargs: ChatDeepSeek(**kwargs, http_async_client=client),
+        )
+        model = deepseek.LangChainDeepSeekFactory(
+            api_key="test-key", base_url="https://api.deepseek.com", model="deepseek-v4-flash"
+        ).create()
+        model.streaming = False
+        result = await invoke_structured_model(model, Result, [HumanMessage(content="test")])
+    assert result.parsed.answer == "ok"
+    assert requests[0]["thinking"] == {"type": "disabled"}
+    assert requests[0]["tool_choice"]["function"]["name"] == "Result"
+
+
+@pytest.mark.asyncio
 async def test_seo_agent_system_api_uses_real_sqlite_store(tmp_path: Path, monkeypatch) -> None:
     from httpx import ASGITransport, AsyncClient
 

@@ -98,6 +98,7 @@ python -m pytest tests/agent tests/agent_evals -q
 - 审批、任务、发布和监控已有基础实现，但不等于整条业务闭环已经完成真实端到端验收。
 - 批准机会不会自动创建任务。创建任务时，所有关联机会必须属于当前站点，且对应的最新“将机会加入生产”审批已通过。新发现的中低价值机会不会自动发起此审批，可通过审批接口手动创建审批；工作台尚无申请入口。
 - HTML 发布要求交付中已有经审核的 `structured_content.html`，请求中的 `html_content` 必须与其完全一致。
+- PRD 生成、交付审核等结构化任务的 DeepSeek 请求关闭 thinking，以支持工具调用；SEO Chat 保持模型默认模式。
 - [seo-audit-plugin](https://github.com/cheng-sir-0038/seo-audit-plugin) 是独立的只读 SEO 插件；当前仓库尚未接入该插件的 MCP，两个项目不能描述为已联通。独立 Agent 尚未实现 GSC 或 GA4 数据源，插件的 OAuth 凭据复制到本仓库也不会生效。
 
 本项目采用 [MIT 许可证](LICENSE)。

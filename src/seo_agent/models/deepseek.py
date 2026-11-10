@@ -30,4 +30,5 @@ class LangChainDeepSeekFactory:
             timeout=self.timeout,
             max_retries=self.max_retries,
             streaming=True,
+            extra_body={"thinking": {"type": "disabled"}},
         )
