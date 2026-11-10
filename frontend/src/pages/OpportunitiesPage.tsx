@@ -1,5 +1,5 @@
 import { PlusOutlined, ReloadOutlined } from '@ant-design/icons'
-import { Button, Drawer, Empty, Form, Input, message, Modal, Select, Table, Tabs } from 'antd'
+import { Alert, Button, Drawer, Empty, Form, Input, message, Modal, Select, Table, Tabs } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 
@@ -42,14 +42,19 @@ export function OpportunitiesPage() {
 
   const createTask = async (values: { title: string; taskType: string; priority: string }) => {
     if (!config || !selected) return
-    await productApi.createTask({
-      site_id: config.siteId,
-      title: values.title,
-      task_type: values.taskType,
-      priority: values.priority,
-      opportunity_ids: [selected.id],
-      owner_actor_id: config.ownerActorId,
-    })
+    try {
+      await productApi.createTask({
+        site_id: config.siteId,
+        title: values.title,
+        task_type: values.taskType,
+        priority: values.priority,
+        opportunity_ids: [selected.id],
+        owner_actor_id: config.ownerActorId,
+      })
+    } catch (cause) {
+      message.error(cause instanceof Error ? cause.message : '创建任务失败')
+      return
+    }
     message.success('内部任务已创建；PRD 内容等待真实模型配置后生成')
     setTaskModal(false)
     form.resetFields()
@@ -77,8 +82,25 @@ export function OpportunitiesPage() {
         <Table rowKey="id" columns={columns} dataSource={filtered} loading={loading} pagination={{ pageSize: 20 }} locale={{ emptyText: <Empty description="暂无机会；诊断层只会通过结构化候选写入这里" /> }} />
       </section>
 
-      <Drawer title="机会详情" size="large" open={Boolean(selected)} onClose={() => setSelected(null)} extra={selected ? <Button type="primary" icon={<PlusOutlined />} onClick={() => { form.setFieldsValue({ title: selected.title, taskType: 'ARTICLE', priority: selected.priority_level }); setTaskModal(true) }}>创建执行任务</Button> : null}>
+      <Drawer
+        title="机会详情"
+        size="large"
+        open={Boolean(selected)}
+        onClose={() => setSelected(null)}
+        extra={selected ? (
+          <Button
+            type="primary"
+            icon={<PlusOutlined />}
+            disabled={selected.status !== 'APPROVED'}
+            onClick={() => {
+              form.setFieldsValue({ title: selected.title, taskType: 'ARTICLE', priority: selected.priority_level })
+              setTaskModal(true)
+            }}
+          >创建执行任务</Button>
+        ) : null}
+      >
         {selected ? <div className="detail-stack">
+          {selected.status !== 'APPROVED' ? <Alert type="info" showIcon message="关联机会尚未通过审批，暂不能创建任务。" /> : null}
           <div className="detail-hero"><div className="score-orb large">{selected.current_score}</div><div><h2>{selected.title}</h2><p>{selected.current_summary}</p><div className="inline-meta"><StatusPill value={selected.priority_level} /><StatusPill value={selected.status} /></div></div></div>
           <section><h3>关键词</h3><div className="tag-list">{selected.keywords?.map((keyword) => <span key={keyword.id}>{keyword.normalized_keyword}</span>)}</div></section>
           <section><h3>观测历史</h3><pre className="json-preview">{JSON.stringify(selected.observations ?? [], null, 2)}</pre></section>

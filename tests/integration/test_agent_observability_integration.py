@@ -154,7 +154,7 @@ def test_deepseek_parser_emits_usage_chunk() -> None:
 
 @pytest.mark.asyncio
 async def test_structured_prd_resolves_prompt_version_and_records_model_call(
-    tmp_path: Path,
+    tmp_path: Path, approve_opportunity,
 ) -> None:
     business = SeoAgentDatabase(tmp_path / "seo-agent.db")
     observability = ObservabilityDatabase(tmp_path / "observability.db")
@@ -179,11 +179,12 @@ async def test_structured_prd_resolves_prompt_version_and_records_model_call(
         "target_country, target_language, title, current_score, priority_level, status, "
         "current_summary, policy_version, first_seen_at, last_seen_at, created_at, updated_at) "
         "VALUES ('opp-1', ?, 'fp', 'maintenance cost', 'CONTENT_GAP', 'US', 'en', "
-        "'Maintenance Cost', 88, 'HIGH', 'APPROVED', 'pricing gap', 'v1', "
+        "'Maintenance Cost', 88, 'HIGH', 'WAITING_FOR_DECISION', 'pricing gap', 'v1', "
         "'2026-07-24T00:00:00+00:00', '2026-07-24T00:00:00+00:00', "
         "'2026-07-24T00:00:00+00:00', '2026-07-24T00:00:00+00:00')",
         (site["id"],),
     )
+    await approve_opportunity(business, site["id"], "opp-1", owner["id"])
     tasks = TaskDeliveryService(business, artifact_root=tmp_path / "artifacts")
     task = await tasks.create_task(
         site_id=site["id"],

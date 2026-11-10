@@ -21,7 +21,7 @@ from src.seo_agent.tasks.service import TaskDeliveryService
 
 
 @pytest.fixture
-async def context(tmp_path: Path):
+async def context(tmp_path: Path, approve_opportunity):
     db = SeoAgentDatabase(tmp_path / "seo-agent.db")
     await db.startup()
     system = SeoAgentSystemService(db)
@@ -38,9 +38,10 @@ async def context(tmp_path: Path):
     )
     now = "2026-07-23T00:00:00+00:00"
     await db.execute(
-        "INSERT INTO opportunities(id, site_id, fingerprint, normalized_intent, opportunity_type, target_country, target_language, title, current_score, priority_level, status, policy_version, first_seen_at, last_seen_at, created_at, updated_at) VALUES ('opp-1', ?, 'fp', 'intent', 'CONTENT_GAP', 'US', 'en', 'Opportunity', 85, 'HIGH', 'APPROVED', 'v1', ?, ?, ?, ?)",
+        "INSERT INTO opportunities(id, site_id, fingerprint, normalized_intent, opportunity_type, target_country, target_language, title, current_score, priority_level, status, policy_version, first_seen_at, last_seen_at, created_at, updated_at) VALUES ('opp-1', ?, 'fp', 'intent', 'CONTENT_GAP', 'US', 'en', 'Opportunity', 85, 'HIGH', 'WAITING_FOR_DECISION', 'v1', ?, ?, ?, ?)",
         (site["id"], now, now, now, now),
     )
+    await approve_opportunity(db, site["id"], "opp-1", owner["id"])
     tasks = TaskDeliveryService(db, artifact_root=tmp_path / "artifacts")
     task = await tasks.create_task(
         site_id=site["id"],

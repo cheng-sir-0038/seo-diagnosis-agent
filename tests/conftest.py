@@ -7,8 +7,9 @@
     uv run pytest -v --cov=src --cov-report=term-missing
 """
 
+from unittest.mock import AsyncMock
+
 import pytest
-from unittest.mock import AsyncMock, MagicMock
 
 
 @pytest.fixture
@@ -25,3 +26,19 @@ def mock_ahrefs_client():
 def sample_site_id():
     """测试用的站点 ID。"""
     return "example.com"
+
+
+@pytest.fixture
+def approve_opportunity():
+    async def approve(database, site_id, opportunity_id, actor_id):
+        from src.seo_agent.approvals.service import ApprovalService
+
+        service = ApprovalService(database)
+        action = await service.create_action(
+            site_id=site_id, action_type="ADD_OPPORTUNITY_TO_PRODUCTION", risk_level="HIGH",
+            target_type="opportunity", target_id=opportunity_id, requested_payload={},
+            approver_actor_id=actor_id, idempotency_key=f"fixture-approval:{opportunity_id}",
+        )
+        await service.decide(action_id=action["id"], actor_id=actor_id, decision="APPROVE")
+
+    return approve

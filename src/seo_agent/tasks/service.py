@@ -8,6 +8,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import aiosqlite
+
 from src.seo_agent.artifacts.renderers import MarkdownPrdRenderer, PdfPrdRenderer
 from src.seo_agent.db.database import SeoAgentDatabase
 from src.seo_agent.notifications.service import NotificationService
@@ -48,44 +50,72 @@ class TaskDeliveryService:
         created_by_run_id: str | None = None,
         deadline_at: str | None = None,
     ) -> dict[str, Any]:
+        if not opportunity_ids:
+            raise ValueError("至少选择一个机会")
+        if len(set(opportunity_ids)) != len(opportunity_ids):
+            raise ValueError("不能重复选择同一个机会")
+        if not self.database.started:
+            raise RuntimeError("SeoAgentDatabase 尚未启动")
+
         task_id = _id("task")
-        now = _now()
-        await self.database.execute(
-            "INSERT INTO execution_tasks(id, site_id, title, task_type, status, priority, "
-            "deadline_at, created_by_run_id, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, 'DRAFT', ?, ?, ?, ?, ?)",
-            (
-                task_id,
-                site_id,
-                title,
-                task_type,
-                priority,
-                deadline_at,
-                created_by_run_id,
-                now,
-                now,
-            ),
-        )
-        for index, opportunity_id in enumerate(opportunity_ids):
-            await self.database.execute(
-                "INSERT INTO task_opportunities(id, task_id, opportunity_id, relation_type, "
-                "is_primary, linked_by_run_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        # Approval decisions use their own connection; take the same write lock while validating.
+        async with aiosqlite.connect(self.database.path) as connection:
+            connection.row_factory = aiosqlite.Row
+            await connection.execute("PRAGMA foreign_keys = ON")
+            await connection.execute("BEGIN IMMEDIATE")
+            for opportunity_id in opportunity_ids:
+                async with connection.execute(
+                    "SELECT status FROM opportunities "
+                    "WHERE id = ? AND site_id = ? AND archived_at IS NULL",
+                    (opportunity_id, site_id),
+                ) as cursor:
+                    opportunity = await cursor.fetchone()
+                if opportunity is None:
+                    raise KeyError("机会不存在或不属于当前站点")
+                async with connection.execute(
+                    "SELECT status FROM approval_actions WHERE site_id = ? "
+                    "AND target_type = 'opportunity' AND target_id = ? "
+                    "AND action_type = 'ADD_OPPORTUNITY_TO_PRODUCTION' "
+                    "AND archived_at IS NULL ORDER BY requested_at DESC, rowid DESC LIMIT 1",
+                    (site_id, opportunity_id),
+                ) as cursor:
+                    action = await cursor.fetchone()
+                if (
+                    opportunity["status"] != "APPROVED"
+                    or action is None
+                    or action["status"] not in {"APPROVED", "EDITED_AND_APPROVED"}
+                ):
+                    raise ValueError("关联机会尚未通过审批")
+
+            now = _now()
+            await connection.execute(
+                "INSERT INTO execution_tasks(id, site_id, title, task_type, status, priority, "
+                "deadline_at, created_by_run_id, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 'DRAFT', ?, ?, ?, ?, ?)",
                 (
-                    _id("taskopp"),
-                    task_id,
-                    opportunity_id,
-                    "PRIMARY_TARGET" if index == 0 else "SECONDARY_TARGET",
-                    int(index == 0),
-                    created_by_run_id,
-                    now,
+                    task_id, site_id, title, task_type, priority, deadline_at,
+                    created_by_run_id, now, now,
                 ),
             )
-        await self.database.execute(
-            "INSERT INTO task_assignments(id, task_id, actor_id, assignment_role, status, "
-            "assigned_at, created_at) VALUES (?, ?, ?, 'OWNER', 'ASSIGNED', ?, ?)",
-            (_id("assignment"), task_id, owner_actor_id, now, now),
-        )
-        await self._record_task_status(task_id, None, "DRAFT", "任务已创建", owner_actor_id)
+            for index, opportunity_id in enumerate(opportunity_ids):
+                await connection.execute(
+                    "INSERT INTO task_opportunities(id, task_id, opportunity_id, relation_type, "
+                    "is_primary, linked_by_run_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        _id("taskopp"), task_id, opportunity_id,
+                        "PRIMARY_TARGET" if index == 0 else "SECONDARY_TARGET", int(index == 0),
+                        created_by_run_id, now,
+                    ),
+                )
+            await connection.execute(
+                "INSERT INTO task_assignments(id, task_id, actor_id, assignment_role, status, "
+                "assigned_at, created_at) VALUES (?, ?, ?, 'OWNER', 'ASSIGNED', ?, ?)",
+                (_id("assignment"), task_id, owner_actor_id, now, now),
+            )
+            await self._record_task_status(
+                task_id, None, "DRAFT", "任务已创建", owner_actor_id, connection=connection
+            )
+            await connection.commit()
         return await self.get_task(task_id)
 
     async def get_task(self, task_id: str) -> dict[str, Any]:
@@ -433,8 +463,11 @@ class TaskDeliveryService:
         to_status: str,
         reason: str,
         actor_id: str | None,
+        *,
+        connection: aiosqlite.Connection | None = None,
     ) -> None:
-        await self.database.execute(
+        execute = connection.execute if connection else self.database.execute
+        await execute(
             "INSERT INTO task_status_history(id, task_id, from_status, to_status, reason, "
             "changed_by_actor_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (_id("taskstatus"), task_id, from_status, to_status, reason, actor_id, _now()),

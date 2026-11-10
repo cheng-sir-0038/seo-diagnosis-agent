@@ -51,7 +51,7 @@ class FakeSMTP:
 
 
 @pytest.fixture
-async def context(tmp_path: Path):
+async def context(tmp_path: Path, approve_opportunity):
     db = SeoAgentDatabase(tmp_path / "automation.db")
     await db.startup()
     system = SeoAgentSystemService(db)
@@ -74,10 +74,11 @@ async def context(tmp_path: Path):
         "current_summary, "
         "policy_version, first_seen_at, last_seen_at, created_at, updated_at) "
         "VALUES ('opp-1', ?, 'fp', 'waterjet maintenance cost', 'CONTENT_GAP', 'US', 'en', "
-        "'Maintenance Cost', 88, 'HIGH', 'APPROVED', 'Competitors cover pricing', "
+        "'Maintenance Cost', 88, 'HIGH', 'WAITING_FOR_DECISION', 'Competitors cover pricing', "
         "'v1', ?, ?, ?, ?)",
         (site["id"], now, now, now, now),
     )
+    await approve_opportunity(db, site["id"], "opp-1", owner["id"])
     tasks = TaskDeliveryService(db, artifact_root=tmp_path / "artifacts")
     task = await tasks.create_task(
         site_id=site["id"],

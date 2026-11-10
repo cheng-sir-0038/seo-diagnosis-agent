@@ -60,7 +60,12 @@ async def list_tasks(site_id: str, status: str | None = None, limit: int = 100) 
 
 @router.post("", status_code=201)
 async def create_task(body: CreateTaskRequest) -> dict:
-    return await task_delivery_service.create_task(**body.model_dump())
+    try:
+        return await task_delivery_service.create_task(**body.model_dump())
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/{task_id}")
