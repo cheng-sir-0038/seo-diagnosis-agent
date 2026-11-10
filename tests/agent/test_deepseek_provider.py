@@ -1,8 +1,61 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from src.agent.providers.deepseek import DeepSeekProvider
+
+
+@pytest.mark.asyncio
+async def test_deepseek_stream_preserves_utf8_split_across_network_chunks(monkeypatch) -> None:
+    payloads = [
+        {"choices": [{"delta": {"content": "中文"}}]},
+        {"choices": [{"delta": {"tool_calls": [{
+            "index": 0, "id": "call_1", "function": {
+                "name": "search", "arguments": json.dumps({"keyword": "中文"}, ensure_ascii=False),
+            },
+        }]}, "finish_reason": "tool_calls"}]},
+    ]
+    data = "".join(
+        f"data: {json.dumps(payload, ensure_ascii=False)}\n\n" for payload in payloads
+    ).encode() + b"data: [DONE]\n\n"
+
+    class Response:
+        status = 200
+        content = None
+
+        def __init__(self) -> None:
+            self.content = self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def iter_any(self):
+            for byte in data:
+                yield bytes([byte])
+
+    class Session:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def post(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr("src.agent.providers.deepseek.aiohttp.ClientSession", Session)
+    provider = DeepSeekProvider(api_key="test")
+    chunks = [chunk async for chunk in provider.stream([], [])]
+    assert chunks[0].text == "中文"
+    assert chunks[-1].tool_calls[0].arguments == {"keyword": "中文"}
 
 
 def test_deepseek_parser_assembles_streamed_tool_calls() -> None:

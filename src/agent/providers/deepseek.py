@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import json
 from collections import defaultdict
 from collections.abc import AsyncIterator
@@ -8,6 +9,12 @@ from typing import Any
 import aiohttp
 
 from src.agent.providers.base import ModelChunk, ModelProvider, ToolCall
+
+
+class DeepSeekRequestError(RuntimeError):
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+        super().__init__(f"DeepSeek 请求失败: HTTP {status_code}")
 
 
 class DeepSeekProvider(ModelProvider):
@@ -76,10 +83,11 @@ class DeepSeekProvider(ModelProvider):
             ) as response:
                 if response.status >= 400:
                     await response.read()
-                    raise RuntimeError(f"DeepSeek 请求失败: HTTP {response.status}")
+                    raise DeepSeekRequestError(response.status)
                 buffer = ""
+                decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
                 async for raw in response.content.iter_any():
-                    buffer += raw.decode("utf-8", errors="replace")
+                    buffer += decoder.decode(raw)
                     frames = buffer.split("\n\n")
                     buffer = frames.pop() or ""
                     for frame in frames:
@@ -99,17 +107,17 @@ class DeepSeekProvider(ModelProvider):
         usage = payload.get("usage") or {}
         if usage:
             details = usage.get("completion_tokens_details") or {}
-            emitted.append(
-                ModelChunk(
-                    usage={
-                        "input_tokens": int(usage.get("prompt_tokens") or 0),
-                        "output_tokens": int(usage.get("completion_tokens") or 0),
-                        "total_tokens": int(usage.get("total_tokens") or 0),
-                        "cached_tokens": int(usage.get("prompt_cache_hit_tokens") or 0),
-                        "reasoning_tokens": int(details.get("reasoning_tokens") or 0),
-                    }
-                )
-            )
+            counts = {
+                "input_tokens": usage.get("prompt_tokens"),
+                "output_tokens": usage.get("completion_tokens"),
+                "total_tokens": usage.get("total_tokens"),
+                "cached_tokens": usage.get("prompt_cache_hit_tokens"),
+                "reasoning_tokens": details.get("reasoning_tokens"),
+            }
+            if any(value is not None for value in counts.values()):
+                emitted.append(ModelChunk(usage={
+                    key: int(value) for key, value in counts.items() if value is not None
+                }))
         choices = payload.get("choices") or []
         if not choices:
             return emitted
