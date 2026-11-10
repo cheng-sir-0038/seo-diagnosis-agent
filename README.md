@@ -41,7 +41,15 @@ SSE 返回过程和结论；SQLite 保存事件与检查点
 
 ## 本地启动
 
-需要 Python 3.11+、Node.js 和 npm。后端从仓库根目录运行：
+需要 Python 3.11+、Node.js 20.19+ 或 22.12+，以及 npm。macOS / Linux 可以在仓库根目录运行一条命令；首次运行会安装依赖：
+
+```bash
+sh start.sh
+```
+
+脚本复用已有虚拟环境和 `frontend/node_modules`。依赖发生变化时，可手动重新运行 `npm ci --prefix frontend`。
+
+也可以分开启动。后端从仓库根目录运行：
 
 ```bash
 python3.11 -m venv .venv
@@ -60,6 +68,10 @@ npm run dev
 
 访问 `http://localhost:5173`；API 文档位于 `http://localhost:8000/docs`。SEO Chat 需要在不会提交的 `.env.local` 中配置 `DEEPSEEK_API_KEY`；按需配置 `SERPER_API_KEY`、`DATAFORSEO_LOGIN`、`DATAFORSEO_API_KEY` 和 `PAGESPEED_API_KEY`。完整配置项见 [`.env.example`](.env.example)，其中示例值需要替换或留空。
 
+默认只在本机启动，浏览器请求仅允许来自本机前端。API 没有登录或鉴权，不要直接暴露到局域网或公网；Docker 使用时应将端口绑定到本机，例如 `-p 127.0.0.1:8000:8000`。本项目尚不提供安全的多人远程部署方案。
+
+页面检查只访问公网地址，每次连接使用校验后的 IP。系统 DNS 只返回 Fake-IP 时，会向 Google Public DNS 的 HTTPS 接口查询目标域名；该兼容方式需要能访问此 DNS 服务。
+
 本地测试可运行：
 
 ```bash
@@ -76,6 +88,6 @@ python -m pytest tests/agent tests/agent_evals -q
 
 - 这是单机 MVP，SQLite 不适合多实例生产部署；真实站点的长期成功率、费用和限流仍需持续验证。
 - 审批、任务、发布和监控已有基础实现，但不等于整条业务闭环已经完成真实端到端验收。
-- [seo-audit-plugin](https://github.com/cheng-sir-0038/seo-audit-plugin) 是独立的只读 SEO 插件；当前仓库尚未接入该插件的 MCP，两个项目不能描述为已联通。
+- [seo-audit-plugin](https://github.com/cheng-sir-0038/seo-audit-plugin) 是独立的只读 SEO 插件；当前仓库尚未接入该插件的 MCP，两个项目不能描述为已联通。独立 Agent 尚未实现 GSC 或 GA4 数据源，插件的 OAuth 凭据复制到本仓库也不会生效。
 
 本项目采用 [MIT 许可证](LICENSE)。
