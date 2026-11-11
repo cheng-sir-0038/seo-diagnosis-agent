@@ -1,9 +1,12 @@
 import {
+  BulbOutlined,
   CloseOutlined,
   DownOutlined,
   MenuOutlined,
   PlusOutlined,
   RightOutlined,
+  SafetyCertificateOutlined,
+  SearchOutlined,
   SendOutlined,
   StopOutlined,
   ToolOutlined,
@@ -19,6 +22,7 @@ import {
   createAgentRun,
   getAgentRun,
   resumeAgentRun,
+  submitAgentInput,
   streamAgentEvents,
 } from '../services/agentApi'
 import { loadProductConfig } from '../services/productApi'
@@ -33,6 +37,30 @@ import type {
 
 const { TextArea } = Input
 
+const starters = [
+  {
+    title: '给首页做个体检',
+    detail: '从标题、H1 和页面基础信息开始。',
+    icon: SearchOutlined,
+    tone: 'blue',
+    prompt: '请给本站首页做一次 SEO 基础体检，读取页面源 HTML，不需要性能检查。',
+  },
+  {
+    title: '发现内容新机会',
+    detail: '用关键词和搜索结果，找找新方向。',
+    icon: BulbOutlined,
+    tone: 'amber',
+    prompt: '我想为本站找关键词机会，请先帮我明确需要提供哪些业务信息，再进行查询。',
+  },
+  {
+    title: '给页面拟份建议',
+    detail: '根据页面内容，拟定标题和分享信息。',
+    icon: SafetyCertificateOutlined,
+    tone: 'mint',
+    prompt: '请根据本站首页现在的内容，给我一份标题、描述、关键词、分享信息和结构化数据建议；缺的信息告诉我，只提建议，不修改网站。',
+  },
+]
+
 const stageLabels: Record<string, string> = {
   idle: '等待输入',
   waiting: '等待中',
@@ -45,6 +73,7 @@ const stageLabels: Record<string, string> = {
 }
 
 const statusLabels: Record<string, string> = {
+  waiting_for_input: '等待你补充',
   idle: '空闲',
   pending: '准备中',
   running: '生成中',
@@ -112,7 +141,15 @@ export function ChatPage() {
   const runRef = useRef(initialRunState)
   const activeConnectionRef = useRef<ActiveRunConnection | undefined>(undefined)
   const active = conversations.find((item) => item.id === activeId) ?? conversations[0]
+  const latestAssistant = [...active.messages].reverse().find((message) => message.role === 'assistant')
   const running = run.status === 'running' || run.status === 'pending' || run.status === 'recovering'
+  const emptyConversation = active.messages.length === 0 && !run.assistantText && run.tools.length === 0
+  const querying = run.tools.some((tool) => tool.status === 'running')
+  const activity = querying
+    ? { title: '正在读取实际数据', detail: '先核对来源，再给你判断。' }
+    : run.tools.length > 0
+      ? { title: '正在整理这次调查', detail: '把能确认的事实和暂时缺少的证据分开说明。' }
+      : { title: '正在理解你的问题', detail: '先看清目标，再找需要的证据。' }
 
   useEffect(() => {
     saveConversations(conversations)
@@ -153,18 +190,22 @@ export function ChatPage() {
     if (!state.assistantText && state.tools.length === 0) return
     setConversations((items) => items.map((conversation) => {
       if (conversation.id !== connection.conversationId) return conversation
-      if (conversation.messages.some((message) => message.runId === connection.runId)) return conversation
+      const lastUser = conversation.messages.map((message) => message.role).lastIndexOf('user')
+      const existing = conversation.messages.findIndex((message, index) => index > lastUser && message.runId === connection.runId)
       const assistantMessage: ChatMessage = {
         id: crypto.randomUUID(),
         role: 'assistant',
-        content: state.assistantText || '已完成数据查询，结果如下。',
+        content: state.assistantText || '已保留本次取得的数据，见下方。',
         createdAt: new Date().toISOString(),
         toolResults: persistableToolResults(state.tools),
         runId: connection.runId,
+        inputRequest: state.humanInput,
       }
       return {
         ...conversation,
-        messages: [...conversation.messages, assistantMessage],
+        messages: existing < 0 ? [...conversation.messages, assistantMessage]
+          : conversation.messages.map((message, index) => index === existing
+            ? { ...assistantMessage, id: message.id, createdAt: message.createdAt } : message),
         updatedAt: new Date().toISOString(),
       }
     }))
@@ -281,8 +322,10 @@ export function ChatPage() {
     resetRun('idle')
   }
 
-  const send = async () => {
-    const content = input.trim()
+  const send = async (action: 'answer' | 'use_available' = 'answer') => {
+    const content = action === 'use_available'
+      ? '请先用现有事实生成草稿，未确认的内容保留待补充，结束本轮追问。'
+      : input.trim()
     if (!content || running) return
 
     setInput('')
@@ -305,10 +348,13 @@ export function ChatPage() {
     try {
       const productConfig = loadProductConfig()
       if (!productConfig?.siteId) throw new Error('站点配置不存在，请重新初始化工作区')
-      const created = await createAgentRun(history, {
-        siteId: productConfig.siteId,
-        conversationId: active.id,
-      })
+      const previous = latestAssistant
+      const created = previous?.inputRequest && previous.runId
+        ? await submitAgentInput(previous.runId, previous.inputRequest.requestId, content, action)
+        : await createAgentRun(history, {
+          siteId: productConfig.siteId,
+          conversationId: active.id,
+        })
       setActiveTask({ taskId: created.task_id, threadId: created.thread_id })
       setCancelUrl(created.cancel_url)
       const connection: ActiveRunConnection = {
@@ -316,7 +362,7 @@ export function ChatPage() {
         eventsUrl: created.events_url,
         cancelUrl: created.cancel_url,
         conversationId: active.id,
-        lastEventId: 0,
+        lastEventId: created.after_sequence ?? 0,
       }
       activeConnectionRef.current = connection
       await consumeConnection(connection)
@@ -358,6 +404,7 @@ export function ChatPage() {
         running: 'processing',
         recovering: 'processing',
         pending: 'warning',
+        waiting_for_input: 'warning',
         idle: 'default',
       })[run.status] as 'success' | 'error' | 'default' | 'processing' | 'warning',
     [run.status],
@@ -409,7 +456,7 @@ export function ChatPage() {
         </div>
       </aside>
 
-      <section className="chat-main">
+      <section className={`chat-main${emptyConversation ? ' has-welcome' : ''}`}>
         <header className="chat-title-bar">
           <div className="chat-title-left">
             <Tooltip title="查看会话">
@@ -435,6 +482,7 @@ export function ChatPage() {
           <div className="chat-title-actions">
             <Tag color={statusColor}>{statusLabels[run.status] ?? run.status}</Tag>
             <Button
+              aria-label="执行详情"
               aria-pressed={inspectorOpen}
               icon={<ToolOutlined />}
               onClick={() => setInspectorOpen((value) => !value)}
@@ -445,27 +493,43 @@ export function ChatPage() {
         </header>
 
         <div className="chat-messages">
-          {active.messages.length === 0 && !run.assistantText && run.tools.length === 0 ? (
+          {emptyConversation ? (
             <div className="chat-welcome">
-              <div className="chat-welcome-mark" aria-hidden="true">S</div>
-              <h1>向 SEO 优化专员提问</h1>
-              <p>从一次对话开始分析问题。所有结论都应回到真实数据、业务对象和执行记录。</p>
-              <div className="suggestions">
-                <button onClick={() => setInput('自然流量下降通常应该从哪些数据开始排查？')}>分析流量下降思路</button>
-                <button onClick={() => setInput('请用简单语言解释 canonical 标签的作用')}>解释 Canonical</button>
-                <button onClick={() => setInput('现在伦敦几点？')}>查询伦敦时间</button>
-                <button onClick={() => setInput('请计算 1234 × 56')}>快速计算</button>
+              <div className="chat-welcome-mark" aria-hidden="true">
+                <BulbOutlined />
+                <span className="chat-welcome-spark">✦</span>
               </div>
-              <small>SEO 数据工具仍以当前后端真实配置和可用能力为准。</small>
+              <div className="chat-welcome-eyebrow">你的 SEO 分析搭档</div>
+              <h1>你来提问，<span>我来查证。</span></h1>
+              <p>检查页面、研究关键词、核对改动。<br />每一步，都带着证据。</p>
+              <div className="suggestions">
+                {starters.map((starter) => {
+                  const Icon = starter.icon
+                  return (
+                    <button key={starter.title} onClick={() => setInput(starter.prompt)}>
+                      <span className="suggestion-top" aria-hidden="true">
+                        <span className={`suggestion-icon ${starter.tone}`}><Icon /></span>
+                        <RightOutlined className="suggestion-arrow" />
+                      </span>
+                      <strong>{starter.title}</strong>
+                      <span className="suggestion-detail">{starter.detail}</span>
+                    </button>
+                  )
+                })}
+              </div>
+              <small><SafetyCertificateOutlined aria-hidden="true" /> 先分析，不自动修改或发布。</small>
             </div>
           ) : null}
 
           {active.messages.map((item) => (
             <article className={`chat-message ${item.role}`} key={item.id}>
-              <div className="avatar" aria-hidden="true">{item.role === 'user' ? '你' : 'S'}</div>
+              <div className={`avatar${item.role === 'assistant' ? ' agent-avatar' : ''}`} aria-hidden="true">
+                {item.role === 'user' ? '你' : <BulbOutlined />}
+              </div>
               <div className="chat-message-content">
                 {item.role === 'assistant' ? (
                   <>
+                    <div className="assistant-name">SEO 优化专员 <span aria-hidden="true">✦</span></div>
                     <MarkdownMessage content={item.content} />
                     <InlineToolResults tools={item.toolResults} />
                   </>
@@ -474,10 +538,20 @@ export function ChatPage() {
             </article>
           ))}
 
-          {running && (run.assistantText || run.tools.length > 0) ? (
+          {running ? (
             <article className="chat-message assistant streaming">
-              <div className="avatar" aria-hidden="true">S</div>
+              <div className="avatar agent-avatar" aria-hidden="true"><BulbOutlined /></div>
               <div className="chat-message-content">
+                <div className="assistant-name">SEO 优化专员 <span aria-hidden="true">✦</span></div>
+                {!run.assistantText || querying ? (
+                  <div className="agent-activity" role="status" aria-label="分析进度" aria-live="polite">
+                    <div className="agent-activity-title">
+                      <strong>{activity.title}</strong>
+                      <span className="activity-dots" aria-hidden="true"><i /><i /><i /></span>
+                    </div>
+                    <span>{activity.detail}</span>
+                  </div>
+                ) : null}
                 {run.assistantText ? <MarkdownMessage content={run.assistantText} /> : null}
                 <InlineToolResults tools={run.tools} />
                 {run.assistantText ? <span className="cursor" /> : null}
@@ -501,7 +575,7 @@ export function ChatPage() {
               )}
             />
           ) : null}
-          {run.error && !connectionIssue ? (
+          {run.status === 'failed' && run.error && !connectionIssue ? (
             <Alert
               type="error"
               showIcon
@@ -519,7 +593,7 @@ export function ChatPage() {
               aria-label="给 SEO 优化专员发送消息"
               value={input}
               disabled={running}
-              placeholder="给 SEO 优化专员发送消息"
+              placeholder="想先看看网站的哪一部分？"
               autoSize={{ minRows: 1, maxRows: 6 }}
               onChange={(event) => setInput(event.target.value)}
               onPressEnter={(event) => {
@@ -546,7 +620,15 @@ export function ChatPage() {
               </Tooltip>
             )}
           </div>
-          <small>Enter 发送，Shift + Enter 换行。重要结论请核对证据和业务记录。</small>
+          <small>{latestAssistant?.inputRequest && !running
+            ? '进度已保存，补充后继续本次分析。'
+            : 'Enter 发送，Shift + Enter 换行 · 只读分析，不自动修改网站'}
+            {latestAssistant?.inputRequest?.allowUseAvailable && !running ? (
+              <Button className="human-input-continue" type="link" size="small" onClick={() => void send('use_available')}>
+                先用现有信息生成
+              </Button>
+            ) : null}
+          </small>
         </div>
       </section>
 

@@ -1,6 +1,9 @@
 export type AgentEventType =
   | 'run.started'
   | 'run.resumed'
+  | 'run.waiting_for_input'
+  | 'input.submitted'
+  | 'input.accepted'
   | 'stage.changed'
   | 'message.started'
   | 'message.delta'
@@ -23,7 +26,13 @@ export interface AgentEvent {
   payload: Record<string, unknown>
 }
 
-export type RunStatus = 'idle' | 'pending' | 'running' | 'recovering' | 'completed' | 'failed' | 'cancelled'
+export type RunStatus = 'idle' | 'pending' | 'running' | 'recovering' | 'waiting_for_input' | 'completed' | 'failed' | 'cancelled'
+
+export interface HumanInputRequest {
+  requestId: string
+  questions: string[]
+  allowUseAvailable?: boolean
+}
 
 export type RenderHint = 'chart' | 'table' | 'tree' | 'cards'
 
@@ -40,6 +49,7 @@ export interface ToolRun {
 
 export interface RunState {
   runId?: string
+  humanInput?: HumanInputRequest
   status: RunStatus
   stage: string
   assistantText: string
@@ -59,6 +69,7 @@ export interface ChatMessage {
   createdAt: string
   toolResults?: ToolRun[]
   runId?: string
+  inputRequest?: HumanInputRequest
 }
 
 export interface Conversation {

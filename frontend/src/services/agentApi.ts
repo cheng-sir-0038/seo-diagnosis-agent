@@ -1,7 +1,7 @@
 import type { AgentEvent, AgentTaskStatusGroup, AgentTaskSummary, ChatMessage } from '../types/agent'
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? ''
-const TERMINAL_EVENTS = new Set<AgentEvent['type']>(['run.completed', 'run.failed', 'run.cancelled'])
+const TERMINAL_EVENTS = new Set<AgentEvent['type']>(['run.completed', 'run.failed', 'run.cancelled', 'run.waiting_for_input'])
 
 export interface CreateRunResponse {
   run_id: string
@@ -10,6 +10,21 @@ export interface CreateRunResponse {
   status: string
   events_url: string
   cancel_url: string
+  after_sequence?: number
+}
+
+export async function submitAgentInput(runId: string, requestId: string, answer: string, action: 'answer' | 'use_available' = 'answer'): Promise<CreateRunResponse> {
+  const response = await fetch(`${API_BASE}/api/v1/seo-agent/chat/runs/${runId}/input`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ request_id: requestId, answer, action }),
+  })
+  if (!response.ok) {
+    const detail = await response.json().catch(() => ({}))
+    throw new Error(typeof detail.detail === 'string' ? detail.detail
+      : response.status === 422 ? '补充信息格式不正确，请输入 1 至 2000 字的内容。'
+        : `提交补充信息失败（${response.status}）`)
+  }
+  return response.json() as Promise<CreateRunResponse>
 }
 
 export interface AgentRunContext {

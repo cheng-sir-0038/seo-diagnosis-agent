@@ -11,6 +11,7 @@ const cancelAgentRun = vi.fn()
 const listAgentTasks = vi.fn()
 const getAgentRun = vi.fn()
 const resumeAgentRun = vi.fn()
+const submitAgentInput = vi.fn()
 
 vi.mock('../services/agentApi', () => ({
   createAgentRun: (...args: unknown[]) => createAgentRun(...args),
@@ -19,6 +20,7 @@ vi.mock('../services/agentApi', () => ({
   listAgentTasks: (...args: unknown[]) => listAgentTasks(...args),
   getAgentRun: (...args: unknown[]) => getAgentRun(...args),
   resumeAgentRun: (...args: unknown[]) => resumeAgentRun(...args),
+  submitAgentInput: (...args: unknown[]) => submitAgentInput(...args),
 }))
 
 const event = (sequence: number, type: AgentEvent['type'], payload: Record<string, unknown>): AgentEvent => ({
@@ -121,6 +123,96 @@ describe('ChatPage SEO Agent integration', () => {
     vi.clearAllMocks()
   })
 
+  it('keeps a saved human-input request across reload and continues the same run', async () => {
+    streamAgentEvents.mockImplementationOnce(async (_url, onEvent: (item: AgentEvent) => void) => {
+      onEvent(event(1, 'run.started', {}))
+      onEvent(event(2, 'message.completed', { content: '这个页面主要提供什么内容？' }))
+      onEvent(event(3, 'run.waiting_for_input', { request_id: 'input_1', questions: ['这个页面主要提供什么内容？'] }))
+      return { lastEventId: 3, terminal: true }
+    })
+    const first = render(<ChatPage />)
+    fireEvent.change(screen.getByRole('textbox', { name: '给 SEO 优化专员发送消息' }), { target: { value: '根据页面给我一份建议' } })
+    fireEvent.click(screen.getByRole('button', { name: '发送消息' }))
+    expect(await screen.findByText('进度已保存，补充后继续本次分析。')).toBeInTheDocument()
+    first.unmount()
+    submitAgentInput.mockResolvedValue({ run_id: 'run_1', task_id: 'agtask_12345678', thread_id: 'chat_12345678',
+      status: 'recovering', events_url: '/api/v1/seo-agent/chat/runs/run_1/events', cancel_url: '/cancel', after_sequence: 4 })
+    streamAgentEvents.mockImplementationOnce(async (_url, onEvent: (item: AgentEvent) => void) => {
+      onEvent(event(5, 'run.resumed', {}))
+      onEvent(event(6, 'message.completed', { content: '建议已整理，请人工确认。' }))
+      onEvent(event(7, 'run.completed', {}))
+      return { lastEventId: 7, terminal: true }
+    })
+    render(<ChatPage />)
+    expect(screen.getByText('进度已保存，补充后继续本次分析。')).toBeInTheDocument()
+    fireEvent.change(screen.getByRole('textbox', { name: '给 SEO 优化专员发送消息' }), { target: { value: '这里汇总野外观察笔记' } })
+    fireEvent.click(screen.getByRole('button', { name: '发送消息' }))
+    expect(await screen.findByText('建议已整理，请人工确认。')).toBeInTheDocument()
+    expect(screen.getByText('这个页面主要提供什么内容？')).toBeInTheDocument()
+    expect(submitAgentInput).toHaveBeenCalledWith('run_1', 'input_1', '这里汇总野外观察笔记', 'answer')
+    expect(createAgentRun).toHaveBeenCalledTimes(1)
+    expect(streamAgentEvents.mock.calls.at(-1)?.[2].afterEventId).toBe(4)
+  })
+
+  it('lets the user explicitly finish with available facts', async () => {
+    streamAgentEvents.mockImplementationOnce(async (_url, onEvent: (item: AgentEvent) => void) => {
+      onEvent(event(1, 'message.completed', { content: '请提供分享图片地址。' }))
+      onEvent(event(2, 'run.waiting_for_input', { request_id: 'input_skip', questions: ['分享图片？'], allow_use_available: true }))
+      return { lastEventId: 2, terminal: true }
+    })
+    submitAgentInput.mockResolvedValue({ run_id: 'run_1', status: 'recovering', events_url: '/events', cancel_url: '/cancel', after_sequence: 3 })
+    render(<ChatPage />)
+    fireEvent.change(screen.getByRole('textbox', { name: '给 SEO 优化专员发送消息' }), { target: { value: '给当前页面提建议' } })
+    fireEvent.click(screen.getByRole('button', { name: '发送消息' }))
+    fireEvent.click(await screen.findByRole('button', { name: '先用现有信息生成' }))
+    await waitFor(() => expect(submitAgentInput).toHaveBeenCalledWith('run_1', 'input_skip', expect.any(String), 'use_available'))
+    expect(createAgentRun).toHaveBeenCalledTimes(1)
+  })
+
+  it('replaces the saved partial reply after recovering the same user turn', async () => {
+    streamAgentEvents.mockImplementationOnce(async (_url, onEvent: (item: AgentEvent) => void) => {
+      onEvent(event(1, 'run.started', {}))
+      onEvent(event(2, 'tool.completed', {tool_call_id:'saved',name:'seo_page_metadata',result:{success:true,data:{}}}))
+      onEvent(event(3, 'run.failed', {message:'summary failed'}))
+      return {lastEventId:3,terminal:true}
+    }).mockImplementationOnce(async (_url, onEvent: (item: AgentEvent) => void) => {
+      onEvent(event(5, 'run.resumed', {}))
+      onEvent(event(6, 'message.completed', {content:'恢复后的完整结论。'}))
+      onEvent(event(7, 'run.completed', {}))
+      return {lastEventId:7,terminal:true}
+    })
+    getAgentRun.mockResolvedValue({id:'run_1',status:'FAILED'})
+    const {container} = render(<ChatPage />)
+    fireEvent.change(screen.getByRole('textbox', {name:'给 SEO 优化专员发送消息'}), {target:{value:'给页面提建议'}})
+    fireEvent.click(screen.getByRole('button', {name:'发送消息'}))
+    expect(await screen.findByText('已保留本次取得的数据，见下方。')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', {name:'基于已有证据完成'}))
+    expect(await screen.findByText('恢复后的完整结论。')).toBeInTheDocument()
+    await waitFor(() => expect(container.querySelectorAll('.chat-message.assistant')).toHaveLength(1))
+    expect(screen.queryByText('已保留本次取得的数据，见下方。')).not.toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('fills a relevant starter without running a query until the user sends it', () => {
+    render(<ChatPage />)
+    fireEvent.click(screen.getByRole('button', { name: /给首页做个体检/ }))
+    expect((screen.getByLabelText('给 SEO 优化专员发送消息') as HTMLTextAreaElement).value).toContain('首页')
+    expect(createAgentRun).not.toHaveBeenCalled()
+    expect(screen.getByLabelText('发送消息')).toBeEnabled()
+  })
+
+  it('shows an honest activity state while the first response is still pending', async () => {
+    createAgentRun.mockImplementationOnce(() => new Promise(() => {}))
+    render(<ChatPage />)
+    fireEvent.change(screen.getByLabelText('给 SEO 优化专员发送消息'), {
+      target: { value: '检查本站首页' },
+    })
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    expect(await screen.findByRole('status', { name: '分析进度' })).toHaveTextContent('正在理解你的问题')
+    expect(screen.getByLabelText('停止生成')).toBeEnabled()
+    expect(screen.queryByRole('region', { name: '数据证据' })).not.toBeInTheDocument()
+  })
+
   it('sends the active site and renders structured evidence directly in the chat', async () => {
     render(<ChatPage />)
 
@@ -142,7 +234,7 @@ describe('ChatPage SEO Agent integration', () => {
     expect(stored[0].messages[1].toolResults[0].result.data.raw).toBeUndefined()
     expect(screen.getByLabelText('Agent 执行详情')).toHaveAttribute('aria-hidden', 'true')
 
-    fireEvent.click(screen.getByRole('button', { name: /^tool 执行详情$/ }))
+    fireEvent.click(screen.getByRole('button', { name: '执行详情' }))
     expect(screen.getByLabelText('Agent 执行详情')).toHaveAttribute('aria-hidden', 'false')
     expect(screen.getAllByRole('table')).toHaveLength(1)
     fireEvent.click(screen.getByRole('button', { name: '展开工具详情 seo_organic_keywords' }))
@@ -371,7 +463,7 @@ Top 4-10（第4-10名） ██ 21 个 → 增长
     await screen.findByText('分析完成')
     expect(screen.queryByRole('region', { name: 'Agent 任务' })).not.toBeInTheDocument()
 
-    fireEvent.click(screen.getByRole('button', { name: /^tool 执行详情$/ }))
+    fireEvent.click(screen.getByRole('button', { name: '执行详情' }))
     const toggle = screen.getByRole('button', { name: '展开工具详情 seo_organic_keywords' })
     expect(toggle).toHaveAttribute('aria-expanded', 'false')
     const inspector = screen.getByLabelText('Agent 执行详情')

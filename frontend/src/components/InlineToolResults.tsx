@@ -64,7 +64,7 @@ export function InlineToolResults({ tools }: { tools?: ToolRun[] }) {
         <span className="inline-tool-results-icon" aria-hidden="true"><DatabaseOutlined /></span>
         <div>
           <strong>数据证据</strong>
-          <span>以下内容来自本次真实工具查询，不是模型手工绘制。</span>
+          <span>页面事实和查询结果保留来源；优化建议是待人工确认的草稿。</span>
         </div>
       </header>
       <div className="inline-tool-results-list">

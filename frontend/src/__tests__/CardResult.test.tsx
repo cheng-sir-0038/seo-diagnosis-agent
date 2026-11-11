@@ -22,4 +22,29 @@ describe('CardResult', () => {
     expect(screen.queryByTestId('raw-tool-result')).not.toBeInTheDocument()
     expect(screen.getByTestId('card-result')).toHaveClass('news')
   })
+
+  it('explains page-review results without turning missing evidence into a success', () => {
+    render(<ToolResultView hint="cards" data={{
+      ...data, capability: 'page_change_review', variant: undefined,
+      items: [
+        { key: 'baseline', title: 'baseline_recorded', summary: 'https://example.com/' },
+        { key: 'review', title: 'title', summary: 'insufficient_evidence' },
+      ],
+    }} mode="chat" />)
+    expect(screen.getByRole('heading', { name: '页面基线已保存' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: '页面标题' })).toBeInTheDocument()
+    expect(screen.getByText('证据不足，暂不能判断')).toBeInTheDocument()
+    expect(screen.queryByText('与目标一致')).not.toBeInTheDocument()
+  })
+
+  it('shows structured suggestions as copyable text without executing HTML', () => {
+    const code = '{"name":"<script>alert(1)</script>"}'
+    const { container } = render(<ToolResultView hint="cards" data={{
+      ...data, capability: 'page_suggestions', variant: 'page-seo-suggestions',
+      items: [{ key: 'json_ld', title: 'JSON-LD 建议', code }],
+    }} mode="chat" />)
+    expect(screen.getByText(code)).toBeInTheDocument()
+    expect(container.querySelector('pre code')).toHaveTextContent(code)
+    expect(container.querySelector('script')).toBeNull()
+  })
 })

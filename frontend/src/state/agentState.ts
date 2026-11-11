@@ -42,9 +42,18 @@ export function reduceAgentEvent(state: RunState, event: AgentEvent): RunState {
   }
   switch (event.type) {
     case 'run.started':
-      return { ...base, status: 'running', stage: '正在分析问题' }
+      return { ...base, status: 'running', stage: '正在分析问题', error: undefined }
     case 'run.resumed':
-      return { ...base, status: 'recovering', stage: '正在恢复任务' }
+      return { ...base, status: 'recovering', stage: '正在恢复任务', humanInput: undefined, error: undefined }
+    case 'run.waiting_for_input':
+      return {
+        ...base, status: 'waiting_for_input', stage: '等待你补充信息',
+        humanInput: {
+          requestId: String(event.payload.request_id),
+          questions: Array.isArray(event.payload.questions) ? event.payload.questions.map(String) : [],
+          allowUseAvailable: event.payload.allow_use_available === true,
+        },
+      }
     case 'stage.changed':
       return { ...base, stage: String(event.payload.stage ?? '处理中') }
     case 'message.delta':
@@ -81,15 +90,17 @@ export function reduceAgentEvent(state: RunState, event: AgentEvent): RunState {
       return {
         ...base,
         status: 'completed',
+        error: undefined,
+        humanInput: undefined,
         stage: partial ? '已基于现有证据完成' : '已完成',
         partial,
         completionMode: String(event.payload.completion_mode ?? 'normal'),
       }
     }
     case 'run.failed':
-      return { ...base, status: 'failed', stage: '执行失败', error: String(event.payload.message ?? 'Agent 执行失败') }
+      return { ...base, status: 'failed', humanInput: undefined, stage: '执行失败', error: String(event.payload.message ?? 'Agent 执行失败') }
     case 'run.cancelled':
-      return { ...base, status: 'cancelled', stage: '已停止' }
+      return { ...base, status: 'cancelled', humanInput: undefined, stage: '已停止' }
     default:
       return base
   }

@@ -75,7 +75,7 @@ describe('SEO specialist product app', () => {
     fireEvent.change(screen.getByLabelText('执行者邮箱'), { target: { value: 'writer@example.com' } })
     fireEvent.click(screen.getByRole('button', { name: /创建并进入对话工作区/ }))
 
-    expect(await screen.findByText('向 SEO 优化专员提问')).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: /你来提问，\s*我来查证。/ })).toBeInTheDocument()
     expect(screen.getByRole('tab', { name: /对话/ })).toHaveAttribute('aria-selected', 'true')
     expect(createdSitePayload).toMatchObject({ default_country: 'US', default_language: 'en-US' })
   })
@@ -99,7 +99,7 @@ describe('SEO specialist product app', () => {
     })
     vi.stubGlobal('fetch', fetchMock)
     render(<App />)
-    expect(await screen.findByText('向 SEO 优化专员提问')).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: /你来提问，\s*我来查证。/ })).toBeInTheDocument()
     expect(screen.getByRole('tab', { name: /对话/ })).toHaveAttribute('aria-selected', 'true')
     await waitFor(() => expect(fetchMock).toHaveBeenCalled())
   })

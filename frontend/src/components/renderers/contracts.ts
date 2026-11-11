@@ -200,6 +200,7 @@ export interface CardResultItem {
   url?: string | null
   image_url?: string | null
   summary?: string | null
+  code?: string
   metadata?: CardMetadataItem[]
 }
 
@@ -375,6 +376,7 @@ export function isCardResultData(data: unknown): data is CardResultData {
     && (item.url === undefined || item.url === null || typeof item.url === 'string')
     && (item.image_url === undefined || item.image_url === null || typeof item.image_url === 'string')
     && (item.summary === undefined || item.summary === null || typeof item.summary === 'string')
+    && (item.code === undefined || typeof item.code === 'string')
     && (item.metadata === undefined || (
       Array.isArray(item.metadata)
       && item.metadata.every((entry) => isRecord(entry) && typeof entry.label === 'string' && typeof entry.value === 'string')
