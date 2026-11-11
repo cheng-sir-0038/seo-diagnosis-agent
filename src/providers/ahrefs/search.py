@@ -32,13 +32,13 @@ T2 — Site Explorer（搜索表现）
 
 from __future__ import annotations
 
-from datetime import datetime, timezone, date
+from datetime import UTC, date, datetime
 from typing import Any
 
 from loguru import logger
 
-from src.models.search import SearchMetrics, TopPage, OrganicKeyword, SearchHistoryPoint
-from src.models.common import DataSource, Country
+from src.models.common import Country, DataSource
+from src.models.search import OrganicKeyword, SearchHistoryPoint, SearchMetrics, TopPage
 
 
 async def get_search_metrics(
@@ -70,7 +70,7 @@ async def get_search_metrics(
     raw = await client.request("site_explorer_metrics", params={
         "target": site_id, "country": country,
     })
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return SearchMetrics(
         domain_rating=raw.get("domain_rating", 0),
         ahrefs_rank=raw.get("ahrefs_rank"),
@@ -121,7 +121,7 @@ async def get_top_pages(
     raw = await client.request("site_explorer_top_pages", params={
         "target": site_id, "country": country, "limit": limit,
     })
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return [
         TopPage(
             url=p["url"],
@@ -153,7 +153,7 @@ async def get_organic_keywords(
     raw = await client.request("site_explorer_organic_keywords", params={
         "target": site_id, "country": country, "limit": limit,
     })
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     keywords = raw.get("keywords", [])
     return [
         OrganicKeyword(
@@ -187,7 +187,7 @@ async def get_search_history(
     raw = await client.request("site_explorer_metrics_history", params={
         "target": site_id, "country": country,
     })
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return [
         SearchHistoryPoint(
             date=h.get("date", date.today()),

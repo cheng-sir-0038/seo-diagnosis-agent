@@ -48,13 +48,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from loguru import logger
 from pydantic import BaseModel, Field
 
-from src.models.common import Capability
-from src.core.exceptions import InternalAdapterError, to_error_response
+from src.core.exceptions import ErrorResponse, InternalAdapterError, to_error_response
 from src.facade.data_facade import facade
+from src.models.common import Capability
 
 router = APIRouter(tags=["Data Query"])
 
@@ -196,8 +196,6 @@ async def query(request: Request, body: QueryRequest) -> dict[str, Any]:
 # HTTP 异常转换
 # ============================================================
 
-from fastapi import HTTPException
-
 _ERROR_CODE_TO_HTTP: dict = {
     "INVALID_PARAMS": 400,
     "UNSUPPORTED_CAPABILITY": 400,
@@ -217,9 +215,7 @@ def _to_http_exception(error: Any) -> HTTPException:
 
     对外只泄露 ErrorResponse 的标准化字段。
     """
-    from src.core.exceptions import ErrorResponse as ER
-
-    if isinstance(error, ER):
+    if isinstance(error, ErrorResponse):
         status_code = _ERROR_CODE_TO_HTTP.get(error.code.value, 500)
         return HTTPException(
             status_code=status_code,

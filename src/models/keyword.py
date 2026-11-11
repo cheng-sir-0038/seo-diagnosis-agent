@@ -26,7 +26,7 @@ from src.models.common import BaseEvidence, Country
 # 状态枚举
 # ============================================================
 
-class KeywordIntent(str, enum.Enum):
+class KeywordIntent(enum.StrEnum):
     """搜索意图类型（平台无关）。
 
     各厂商映射:
@@ -41,7 +41,7 @@ class KeywordIntent(str, enum.Enum):
     UNKNOWN = "unknown"
 
 
-class SERPFeatureType(str, enum.Enum):
+class SERPFeatureType(enum.StrEnum):
     """SERP 特征类型（平台无关）。
 
     用于分析 SERP 结构变化对 CTR 的影响。
@@ -67,7 +67,7 @@ class SERPFeatureType(str, enum.Enum):
     OTHER = "other"
 
 
-class VolumeTrend(str, enum.Enum):
+class VolumeTrend(enum.StrEnum):
     """搜索量趋势（平台无关）。"""
     RISING = "rising"
     STABLE = "stable"

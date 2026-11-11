@@ -22,7 +22,7 @@ from pydantic import (
 from src.models.common import Capability, DataSource, Device
 
 
-class QueryPurpose(str, enum.Enum):
+class QueryPurpose(enum.StrEnum):
     """一次查询的业务目的。"""
 
     QUICK_LOOKUP = "quick_lookup"
@@ -32,7 +32,7 @@ class QueryPurpose(str, enum.Enum):
     RESEARCH = "research"
 
 
-class ProviderFeature(str, enum.Enum):
+class ProviderFeature(enum.StrEnum):
     """路由时可确定性匹配的 Provider 能力标签。"""
 
     REALTIME = "realtime"
@@ -48,7 +48,7 @@ class ProviderFeature(str, enum.Enum):
     DEEP_RESULTS = "deep_results"
 
 
-class ProviderOperatingSystem(str, enum.Enum):
+class ProviderOperatingSystem(enum.StrEnum):
     """搜索结果模拟设备的操作系统。"""
 
     WINDOWS = "windows"
@@ -63,7 +63,7 @@ class ProviderOperatingSystem(str, enum.Enum):
         return Device.DESKTOP
 
 
-class ProviderRuntimeMode(str, enum.Enum):
+class ProviderRuntimeMode(enum.StrEnum):
     """Provider 当前运行模式。"""
 
     LIVE = "live"
@@ -71,7 +71,7 @@ class ProviderRuntimeMode(str, enum.Enum):
     UNAVAILABLE = "unavailable"
 
 
-class ProviderSelectionMode(str, enum.Enum):
+class ProviderSelectionMode(enum.StrEnum):
     """Provider 选择结果的来源。"""
 
     AUTOMATIC = "automatic"

@@ -108,7 +108,10 @@ ENDPOINTS: dict[str, DataForSEOEndpoint] = {
     ),
     "ranked_keywords": DataForSEOEndpoint(
         path="/v3/dataforseo_labs/google/ranked_keywords/live",
-        description="域名排名关键词：完整关键词列表 + 排名 + 搜索量 + 流量估算 → 替代 Ahrefs organic_keywords",
+        description=(
+            "域名排名关键词：完整关键词列表 + 排名 + 搜索量 + 流量估算"
+            " → 替代 Ahrefs organic_keywords"
+        ),
         is_live=True,
         estimated_cost=0.02,
     ),

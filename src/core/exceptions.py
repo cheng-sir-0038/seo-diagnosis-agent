@@ -20,12 +20,11 @@ from typing import Any
 
 from pydantic import BaseModel
 
-
 # ============================================================
 # 对外：错误码枚举
 # ============================================================
 
-class ErrorCode(str, enum.Enum):
+class ErrorCode(enum.StrEnum):
     """对外错误码 — API 调用方依据此码做程序化处理。
 
     每个错误码对应一个标准化的 HTTP 状态码和人类可读的消息模板。

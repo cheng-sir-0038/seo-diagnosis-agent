@@ -25,18 +25,16 @@ from __future__ import annotations
 
 import enum
 from datetime import datetime
-from typing import Optional
 
 from pydantic import Field
 
 from src.models.common import BaseEvidence
 
-
 # ============================================================
 # 状态枚举
 # ============================================================
 
-class IssueSeverity(str, enum.Enum):
+class IssueSeverity(enum.StrEnum):
     """SEO 问题严重程度（平台无关）。
 
     各厂商映射:
@@ -48,7 +46,7 @@ class IssueSeverity(str, enum.Enum):
     NOTICE = "notice"
 
 
-class IssueState(str, enum.Enum):
+class IssueState(enum.StrEnum):
     """问题检测状态（平台无关）。
 
     各厂商映射:
@@ -61,7 +59,7 @@ class IssueState(str, enum.Enum):
     REAPPEARED = "reappeared"  # 重新出现
 
 
-class PageIndexability(str, enum.Enum):
+class PageIndexability(enum.StrEnum):
     """页面可索引状态（平台无关）。
 
     综合判断页面对搜索引擎的可用性。

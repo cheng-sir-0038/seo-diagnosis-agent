@@ -25,13 +25,13 @@ T4b — Rank Tracker（排名跟踪）
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from loguru import logger
 
-from src.models.rank import RankOverview, RankedKeyword
-from src.models.common import DataSource, Country
+from src.models.common import Country, DataSource
+from src.models.rank import RankedKeyword, RankOverview
 
 
 async def get_rank_overview(client: Any, site_id: str, **kwargs: Any) -> RankOverview:
@@ -39,7 +39,7 @@ async def get_rank_overview(client: Any, site_id: str, **kwargs: Any) -> RankOve
     logger.info(f"[T4b-Rank] get_rank_overview | site={site_id}")
 
     raw = await client.request("rank_tracker_overview", params={"project_id": site_id})
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return RankOverview(
         tracked_keywords_count=raw.get("tracked_keywords_count", 0),
         top_3_count=raw.get("top_3_count", 0),
@@ -72,7 +72,7 @@ async def get_ranked_keywords(
     raw = await client.request("rank_tracker_keywords", params={
         "project_id": site_id, "limit": limit,
     })
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     keywords = raw.get("keywords", [])
     return [
         RankedKeyword(

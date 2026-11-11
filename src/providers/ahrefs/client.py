@@ -22,6 +22,7 @@ import asyncio
 import hashlib
 import json
 import time
+from datetime import UTC
 from typing import Any
 
 from loguru import logger
@@ -30,15 +31,10 @@ from src.core.config import settings
 from src.core.exceptions import (
     InternalAuthError,
     InternalProviderRequestError,
-    InternalProviderResponseError,
     InternalProviderServerError,
     InternalRateLimitError,
-    InternalQuotaExhaustedError,
-    upstream_error,
-    auth_error,
-    rate_limit_error,
 )
-from src.providers.ahrefs.config import AhrefsConfig, AhrefsEndpoint, ENDPOINTS
+from src.providers.ahrefs.config import ENDPOINTS, AhrefsConfig, AhrefsEndpoint
 
 
 class AhrefsClient:
@@ -360,10 +356,10 @@ class AhrefsClient:
 
         TODO: 接入真实 Ahrefs API Key 后，删除此方法及其所有调用。
         """
-        from datetime import date, datetime, timezone
+        from datetime import date, datetime
 
         today = date.today()
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
 
         pseudo_templates: dict[str, dict] = {
             "site_explorer_metrics": {
@@ -395,7 +391,10 @@ class AhrefsClient:
                         "refdomains_count": 245,
                     },
                     {
-                        "url": f"https://{params.get('target', 'example.com')}/tools/keyword-research",
+                        "url": (
+                            f"https://{params.get('target', 'example.com')}"
+                            "/tools/keyword-research"
+                        ),
                         "title": "Free Keyword Research Tool",
                         "organic_traffic_estimate": 9600,
                         "traffic_change": 0.08,

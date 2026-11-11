@@ -14,7 +14,7 @@ DataForSEO 提供 SERP 数据、关键词研究、域名分析、外链数据等
 """
 
 from src.providers.dataforseo.client import DataForSEOClient
-from src.providers.dataforseo.config import DataForSEOConfig, ENDPOINTS
+from src.providers.dataforseo.config import ENDPOINTS, DataForSEOConfig
 from src.providers.dataforseo.provider import DataForSEOProvider
 
 __all__ = ["DataForSEOProvider", "DataForSEOClient", "DataForSEOConfig", "ENDPOINTS"]

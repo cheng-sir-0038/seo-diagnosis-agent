@@ -15,12 +15,12 @@ T5a — 外链分析（Backlinks / Refdomains / Broken）
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from loguru import logger
 
-from src.models.backlink import Backlink, RefDomain, BrokenBacklink
+from src.models.backlink import Backlink, BrokenBacklink, RefDomain
 from src.models.common import DataSource
 
 
@@ -45,7 +45,7 @@ async def get_backlinks(
     raw = await client.request("site_explorer_backlinks", params={
         "target": site_id, "limit": limit,
     })
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return [
         Backlink(
             source_url=b["source_url"],
@@ -76,7 +76,7 @@ async def get_refdomains(
     raw = await client.request("site_explorer_refdomains", params={
         "target": site_id, "limit": limit,
     })
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return [
         RefDomain(
             domain=d["domain"],
@@ -109,7 +109,7 @@ async def get_broken_backlinks(
     raw = await client.request("site_explorer_broken_backlinks", params={
         "target": site_id, "limit": limit,
     })
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return [
         BrokenBacklink(
             source_url=b["source_url"],

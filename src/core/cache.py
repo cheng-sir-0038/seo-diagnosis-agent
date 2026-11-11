@@ -30,7 +30,7 @@ import hashlib
 import json
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -176,7 +176,7 @@ class CacheManager:
         evidence = data.get("data") if isinstance(data, dict) else None
         first_evidence = evidence[0] if isinstance(evidence, list) and evidence else evidence
         first_evidence = first_evidence if isinstance(first_evidence, dict) else {}
-        created_at = datetime.now(timezone.utc).isoformat()
+        created_at = datetime.now(UTC).isoformat()
         await self._db.execute(
             """INSERT INTO evidence_snapshots
                (id, task_id, provider, capability, params_hash, source,
@@ -244,7 +244,7 @@ class CacheManager:
                 endpoint,
                 units_consumed,
                 int(success),
-                datetime.now(timezone.utc).isoformat(),
+                datetime.now(UTC).isoformat(),
             ),
         )
         await self._db.commit()

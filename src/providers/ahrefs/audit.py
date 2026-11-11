@@ -14,7 +14,7 @@ T3 — Site Audit（技术审计）
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from loguru import logger
@@ -47,7 +47,7 @@ async def get_audit_health(client: Any, site_id: str, **kwargs: Any) -> AuditHea
     logger.info(f"[T3-Audit] get_audit_health | site={site_id}")
 
     raw = await client.request("site_audit_health", params={"project_id": site_id})
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return AuditHealth(
         health_score=raw.get("health_score", 0),
         total_urls_crawled=raw.get("total_urls_crawled", 0),
@@ -83,7 +83,7 @@ async def get_audit_issues(
     raw = await client.request("site_audit_issues", params={
         "project_id": site_id, "severity": severity or "all",
     })
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     issues = raw.get("issues", [])
     return [
         AuditIssue(
@@ -119,7 +119,7 @@ async def get_page_explorer(
     raw = await client.request("site_audit_page_explorer", params={
         "project_id": site_id, "url": url,
     })
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     pages = raw.get("pages", [])
     return [
         PageExplorerItem(

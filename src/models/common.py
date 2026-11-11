@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import enum
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field
 # 枚举
 # ============================================================
 
-class DataSource(str, enum.Enum):
+class DataSource(enum.StrEnum):
     """数据来源枚举。
 
     每个枚举值对应一个已接入的数据平台。
@@ -42,7 +42,7 @@ class DataSource(str, enum.Enum):
     PAGE_HTML = "page_html"               # 站点页面源 HTML 元信息
 
 
-class Capability(str, enum.Enum):
+class Capability(enum.StrEnum):
     """业务能力枚举 — Facade 统一入口的路由 Key。
 
     每个值对应一个业务查询能力，调用方只需指定 capability，
@@ -97,7 +97,7 @@ class Capability(str, enum.Enum):
     BATCH_ANALYSIS = "batch_analysis"
 
 
-class EvidenceConfidence(str, enum.Enum):
+class EvidenceConfidence(enum.StrEnum):
     """证据可信度等级。
 
     对齐 PRD 第 7.2 节定义:
@@ -110,7 +110,7 @@ class EvidenceConfidence(str, enum.Enum):
     LOW = "low"
 
 
-class ChangeDirection(str, enum.Enum):
+class ChangeDirection(enum.StrEnum):
     """指标变化方向 — 所有时间对比查询的统一表达。
 
     用于搜索表现、排名、外链、流量等任何指标的对比结果。
@@ -123,7 +123,7 @@ class ChangeDirection(str, enum.Enum):
     UNKNOWN = "unknown"           # 无法判断
 
 
-class TaskStatus(str, enum.Enum):
+class TaskStatus(enum.StrEnum):
     """Agent 任务状态 — 对齐 PRD 第 13.2 节。
 
     贯穿任务全生命周期。
@@ -141,7 +141,7 @@ class TaskStatus(str, enum.Enum):
     CANCELLED = "cancelled"               # 已取消
 
 
-class HypothesisStatus(str, enum.Enum):
+class HypothesisStatus(enum.StrEnum):
     """假设验证状态 — 对齐 PRD 第 7.1 节。
 
     Agent 调查过程中对每个假设的验证结论。
@@ -154,7 +154,7 @@ class HypothesisStatus(str, enum.Enum):
     NOT_RELEVANT = "not_relevant"         # 暂不相关
 
 
-class ActionStatus(str, enum.Enum):
+class ActionStatus(enum.StrEnum):
     """行动状态 — 对齐 PRD 第 15.3 节。
 
     从建议到验证的完整生命周期。
@@ -172,7 +172,7 @@ class ActionStatus(str, enum.Enum):
     REOPENED = "reopened"                         # 已重新打开
 
 
-class OpportunityStatus(str, enum.Enum):
+class OpportunityStatus(enum.StrEnum):
     """增长机会状态 — 对齐 PRD 第 14.2 节。
 
     从发现到归档的机会生命周期。
@@ -187,7 +187,7 @@ class OpportunityStatus(str, enum.Enum):
     ARCHIVED = "archived"         # 已归档
 
 
-class DataIntegrity(str, enum.Enum):
+class DataIntegrity(enum.StrEnum):
     """数据完整性标签 — 对齐 PRD 第 20.5 节。
 
     用于标注单次查询返回数据的完整程度。
@@ -232,7 +232,7 @@ class Country(BaseModel):
     name: str | None = None
 
 
-class Device(str, enum.Enum):
+class Device(enum.StrEnum):
     """设备类型。"""
     DESKTOP = "desktop"
     MOBILE = "mobile"
@@ -264,7 +264,7 @@ class BaseEvidence(BaseModel):
 
     source: DataSource = Field(..., description="数据来源平台")
     fetched_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc),
+        default_factory=lambda: datetime.now(UTC),
         description="数据获取时间（UTC）",
     )
     data_date: DateRange | date | None = Field(

@@ -18,18 +18,16 @@ from __future__ import annotations
 
 import enum
 from datetime import datetime
-from typing import Optional
 
 from pydantic import Field
 
 from src.models.common import BaseEvidence, Country
 
-
 # ============================================================
 # 状态枚举
 # ============================================================
 
-class AuthStatus(str, enum.Enum):
+class AuthStatus(enum.StrEnum):
     """授权状态（平台无关）。
 
     各 Provider 通过调用各自的健康检查端点判断，映射为统一状态。
@@ -41,7 +39,7 @@ class AuthStatus(str, enum.Enum):
     UNKNOWN = "unknown"
 
 
-class SubscriptionTier(str, enum.Enum):
+class SubscriptionTier(enum.StrEnum):
     """订阅级别（平台无关）。
 
     用于 TierRouter 选择最优 Provider。
@@ -54,7 +52,7 @@ class SubscriptionTier(str, enum.Enum):
     UNKNOWN = "unknown"
 
 
-class DataDomainStatus(str, enum.Enum):
+class DataDomainStatus(enum.StrEnum):
     """数据域可用状态（平台无关）。
 
     用于站点档案和各数据域状态检查。

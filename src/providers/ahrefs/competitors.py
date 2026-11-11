@@ -14,13 +14,13 @@ T5b — 竞争分析（Organic Competitors / Batch Analysis）
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from loguru import logger
 
-from src.models.competitor import OrganicCompetitor, BatchAnalysisResult
 from src.models.common import DataSource
+from src.models.competitor import BatchAnalysisResult, OrganicCompetitor
 
 
 async def get_organic_competitors(
@@ -59,7 +59,7 @@ async def get_organic_competitors(
     raw = await client.request("site_explorer_organic_competitors", params={
         "target": site_id, "country": country,
     })
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return [
         OrganicCompetitor(
             domain=c["domain"],
@@ -108,7 +108,7 @@ async def get_batch_analysis(
     logger.info(f"[T5b-Competitors] get_batch_analysis | targets={len(targets)}")
 
     raw = await client.request("batch_analysis", body={"targets": targets})
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return [
         BatchAnalysisResult(
             target_domain=r["target_domain"],

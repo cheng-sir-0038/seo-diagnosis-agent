@@ -133,7 +133,10 @@ async def test_page_metadata_provider_merges_python_seo_analyzer_evidence() -> N
         content_type="text/html",
         content_length_bytes=300,
         headers={},
-        html="<html><head><title>Example</title><meta name=\"description\" content=\"Desc\"></head><body><h1>Main</h1><h2>Section</h2></body></html>",
+        html=(
+            '<html><head><title>Example</title><meta name="description" content="Desc">'
+            "</head><body><h1>Main</h1><h2>Section</h2></body></html>"
+        ),
     )
     analyzer = type("Analyzer", (), {"analyze": AsyncMock(), "enabled": True})()
     analyzer.analyze.return_value = {
@@ -185,7 +188,10 @@ async def test_page_metadata_provider_keeps_metadata_when_python_seo_analyzer_fa
         content_type="text/html",
         content_length_bytes=100,
         headers={},
-        html="<html><head><title>Example</title><meta name=\"description\" content=\"Desc\"></head><body><h1>Main</h1></body></html>",
+        html=(
+            '<html><head><title>Example</title><meta name="description" content="Desc">'
+            "</head><body><h1>Main</h1></body></html>"
+        ),
     )
     analyzer = type("Analyzer", (), {"analyze": AsyncMock(), "enabled": True})()
     analyzer.analyze.side_effect = RuntimeError("worker down")

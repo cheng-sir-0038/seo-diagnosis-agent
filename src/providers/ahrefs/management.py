@@ -21,13 +21,13 @@ T1 — 站点管理与订阅信息
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from loguru import logger
 
-from src.models.management import SiteProfile, AhrefsProject, SubscriptionInfo
-from src.models.common import DataSource, Country
+from src.models.common import Country, DataSource
+from src.models.management import AhrefsProject, SiteProfile, SubscriptionInfo
 
 
 async def get_site_profile(
@@ -76,7 +76,6 @@ async def get_site_profile(
     logger.info(f"[T1-Management] get_site_profile | site_id={site_id}")
 
     # PSEUDO: 真实实现时替换为上述步骤
-    now = datetime.now(timezone.utc).isoformat()
     project = AhrefsProject(
         project_id="proj_abc123",
         project_name="示例站点项目",
@@ -87,7 +86,7 @@ async def get_site_profile(
         created_at="2026-01-15",
         status="active",
         source=DataSource.AHREFS,
-        fetched_at=datetime.now(timezone.utc),
+        fetched_at=datetime.now(UTC),
         is_estimated=False,
     )
 
@@ -115,7 +114,7 @@ async def get_site_profile(
             "competitors": "available",
         },
         source=DataSource.AHREFS,
-        fetched_at=datetime.now(timezone.utc),
+        fetched_at=datetime.now(UTC),
         is_estimated=False,
     )
 
@@ -146,7 +145,6 @@ async def get_subscription_info(
     logger.info("[T1-Management] get_subscription_info")
 
     # PSEUDO: 真实实现时调用 client.request("subscription_info")
-    now = datetime.now(timezone.utc).isoformat()
     return SubscriptionInfo(
         plan_name="Ahrefs Advanced",
         api_units_limit=500000,
@@ -158,6 +156,6 @@ async def get_subscription_info(
         rate_limit_per_minute=60,
         workspace_name="主工作区",
         source=DataSource.AHREFS,
-        fetched_at=datetime.now(timezone.utc),
+        fetched_at=datetime.now(UTC),
         is_estimated=False,
     )

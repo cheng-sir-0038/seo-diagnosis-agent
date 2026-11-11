@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from src.core.config import settings
 
 
-class SerperSearchType(str, enum.Enum):
+class SerperSearchType(enum.StrEnum):
     """Serper 已注册的搜索类型。"""
 
     SEARCH = "search"

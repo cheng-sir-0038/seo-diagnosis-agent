@@ -19,13 +19,13 @@ T4a — Keywords Explorer + SERP Overview
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from loguru import logger
 
+from src.models.common import Country, DataSource
 from src.models.keyword import KeywordOverview, SerpResult
-from src.models.common import DataSource, Country
 
 
 async def get_keyword_overview(
@@ -57,7 +57,7 @@ async def get_keyword_overview(
     """
     logger.info(f"[T4a-Keywords] get_keyword_overview | keywords={len(keywords)} country={country}")
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     results: list[KeywordOverview] = []
     for kw in keywords[:20]:  # 限制批量大小
         raw = await client.request("keywords_explorer_overview", params={
@@ -107,7 +107,7 @@ async def get_serp_overview(
     raw = await client.request("serp_overview", params={
         "keyword": keyword, "country": country,
     })
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return [
         SerpResult(
             rank=r.get("rank", i + 1),

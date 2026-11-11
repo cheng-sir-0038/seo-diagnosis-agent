@@ -29,12 +29,11 @@ from pydantic import Field
 
 from src.models.common import BaseEvidence
 
-
 # ============================================================
 # 状态枚举
 # ============================================================
 
-class BacklinkStatus(str, enum.Enum):
+class BacklinkStatus(enum.StrEnum):
     """外链生命周期状态（平台无关）。
 
     各厂商映射:
@@ -47,7 +46,7 @@ class BacklinkStatus(str, enum.Enum):
     REDIRECT = "redirect"   # 已重定向
 
 
-class BacklinkAttribute(str, enum.Enum):
+class BacklinkAttribute(enum.StrEnum):
     """外链属性类型（平台无关）。
 
     对应 rel 属性值。

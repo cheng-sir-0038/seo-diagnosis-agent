@@ -27,12 +27,11 @@ from pydantic import Field
 
 from src.models.common import BaseEvidence, Country
 
-
 # ============================================================
 # 状态枚举
 # ============================================================
 
-class RankingTrend(str, enum.Enum):
+class RankingTrend(enum.StrEnum):
     """排名变化趋势（平台无关）。
 
     通过比较当前排名与上次排名计算得出。
@@ -51,7 +50,7 @@ class RankingTrend(str, enum.Enum):
     UNKNOWN = "unknown"
 
 
-class RankingTier(str, enum.Enum):
+class RankingTier(enum.StrEnum):
     """排名区间分级（平台无关）。
 
     用于阈值判断和优先级计算。
@@ -64,7 +63,7 @@ class RankingTier(str, enum.Enum):
     NOT_RANKING = "not_ranking"
 
 
-class RankedKeywordStatus(str, enum.Enum):
+class RankedKeywordStatus(enum.StrEnum):
     """关键词跟踪状态（平台无关）。
 
     各厂商映射:
@@ -140,7 +139,9 @@ class RankedKeyword(BaseEvidence):
     position_change: int | None = None
     url: str | None = None
     previous_url: str | None = None
-    status: str = Field(default="active", description="active / processing / frozen / paused / error")
+    status: str = Field(
+        default="active", description="active / processing / frozen / paused / error"
+    )
     last_updated: datetime | None = None
     serp_date: date | None = None
 

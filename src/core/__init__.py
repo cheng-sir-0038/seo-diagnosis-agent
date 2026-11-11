@@ -1,5 +1,6 @@
 """核心基础设施模块。"""
 
+from src.core.cache import CacheManager, cache_manager
 from src.core.config import Settings, settings
 from src.core.exceptions import (
     ErrorCode,
@@ -21,7 +22,6 @@ from src.core.exceptions import (
     to_error_response,
     upstream_error,
 )
-from src.core.cache import CacheManager, cache_manager
 
 __all__ = [
     # Config
