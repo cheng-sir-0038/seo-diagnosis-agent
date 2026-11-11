@@ -2,18 +2,6 @@
 
 一个网站 SEO 诊断 Agent MVP。用户用自然语言提问，DeepSeek 根据问题和已有证据选择工具、决定是否继续查询，最后整理结论。代码负责限制执行次数、处理超时并保存运行过程。项目使用 Python、FastAPI、React 和 SQLite。
 
-## 受控的工具循环
-
-Agent 的核心不是「能调工具」，是**知道什么时候停**。三条约束写死在代码里，不依赖提示词自觉：
-
-| 约束 | 位置 | 值 |
-|---|---|---|
-| 单次调查工具调用上限 | `AgentLoop.max_tool_calls` | 12 |
-| 单次工具超时 | `AgentLoop.tool_timeout` | 15s |
-| 重复调用检测 | `_DUPLICATE_GUARD_PREFIX` | 命中即停，改为基于已有证据作答 |
-
-到达预算不是静默截断：循环切换到总结模式，只基于已获得的证据作答，并必须输出「已确认结论 / 关键证据 / 数据不足或失败项 / 下一步建议」四段，不得继续补查、不得编造数据。
-
 ## Agent 如何运行
 
 [SEO Chat 入口](src/api/routes/seo_agent_chat.py)读取站点信息，构建[系统提示词](src/seo_agent/chat/runtime.py)和可用工具，再交给[工具循环](src/agent/loop.py)执行。模型负责选择查询和解读结果；页面体检、关键词研究和综合报告等步骤由工作流代码组织。
@@ -124,7 +112,7 @@ seo_site_diagnosis
 
 页面原文和用户补充分开标记。没有依据的价格、评分、日期、作者或图片不自动补齐；不能确认结构化类型时先保留可确定的文案并追问。没有执行 JavaScript，正文最多读取 6000 字符，对话补充最多使用最近 5 条用户输入、每条 2000 字符。HTML 片段保留在结果中，JSON-LD 在卡片展示；提示词、模型调用和引用校验可在运行记录中查看。
 
-结果始终是待人工确认的建议，不修改外部网站、Canonical、审批或发布记录。已有 JSON-LD 需人工确认合并，不能直接覆盖。代码只做 JSON 结构与来源校验，尚未运行 Schema.org 词汇全量验证或 [Google 富结果测试](https://search.google.com/test/rich-results)。[Google 不使用 Meta Keywords 参与收录和排名](https://developers.google.com/search/docs/crawling-indexing/special-tags#unsupported)，关键词仅作为主题文案建议。
+结果始终是待人工确认的建议，不修改外部网站、Canonical、审批或发布记录。已有 JSON-LD 需人工确认合并，不能直接覆盖。运行时只做 JSON 结构与来源校验，落地前需使用 [Schema.org 验证器](https://validator.schema.org/)和适用的 [Google 富结果测试](https://search.google.com/test/rich-results)另行验证；语法通过不保证符合 Google 展示规则。站点名称不适用富结果测试，需按 [Google 站点名称规则](https://developers.google.com/search/docs/appearance/site-names)核对。[Google 不使用 Meta Keywords 参与收录和排名](https://developers.google.com/search/docs/crawling-indexing/special-tags#unsupported)，关键词仅作为主题文案建议。
 
 ### 机会生成与入池
 
@@ -281,7 +269,7 @@ npm ci
 npm run dev
 ```
 
-未配置可选数据源或 Ahrefs 仍为 pseudo 模式时，`/health` 的总体状态可能为 `degraded`，可查看各数据源状态。
+已在本地验证镜像构建、容器启动、健康接口、工作流路由和隔离 HTML 分析器。未配置可选数据源或 Ahrefs 仍为 pseudo 模式时，`/health` 的总体状态可能为 `degraded`，可查看各数据源状态。
 
 ### 可选：Langfuse Cloud
 
@@ -312,6 +300,8 @@ npm run dev
 ```
 
 前端验证：`npm --prefix frontend test`、`npm --prefix frontend run lint`、`npm --prefix frontend run build`；完整后端用例运行 `python -m pytest -q`。
+
+安装 Ruff 后运行 `ruff check src tests`，静态检查覆盖全部后端源码和测试，不依赖第三方 Key。
 
 [`tests/agent_evals/`](tests/agent_evals/)根据实际运行事件检查工具选择、失败和终态；自动化用例使用模拟模型，不代表 DeepSeek 的真实选工具准确率。新增诊断流程见[业务工作流用例](tests/seo_agent/test_business_workflows.py)，关键词接口字段见[DataForSEO 契约用例](tests/providers/test_dataforseo_keyword_overview.py)。其他业务用例可参阅[机会管理](tests/seo_agent/test_opportunities_workbench.py)、[任务与交付](tests/seo_agent/test_tasks_delivery.py)、[发布与监控](tests/seo_agent/test_publishing_monitoring.py)和[自动化集成](tests/seo_agent/test_automation_integration.py)。
 
