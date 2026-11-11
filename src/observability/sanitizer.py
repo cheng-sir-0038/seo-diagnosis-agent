@@ -120,4 +120,4 @@ def sanitized_json(
 
 
 def observation_json(value: Any) -> str:
-    return sanitized_json(value, max_depth=12, max_string_length=50_000)
+    return sanitized_json(value, max_depth=20, max_string_length=50_000)

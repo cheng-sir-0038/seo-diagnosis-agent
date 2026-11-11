@@ -169,7 +169,7 @@ class OpenTelemetryExporter:
                 attributes.update(
                     self._io_attributes(payload, "arguments_json", "result_summary_json")
                 )
-            elif payload.get("kind") == "TOOL":
+            else:
                 attributes.update(self._io_attributes(payload, "input_json", "output_json"))
             if metadata.get("reused") is True:
                 attributes["langfuse.observation.metadata.reused"] = True

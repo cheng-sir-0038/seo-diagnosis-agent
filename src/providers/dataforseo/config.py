@@ -85,9 +85,14 @@ ENDPOINTS: dict[str, DataForSEOEndpoint] = {
 
     "competitors_domain": DataForSEOEndpoint(
         path="/v3/dataforseo_labs/google/competitors_domain/live",
-        description="竞争对手域名全景：排名分布、流量估算 → 替代 Ahrefs organic_competitors + search_metrics",
+        description="自然搜索竞争对手及关键词交集",
         is_live=True,
         estimated_cost=0.02,
+    ),
+    "domain_rank_overview": DataForSEOEndpoint(
+        path="/v3/dataforseo_labs/google/domain_rank_overview/live",
+        description="当前域名的自然搜索指标与排名分布",
+        is_live=True,
     ),
     "domain_intersection": DataForSEOEndpoint(
         path="/v3/dataforseo_labs/google/domain_intersection/live",
@@ -120,12 +125,12 @@ ENDPOINTS: dict[str, DataForSEOEndpoint] = {
     ),
 
     # ============================================================
-    # Keywords Data API — 关键词研究
+    # DataForSEO Labs — 关键词指标
     # ============================================================
 
-    "keywords_for_keywords": DataForSEOEndpoint(
-        path="/v3/keywords_data/google/keywords_for_keywords/live",
-        description="关键词扩展：搜索量、难度、CPC、意图 → 替代 Ahrefs keyword_overview",
+    "keyword_overview": DataForSEOEndpoint(
+        path="/v3/dataforseo_labs/google/keyword_overview/live",
+        description="核对指定关键词的搜索量、难度、CPC 和意图",
         is_live=True,
         estimated_cost=0.01,
     ),

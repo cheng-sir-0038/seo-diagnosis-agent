@@ -11,11 +11,49 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 
 from src.observability.client import ObservabilityClient
 from src.observability.exporters import OpenTelemetryExporter
+from src.observability.instrumentation import observed_operation
 from src.observability.models import SpanKind
 from src.observability.storage import ObservabilityDatabase
 
 TRACE_ID = re.compile(r"^[0-9a-f]{32}$")
 SPAN_ID = re.compile(r"^[0-9a-f]{16}$")
+
+
+@pytest.mark.asyncio
+async def test_business_steps_export_evidence_and_receipt_on_the_same_trace(tmp_path: Path):
+    memory = InMemorySpanExporter()
+    database = ObservabilityDatabase(tmp_path / "observability.db")
+    exporter = OpenTelemetryExporter(
+        service_name="seo-agent", endpoint=None, span_exporter=memory, database=database
+    )
+    client = ObservabilityClient(database, project_key="seo-agent", exporters=[exporter])
+    receipt = {"opportunity_ids": ["opportunity-1"], "workflow_status": "partial"}
+    try:
+        async with observed_operation(
+            client, "seo.opportunity_discovery", kind=SpanKind.INTERNAL,
+            input_data={"query": "企业名录"},
+        ) as workflow:
+            async with observed_operation(
+                client, "freeze_opportunity_evidence", kind=SpanKind.INTERNAL,
+                input_data={"scan_run_id": "scan-1", "api_key": "fake-step-secret"},
+            ) as freeze:
+                freeze.output_data = {"evidence_snapshot_ids": ["snapshot-1"]}
+            workflow.output_data = receipt
+        await exporter.force_flush()
+        spans = memory.get_finished_spans()
+        root = next(span for span in spans if span.parent is None)
+        step = next(span for span in spans if span.name == "freeze_opportunity_evidence")
+        parent = next(span for span in spans if span.context.span_id == step.parent.span_id)
+        assert parent.parent.span_id == root.context.span_id
+        assert step.context.trace_id == root.context.trace_id
+        assert json.loads(step.attributes["langfuse.observation.input"])["scan_run_id"] == "scan-1"
+        assert json.loads(step.attributes["langfuse.observation.output"]) == {
+            "evidence_snapshot_ids": ["snapshot-1"]
+        }
+        assert json.loads(root.attributes["langfuse.observation.output"]) == receipt
+        assert "fake-step-secret" not in str([dict(span.attributes) for span in spans])
+    finally:
+        await client.shutdown()
 
 
 @pytest.mark.asyncio

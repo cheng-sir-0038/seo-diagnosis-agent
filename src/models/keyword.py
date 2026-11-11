@@ -102,9 +102,11 @@ class KeywordOverview(BaseEvidence):
 
     keyword: str
     country: Country | None = None
-    search_volume: int = Field(ge=0, description="月均搜索量")
+    search_volume: int | None = Field(default=None, ge=0, description="月均搜索量，未知时为空")
     global_volume: int | None = Field(default=None, description="全球搜索量")
-    keyword_difficulty: float = Field(default=0, ge=0, le=100, description="关键词难度")
+    keyword_difficulty: float | None = Field(
+        default=None, ge=0, le=100, description="关键词难度，未知时为空"
+    )
     traffic_potential: int | None = Field(default=None, description="流量潜力估算")
     cpc: float | None = Field(default=None, description="平均 CPC")
     parent_topic: str | None = Field(default=None, description="父级主题")

@@ -13,7 +13,7 @@ DataForSEO Provider 主类
   - 覆盖不同的 Capability 集合（DataForSEO 无审计/排名跟踪）
 
 DataForSEO 覆盖的 Capability:
-  ✅ 搜索表现: search_metrics (通过 competitors_domain 查自身)
+  ✅ 搜索表现: search_metrics (domain_rank_overview)
   ✅ 关键词:   organic_keywords, keyword_overview, serp_overview
   ✅ 外链:     backlinks_list, refdomains, broken_backlinks
   ✅ 竞争:     organic_competitors
@@ -208,34 +208,49 @@ class DataForSEOProvider(BaseProvider):
     ) -> SearchMetrics:
         """获取站点搜索表现总览。
 
-        通过 competitors_domain 查目标域名的自身指标。
-        DataForSEO 不直接提供"总览"端点，从 competitors_domain 的结果中
-        提取 target 自身的数据。
+        使用域名总览端点，并校验响应 target；没有本站指标时明确报错。
         """
         limit = self._resolve_limit(kwargs.get("limit"))
         raw = await self.client.request(
-            "competitors_domain",
+            "domain_rank_overview",
             task_body={
                 "target": site_id,
                 "location_name": _country_to_name(country),
-                "language_name": "English",
-                "include_clickstream_data": True,
+                "language_code": _language_code(str(kwargs.get("language") or "en")),
                 "limit": limit,
             },
         )
         results = self._extract_result(raw)
         now = self._now()
 
-        # 找到目标自身数据
+        groups = (raw.get("tasks") or [{}])[0].get("result") or []
         own = None
-        for r in results:
-            if r.get("domain") == site_id or r.get("domain") in site_id:
-                own = r
+        for group in groups:
+            if not isinstance(group, dict) or not _is_same_domain(
+                str(group.get("target") or ""), site_id
+            ):
+                continue
+            own = next((item for item in group.get("items", []) if isinstance(item, dict)), None)
+            if own is not None:
                 break
+        # 兼容已有离线样本，仍必须准确匹配域名。
+        if own is None and not any(
+            isinstance(group, dict) and "target" in group for group in groups
+        ):
+            own = next((
+                row for row in results if isinstance(row, dict)
+                and isinstance(row.get("domain"), str)
+                and _is_same_domain(row["domain"], site_id)
+            ), None)
         if own is None:
-            own = results[0] if results else {}
+            raise InternalProviderResponseError(
+                "站点总览响应缺少当前域名的指标，不能使用竞品数据代替",
+                provider="dataforseo",
+            )
 
         metrics = own.get("metrics", {}).get("organic", {})
+        if not isinstance(metrics, dict) or not metrics:
+            raise InternalProviderResponseError("站点总览缺少自然搜索指标", provider="dataforseo")
 
         return SearchMetrics(
             source=DataSource.DATAFORSEO,
@@ -269,7 +284,7 @@ class DataForSEOProvider(BaseProvider):
             task_body={
                 "target": site_id,
                 "location_name": _country_to_name(country),
-                "language_name": "English",
+                "language_code": _language_code(str(kwargs.get("language") or "en")),
                 "limit": min(limit, 1000),
             },
             max_pages=(limit // 100) + 1 if limit > 100 else 1,
@@ -320,20 +335,25 @@ class DataForSEOProvider(BaseProvider):
     ) -> list[KeywordOverview]:
         """获取关键词概览。
 
-        DataForSEO: keywords_for_keywords → list[KeywordOverview]
-        一次请求最多 20 个关键词。
+        DataForSEO Labs keyword_overview，按 20 个词分批核对。
         """
+        if not isinstance(keywords, list) or not 1 <= len(keywords) <= 50 or any(
+            not isinstance(word, str) or not word.strip()
+            or len(word.strip()) > 80 or len(word.split()) > 10
+            for word in keywords
+        ):
+            raise ValueError("需要 1-50 个非空关键词，每个最多 80 个字符、10 个词")
         all_items = []
         batch_size = 20
 
         for i in range(0, len(keywords), batch_size):
             batch = keywords[i : i + batch_size]
             raw = await self.client.request(
-                "keywords_for_keywords",
+                "keyword_overview",
                 task_body={
                     "keywords": batch,
                     "location_name": _country_to_name(country),
-                    "language_name": "English",
+                    "language_code": _language_code(str(kwargs.get("language") or "en")),
                     "include_serp_info": False,
                 },
             )
@@ -341,21 +361,33 @@ class DataForSEOProvider(BaseProvider):
             now = self._now()
 
             for item in results:
+                keyword = item.get("keyword")
+                if not isinstance(keyword, str) or not keyword.strip():
+                    continue
+                info = _mapping(item.get("keyword_info")) if "keyword_info" in item else item
+                properties = _mapping(item.get("keyword_properties"))
+                intent = _mapping(item.get("search_intent_info"))
                 all_items.append(
                     KeywordOverview(
                         source=DataSource.DATAFORSEO,
                         fetched_at=now,
                         is_estimated=True,
-                        keyword=item.get("keyword", ""),
+                        integrity=(
+                            DataIntegrity.COMPLETE if info.get("search_volume") is not None
+                            else DataIntegrity.PARTIAL
+                        ),
+                        keyword=keyword.strip(),
                         country={"code": country},
-                        search_volume=item.get("search_volume", 0),
+                        search_volume=info.get("search_volume"),
                         global_volume=item.get("global_search_volume"),
-                        keyword_difficulty=item.get("keyword_difficulty", 0),
+                        keyword_difficulty=properties.get(
+                            "keyword_difficulty", item.get("keyword_difficulty")
+                        ),
                         traffic_potential=item.get("traffic_potential"),
-                        cpc=item.get("cpc"),
-                        intent=item.get("search_intent"),
+                        cpc=info.get("cpc"),
+                        intent=intent.get("main_intent", item.get("search_intent")),
                         volume_trend=None,
-                        updated_at=item.get("last_updated_time"),
+                        updated_at=info.get("last_updated_time", item.get("last_updated_time")),
                     )
                 )
 
@@ -580,7 +612,7 @@ class DataForSEOProvider(BaseProvider):
             task_body={
                 "target": site_id,
                 "location_name": _country_to_name(country),
-                "language_name": "English",
+                "language_code": _language_code(str(kwargs.get("language") or "en")),
                 "include_clickstream_data": False,
                 "limit": limit,
             },

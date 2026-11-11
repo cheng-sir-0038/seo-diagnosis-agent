@@ -87,3 +87,4 @@ async def observed_operation(
                 metadata=metadata,
             ) as span:
                 yield span
+                trace.output_data = span.output_data

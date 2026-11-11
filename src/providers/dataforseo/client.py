@@ -40,7 +40,7 @@ import base64
 import hashlib
 import json
 import time
-from typing import Any, Optional
+from typing import Any
 
 from loguru import logger
 
@@ -51,13 +51,13 @@ from src.core.exceptions import (
     InternalProviderRequestError,
     InternalProviderResponseError,
     InternalProviderServerError,
-    InternalRateLimitError,
     InternalQuotaExhaustedError,
+    InternalRateLimitError,
     auth_error,
     rate_limit_error,
     upstream_error,
 )
-from src.providers.dataforseo.config import DataForSEOConfig, DataForSEOEndpoint, ENDPOINTS
+from src.providers.dataforseo.config import ENDPOINTS, DataForSEOConfig, DataForSEOEndpoint
 
 
 class DataForSEOClient:
@@ -309,7 +309,7 @@ class DataForSEOClient:
                     await self._acquire_rate_limit()
                 else:
                     raise
-            except (InternalAuthError, InternalProviderRequestError):
+            except InternalAdapterError:
                 self._release_rate_limit()
                 raise
 
@@ -390,7 +390,7 @@ class DataForSEOClient:
           5xx → InternalProviderServerError
           其他 → InternalProviderResponseError
 
-        tasks 层面的错误（task.status_code != 200）也需处理。
+        HTTP 成功仍需检查响应和 tasks 中的 API 状态码。
         """
         status = response.status
 
@@ -456,17 +456,13 @@ class DataForSEOClient:
         """检查 DataForSEO tasks 数组层面的错误。
 
         DataForSEO 在 HTTP 200 的情况下，task 层面仍可能返回错误。
-        例如: task.status_code = 40400（目标无数据）。
+        例如: task.status_code = 40501（请求字段无效）。
         """
-        tasks = data.get("tasks", [])
-        if not tasks:
-            return
-
-        for task in tasks:
+        for task in [data, *(data.get("tasks") or [])]:
             task_status = task.get("status_code", 200)
 
             # 正常
-            if task_status == 200 or task_status == 20100:
+            if task_status in (200, 20000, 20100):
                 continue
 
             # Task 层面错误码
@@ -482,7 +478,7 @@ class DataForSEOClient:
                     f"DataForSEO task 额度耗尽: {task_message}",
                     provider="dataforseo",
                 )
-            elif task_status == 40400:
+            elif task_status == 40102:
                 logger.warning(
                     f"DataForSEO task 无数据: {task_message} | "
                     f"endpoint={endpoint.path}"
@@ -493,6 +489,12 @@ class DataForSEOClient:
                     f"DataForSEO task 服务端错误: {task_message}",
                     provider="dataforseo",
                     debug_context={"task_status": task_status},
+                )
+            elif task_status >= 40000:
+                raise InternalProviderResponseError(
+                    f"DataForSEO 请求失败 ({task_status}): {task_message}",
+                    provider="dataforseo",
+                    debug_context={"task_status": task_status, "endpoint": endpoint.path},
                 )
 
     # ============================================================
@@ -560,7 +562,8 @@ class DataForSEOClient:
             )
 
         raise InternalProviderRequestError(
-            f"DataForSEO 任务轮询超时 ({self.config.task_poll_max_attempts * self.config.task_poll_interval}s)",
+            "DataForSEO 任务轮询超时 "
+            f"({self.config.task_poll_max_attempts * self.config.task_poll_interval}s)",
             provider="dataforseo",
             debug_context={"task_id": task_id, "endpoint": endpoint.path},
         )
@@ -699,13 +702,16 @@ class DataForSEOClient:
 
         TODO: 接入真实 DataForSEO API Key 后，删除此方法及其所有调用。
         """
-        from datetime import date, datetime, timezone
+        from datetime import UTC, datetime
 
-        today = str(date.today())
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
 
         target = task_body.get("target", "example.com")
-        keyword = task_body.get("keyword", task_body.get("keywords", ["seo"])[0] if isinstance(task_body.get("keywords"), list) else "seo")
+        keyword = task_body.get(
+            "keyword",
+            task_body.get("keywords", ["seo"])[0]
+            if isinstance(task_body.get("keywords"), list) else "seo",
+        )
 
         pseudo_templates: dict[str, dict] = {
             "competitors_domain": {
@@ -769,21 +775,27 @@ class DataForSEOClient:
                             "keyword": f"best {keyword} tool",
                             "search_volume": 12100, "competition": 0.85, "cpc": 12.50,
                             "keyword_difficulty": 67,
-                            "ranked_domain": {"domain": target, "rank_group": 3, "rank_absolute": 3},
+                            "ranked_domain": {
+                                "domain": target, "rank_group": 3, "rank_absolute": 3,
+                            },
                             "impressions": 45000, "clicks": 3200, "estimated_traffic": 18500,
                         },
                         {
                             "keyword": f"{keyword} guide 2026",
                             "search_volume": 8800, "competition": 0.62, "cpc": 8.90,
                             "keyword_difficulty": 45,
-                            "ranked_domain": {"domain": target, "rank_group": 1, "rank_absolute": 1},
+                            "ranked_domain": {
+                                "domain": target, "rank_group": 1, "rank_absolute": 1,
+                            },
                             "impressions": 120000, "clicks": 28000, "estimated_traffic": 42000,
                         },
                         {
                             "keyword": f"free {keyword} checker",
                             "search_volume": 5400, "competition": 0.35, "cpc": 3.20,
                             "keyword_difficulty": 28,
-                            "ranked_domain": {"domain": target, "rank_group": 8, "rank_absolute": 8},
+                            "ranked_domain": {
+                                "domain": target, "rank_group": 8, "rank_absolute": 8,
+                            },
                             "impressions": 8000, "clicks": 320, "estimated_traffic": 1200,
                         },
                     ],
@@ -868,6 +880,7 @@ class DataForSEOClient:
     def _match_template(self, endpoint: DataForSEOEndpoint) -> str:
         """匹配伪数据模板 key。"""
         path_to_template: dict[str, str] = {
+            "domain_rank_overview": "competitors_domain",
             "competitors_domain": "competitors_domain",
             "ranked_keywords": "ranked_keywords",
             "backlinks/backlinks": "backlinks_list",
