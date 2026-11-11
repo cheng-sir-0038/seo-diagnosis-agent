@@ -145,3 +145,4 @@ def test_deepseek_payload_can_disable_tool_calls_for_budget_summary() -> None:
     )
     assert payload["tools"]
     assert payload["tool_choice"] == "none"
+    assert payload["thinking"] == {"type": "disabled"}

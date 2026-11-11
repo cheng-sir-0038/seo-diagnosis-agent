@@ -23,6 +23,8 @@ async def invoke_structured_model(
     model: Any,
     schema: Any,
     messages: list[Any],
+    *,
+    method: str | None = None,
 ) -> StructuredInvocationResult:
     """调用结构化模型并尽量保留原始 AIMessage 与用量。
 
@@ -31,7 +33,9 @@ async def invoke_structured_model(
     """
 
     try:
-        runnable = model.with_structured_output(schema, include_raw=True)
+        runnable = model.with_structured_output(
+            schema, include_raw=True, **({"method": method} if method else {})
+        )
     except TypeError:
         runnable = model.with_structured_output(schema)
     result = await runnable.ainvoke(messages)
@@ -43,6 +47,8 @@ async def invoke_structured_model(
         raw = result.get("raw")
         parsed = result.get("parsed")
         parsing_error = result.get("parsing_error")
+        if parsed is None and parsing_error is None:
+            parsing_error = ValueError("模型未返回可解析的结构化结果")
     else:
         raw = None
         parsed = result

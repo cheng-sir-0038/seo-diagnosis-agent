@@ -4,13 +4,14 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from datetime import UTC, datetime
 from typing import Any
 
 from src.agent.content_sanitizer import sanitize_assistant_content
 from src.agent.harness.protocols import AgentRunPersistence
 from src.agent.harness.summary import compact_model_context
-from src.agent.models import AgentRun, RunStatus
+from src.agent.models import AgentRun, HumanInputRequest, HumanInputState, RunStatus
 from src.agent.observability import AgentRunObserver
 from src.agent.providers.base import ModelProvider, ToolCall
 from src.agent.tools.base import ToolRuntimeContext, resolve_render_hint
@@ -20,7 +21,11 @@ from src.observability.context import (
     reset_current_context,
     set_current_context,
 )
-from src.observability.instrumentation import model_usage_fields, record_model_failure
+from src.observability.instrumentation import (
+    model_usage_fields,
+    observed_operation,
+    record_model_failure,
+)
 from src.observability.models import Severity, SpanKind, Status
 
 logger = logging.getLogger(__name__)
@@ -80,6 +85,37 @@ class AgentLoop:
             )
             if self.max_iterations <= 0:
                 raise RuntimeError("最大模型循环次数必须大于 0")
+            if run.human_input and run.human_input.answer is not None:
+                await self._emit(run, "input.accepted", {
+                    "request_id": run.human_input.request_id,
+                    "answer": run.human_input.answer,
+                    "action": run.human_input.action,
+                })
+                async with observed_operation(
+                    self.observer.client if self.observer else None,
+                    "human_input_received", kind=SpanKind.INTERNAL,
+                    input_data={
+                        "request_id": run.human_input.request_id, "answer": run.human_input.answer,
+                    },
+                ) as span:
+                    if span:
+                        span.output_data = {"application_run_id": run.id, "status": "resuming"}
+                if not run.pending_tool_calls:
+                    call = ToolCall(
+                        id=f"resume_{uuid.uuid4().hex}", name=run.human_input.tool_name,
+                        arguments=run.human_input.tool_arguments,
+                    )
+                    messages.append({"role": "assistant", "content": None, "tool_calls": [{
+                        "id": call.id, "type": "function", "function": {
+                            "name": call.name,
+                            "arguments": json.dumps(call.arguments, ensure_ascii=False),
+                        },
+                    }]})
+                    run.pending_tool_calls = [_serialize_tool_call(call)]
+                    await self._save_checkpoint(
+                        run, messages, iteration=iteration, tool_count=tool_count,
+                        stage="input_resume_pending",
+                    )
             if run.pending_tool_calls:
                 iteration, tool_count = await self._execute_pending_tools(
                     run,
@@ -87,6 +123,8 @@ class AgentLoop:
                     iteration=iteration,
                     tool_count=tool_count,
                 )
+            if await self._wait_for_input(run, messages):
+                return
 
             if iteration >= self.max_iterations:
                 iteration = self.max_iterations - 1
@@ -269,6 +307,8 @@ class AgentLoop:
                         iteration=iteration,
                         tool_count=tool_count,
                     )
+                    if await self._wait_for_input(run, messages):
+                        return
                     continue
 
                 raw_final_text = "".join(assistant_text).strip()
@@ -315,13 +355,15 @@ class AgentLoop:
             raise RuntimeError("模型循环未能收敛")
         except asyncio.CancelledError:
             if run.pause_requested:
-                run.status = RunStatus.RECOVERING
+                if run.status != RunStatus.WAITING_FOR_INPUT:
+                    run.status = RunStatus.RECOVERING
                 await self._save_checkpoint(
                     run,
                     messages,
                     iteration=iteration,
                     tool_count=tool_count,
-                    stage="paused",
+                    stage=("waiting_for_input"
+                           if run.status == RunStatus.WAITING_FOR_INPUT else "paused"),
                 )
             elif not run.terminal:
                 run.status = RunStatus.CANCELLED
@@ -412,6 +454,17 @@ class AgentLoop:
                 if tool_count > self.max_tool_calls:
                     raise RuntimeError("超过最大工具调用次数")
                 await self._execute_tool(run, call, messages)
+            payload = json.loads(messages[-1]["content"])
+            request = (payload.get("metadata") or {}).get("human_input")
+            if request is not None:
+                validated = HumanInputRequest.model_validate(request)
+                run.human_input = HumanInputState(
+                    **validated.model_dump(), request_id=f"input_{uuid.uuid4().hex}",
+                    tool_name=call.name,
+                    tool_arguments=call.arguments, tool_result=payload,
+                )
+            elif run.human_input and run.human_input.tool_name == call.name:
+                run.human_input = None
             run.pending_tool_calls = run.pending_tool_calls[1:]
             run.tool_count = tool_count
             if not run.pending_tool_calls:
@@ -426,6 +479,34 @@ class AgentLoop:
                 stage="tool_completed",
             )
         return iteration, tool_count
+
+    async def _wait_for_input(self, run: AgentRun, messages: list[dict[str, Any]]) -> bool:
+        pending = run.human_input
+        if pending is None or pending.answer is not None:
+            return False
+        text = "还需要你补充以下信息：\n\n" + "\n".join(
+            f"{index + 1}. {question}" for index, question in enumerate(pending.questions)
+        )
+        if not messages or messages[-1].get("content") != text:
+            messages.append({"role": "assistant", "content": text})
+        run.status = RunStatus.WAITING_FOR_INPUT
+        async with observed_operation(
+            self.observer.client if self.observer else None,
+            "wait_for_user_input", kind=SpanKind.INTERNAL,
+            input_data={"request_id": pending.request_id, "questions": pending.questions},
+        ) as span:
+            if span:
+                span.output_data = {"application_run_id": run.id, "status": run.status.value}
+        await self._emit(run, "message.completed", {"content": text})
+        await self._emit(run, "run.waiting_for_input", {
+            "request_id": pending.request_id, "questions": pending.questions,
+            "allow_use_available": pending.allow_use_available,
+        }, stage="waiting_for_input")
+        await self._save_checkpoint(
+            run, messages, iteration=run.iteration, tool_count=run.tool_count,
+            stage="waiting_for_input",
+        )
+        return True
 
     async def _reuse_tool_result(
         self,
@@ -546,6 +627,9 @@ class AgentLoop:
                             thread_id=run.thread_id,
                             site_id=run.site_id,
                             conversation_id=run.conversation_id,
+                            metadata={"human_input_resume": run.human_input.model_dump(mode="json")}
+                            if run.human_input and run.human_input.answer is not None
+                            and run.human_input.tool_name == call.name else {},
                         ),
                     ),
                     timeout=self.tool_timeout,
@@ -705,7 +789,10 @@ def _find_cached_success(
                 payload = json.loads(content) if isinstance(content, str) else dict(content or {})
             except (json.JSONDecodeError, TypeError, ValueError):
                 continue
-            if isinstance(payload, dict) and payload.get("success") is True:
+            if (
+                isinstance(payload, dict) and payload.get("success") is True
+                and not (payload.get("metadata") or {}).get("human_input")
+            ):
                 cache[key] = (payload, tool_call_id)
     return cache.get(_canonical_tool_call_key(call.name, call.arguments))
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,7 @@ class TaskDeliveryService:
         owner_actor_id: str,
         created_by_run_id: str | None = None,
         deadline_at: str | None = None,
+        connection: aiosqlite.Connection | None = None,
     ) -> dict[str, Any]:
         if not opportunity_ids:
             raise ValueError("至少选择一个机会")
@@ -58,34 +60,21 @@ class TaskDeliveryService:
             raise RuntimeError("SeoAgentDatabase 尚未启动")
 
         task_id = _id("task")
+        owns_transaction = connection is None
+        if connection is not None and (
+            connection is not self.database._require_connection() or not connection.in_transaction
+        ):
+            raise ValueError("创建任务必须使用当前业务事务连接")
         # Approval decisions use their own connection; take the same write lock while validating.
-        async with aiosqlite.connect(self.database.path) as connection:
-            connection.row_factory = aiosqlite.Row
-            await connection.execute("PRAGMA foreign_keys = ON")
-            await connection.execute("BEGIN IMMEDIATE")
-            for opportunity_id in opportunity_ids:
-                async with connection.execute(
-                    "SELECT status FROM opportunities "
-                    "WHERE id = ? AND site_id = ? AND archived_at IS NULL",
-                    (opportunity_id, site_id),
-                ) as cursor:
-                    opportunity = await cursor.fetchone()
-                if opportunity is None:
-                    raise KeyError("机会不存在或不属于当前站点")
-                async with connection.execute(
-                    "SELECT status FROM approval_actions WHERE site_id = ? "
-                    "AND target_type = 'opportunity' AND target_id = ? "
-                    "AND action_type = 'ADD_OPPORTUNITY_TO_PRODUCTION' "
-                    "AND archived_at IS NULL ORDER BY requested_at DESC, rowid DESC LIMIT 1",
-                    (site_id, opportunity_id),
-                ) as cursor:
-                    action = await cursor.fetchone()
-                if (
-                    opportunity["status"] != "APPROVED"
-                    or action is None
-                    or action["status"] not in {"APPROVED", "EDITED_AND_APPROVED"}
-                ):
-                    raise ValueError("关联机会尚未通过审批")
+        context = aiosqlite.connect(self.database.path) if owns_transaction else nullcontext(connection)
+        async with context as connection:
+            if owns_transaction:
+                connection.row_factory = aiosqlite.Row
+                await connection.execute("PRAGMA foreign_keys = ON")
+                await connection.execute("BEGIN IMMEDIATE")
+            await self.validate_opportunities(
+                site_id=site_id, opportunity_ids=opportunity_ids, connection=connection
+            )
 
             now = _now()
             await connection.execute(
@@ -115,8 +104,46 @@ class TaskDeliveryService:
             await self._record_task_status(
                 task_id, None, "DRAFT", "任务已创建", owner_actor_id, connection=connection
             )
-            await connection.commit()
+            if owns_transaction:
+                await connection.commit()
         return await self.get_task(task_id)
+
+    async def validate_opportunities(
+        self, *, site_id: str, opportunity_ids: list[str],
+        connection: aiosqlite.Connection | None = None,
+    ) -> list[dict[str, Any]]:
+        if not opportunity_ids or len(set(opportunity_ids)) != len(opportunity_ids):
+            raise ValueError("必须选择不重复的机会")
+        connection = connection or self.database._require_connection()
+        opportunities = []
+        for opportunity_id in opportunity_ids:
+            async with connection.execute(
+                "SELECT * FROM opportunities "
+                "WHERE id = ? AND site_id = ? AND archived_at IS NULL",
+                (opportunity_id, site_id),
+            ) as cursor:
+                opportunity = await cursor.fetchone()
+            if opportunity is None:
+                raise KeyError("机会不存在或不属于当前站点")
+            async with connection.execute(
+                "SELECT id, status FROM approval_actions WHERE site_id = ? "
+                "AND target_type = 'opportunity' AND target_id = ? "
+                "AND action_type = 'ADD_OPPORTUNITY_TO_PRODUCTION' "
+                "AND archived_at IS NULL ORDER BY requested_at DESC, rowid DESC LIMIT 1",
+                (site_id, opportunity_id),
+            ) as cursor:
+                action = await cursor.fetchone()
+            if (
+                opportunity["status"] != "APPROVED"
+                or action is None
+                or action["status"] not in {"APPROVED", "EDITED_AND_APPROVED"}
+            ):
+                raise ValueError("关联机会尚未通过审批")
+            opportunities.append({
+                **dict(opportunity), "approval_action_id": action["id"],
+                "approval_status": action["status"],
+            })
+        return opportunities
 
     async def get_task(self, task_id: str) -> dict[str, Any]:
         row = await self.database.fetch_one(

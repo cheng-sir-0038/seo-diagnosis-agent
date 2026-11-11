@@ -102,7 +102,7 @@ class AgentRunObserver:
             exc = RuntimeError(run.error or "Agent run failed")
         elif run.status == RunStatus.CANCELLED:
             exc = asyncio.CancelledError()
-        elif run.status == RunStatus.RECOVERING:
+        elif run.status in {RunStatus.RECOVERING, RunStatus.WAITING_FOR_INPUT}:
             self.trace_scope.status_override = Status.INTERRUPTED
             self.run_scope.status_override = Status.INTERRUPTED
         await self.run_scope.__aexit__(type(exc) if exc else None, exc, None)

@@ -12,11 +12,12 @@ from pydantic import BaseModel, Field
 
 from src.agent.harness.persistence import StoreRunPersistence
 from src.agent.loop import AgentLoop
-from src.agent.models import AgentEvent, AgentRun
+from src.agent.models import AgentEvent, AgentRun, HumanInputAnswer, RunStatus
 from src.agent.observability import AgentRunObserver
 from src.agent.providers.base import ModelProvider
 from src.agent.providers.deepseek import DeepSeekProvider
 from src.agent.run_manager import run_manager
+from src.core.cache import cache_manager
 from src.core.config import settings
 from src.facade.data_facade import facade
 from src.observability.runtime import observability_client, observability_database
@@ -26,6 +27,7 @@ from src.seo_agent.runtime import (
     seo_agent_system_service,
     seo_chat_harness_store,
     seo_chat_recovery_service,
+    structured_model_automation,
 )
 
 router = APIRouter(prefix="/seo-agent/chat", tags=["SEO Agent Chat"])
@@ -102,7 +104,12 @@ async def _schedule_restored_run(run: AgentRun) -> None:
         raise RuntimeError("恢复运行缺少 site_id")
     site = await seo_agent_system_service.get_site(run.site_id)
     registry = build_seo_agent_registry(
-        facade, site, observability=observability_client if observability_database.started else None
+        facade, site,
+        observability=observability_client if observability_database.started else None,
+        snapshots=cache_manager,
+        model_runner=structured_model_automation.model_runner,
+        user_messages=[str(message.get("content", "")) for message in run.messages
+                       if message.get("role") == "user"],
     )
     if not registry.schemas():
         raise RuntimeError("恢复运行没有真实 SEO 数据工具可用")
@@ -128,7 +135,11 @@ async def create_run(body: CreateSeoAgentRunRequest) -> CreateSeoAgentRunRespons
     if str(site.get("status") or "ACTIVE") != "ACTIVE":
         raise HTTPException(status_code=409, detail="站点当前不可用于 SEO Agent 调查")
     registry = build_seo_agent_registry(
-        facade, site, observability=observability_client if observability_database.started else None
+        facade, site,
+        observability=observability_client if observability_database.started else None,
+        snapshots=cache_manager,
+        model_runner=structured_model_automation.model_runner,
+        user_messages=[message.content for message in body.messages if message.role == "user"],
     )
     if not registry.schemas():
         raise HTTPException(
@@ -244,7 +255,7 @@ async def _event_stream(
         if event.type != "message.delta":
             cursor = max(cursor, event.sequence)
 
-    if run.terminal:
+    if run.terminal or run.status == RunStatus.WAITING_FOR_INPUT:
         return
 
     while True:
@@ -258,7 +269,9 @@ async def _event_stream(
             yield _encode(event)
             if event.type != "message.delta":
                 cursor = max(cursor, event.sequence)
-            if event.type in {"run.completed", "run.failed", "run.cancelled"}:
+            if event.type in {
+                "run.completed", "run.failed", "run.cancelled", "run.waiting_for_input",
+            }:
                 return
         except TimeoutError:
             yield "event: heartbeat\ndata: {}\n\n"
@@ -336,9 +349,14 @@ async def resume_run(run_id: str) -> dict[str, str]:
     if existing is not None and existing.task is not None and not existing.task.done():
         raise HTTPException(status_code=409, detail="run 正在执行")
     try:
+        detail = await seo_chat_harness_store.get_run(run_id)
+        if detail["status"] == "WAITING_FOR_INPUT":
+            raise HTTPException(status_code=409, detail="请先回答当前问题，再继续运行")
         run = await seo_chat_harness_store.restore_run(run_id)
         run_manager.register(run)
         await _schedule_restored_run(run)
+    except HTTPException:
+        raise
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
@@ -347,8 +365,43 @@ async def resume_run(run_id: str) -> dict[str, str]:
     return {"run_id": run.id, "status": run.status.value}
 
 
+@router.post("/runs/{run_id}/input")
+async def submit_run_input(run_id: str, body: HumanInputAnswer) -> dict[str, Any]:
+    if not _durable_enabled():
+        raise HTTPException(status_code=503, detail="Agent 运行 Harness 未启动")
+    existing = run_manager.get(run_id)
+    if (
+        existing is not None and existing.task is not None and not existing.task.done()
+        and existing.status == RunStatus.WAITING_FOR_INPUT
+    ):
+        try:
+            await asyncio.wait_for(asyncio.shield(existing.task), timeout=5)
+        except TimeoutError as exc:
+            raise HTTPException(status_code=409, detail="正在保存进度，请稍后再提交") from exc
+    try:
+        run, replayed, sequence = await seo_chat_harness_store.submit_input(run_id, body)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not replayed:
+        run_manager.register(run)
+        try:
+            await _schedule_restored_run(run)
+        except Exception as exc:
+            await seo_chat_harness_store.mark_recovery_blocked(run_id, str(exc))
+            raise HTTPException(status_code=503, detail="补充已保存，运行暂时无法恢复") from exc
+    return {
+        "run_id": run.id, "task_id": run.task_id, "thread_id": run.thread_id,
+        "status": run.status.value, "after_sequence": sequence, "replayed": replayed,
+        "events_url": f"/api/v1/seo-agent/chat/runs/{run.id}/events",
+        "cancel_url": f"/api/v1/seo-agent/chat/runs/{run.id}/cancel",
+    }
+
+
 @router.post("/runs/{run_id}/cancel")
 async def cancel_run(run_id: str) -> dict[str, str]:
+    await _load_runtime_run(run_id)
     run = run_manager.cancel(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="run 不存在")

@@ -217,7 +217,7 @@ def test_registry_only_exposes_live_capabilities() -> None:
     registry = build_seo_agent_registry(facade, SITE)
     names = {schema["function"]["name"] for schema in registry.schemas()}
 
-    assert names == {"seo_search_metrics", "seo_organic_keywords"}
+    assert names == {"seo_search_metrics", "seo_organic_keywords", "seo_search_diagnosis"}
     assert "seo_search_history" not in names
     assert "seo_audit_issues" not in names
     assert "seo_top_pages" not in names

@@ -6,11 +6,19 @@ from urllib.parse import urlparse
 
 from src.agent.tools.base import AgentTool, RenderHint, ToolResult, ToolRuntimeContext
 from src.agent.tools.registry import ToolRegistry
+from src.core.cache import CacheManager
 from src.core.config import settings
 from src.models.common import Capability
 from src.observability.client import ObservabilityClient
 from src.seo_agent.chat.presentation import build_presentation, can_render
+from src.seo_agent.workflows.keyword_opportunity import KeywordOpportunityWorkflow
+from src.seo_agent.workflows.page_change_review import PageChangeReviewWorkflow
+from src.seo_agent.workflows.page_suggestions import PageSuggestionsWorkflow
+from src.seo_agent.workflows.ranking_page_optimization import RankingPageOptimizationWorkflow
+from src.seo_agent.workflows.search_diagnosis import SearchDiagnosisWorkflow
 from src.seo_agent.workflows.site_audit import SiteAuditWorkflow
+from src.seo_agent.workflows.site_diagnosis import SiteDiagnosisWorkflow
+from src.seo_agent.workflows.structured_model import StructuredModelRunner
 
 
 class FacadeProtocol(Protocol):
@@ -33,6 +41,7 @@ _COMMON_PROPERTIES = {
         "type": "string",
         "description": "ISO 3166-1 两位国家代码。未提供时使用站点默认国家。",
     },
+    "language": {"type": "string", "description": "语言代码；未提供时使用站点默认语言。"},
     "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
     "force_refresh": {"type": "boolean", "default": False},
 }
@@ -411,6 +420,11 @@ class SeoFacadeTool(AgentTool):
             params.setdefault("language", str(self.site.get("default_language") or "en"))
 
         params.setdefault("country", str(self.site.get("default_country") or "US").lower())
+        if self.definition.capability in {
+            Capability.SEARCH_METRICS, Capability.ORGANIC_KEYWORDS,
+            Capability.KEYWORD_OVERVIEW, Capability.ORGANIC_COMPETITORS,
+        }:
+            params.setdefault("language", str(self.site.get("default_language") or "en"))
         if "limit" in params:
             maximum = 200 if self.definition.capability == Capability.SERP_OVERVIEW else 100
             params["limit"] = max(1, min(int(params["limit"]), maximum))
@@ -465,6 +479,9 @@ class SeoFacadeTool(AgentTool):
 def build_seo_agent_registry(
     facade: FacadeProtocol, site: dict[str, Any], *,
     observability: ObservabilityClient | None = None,
+    snapshots: CacheManager | None = None,
+    model_runner: StructuredModelRunner | None = None,
+    user_messages: list[str] | None = None,
 ) -> ToolRegistry:
     live_capabilities = facade.live_capabilities()
     registry = ToolRegistry(
@@ -481,6 +498,40 @@ def build_seo_agent_registry(
         )
         registry.register(SiteAuditWorkflow(
             registry.get("seo_page_metadata"), performance, settings.agent_tool_timeout,
+            observability=observability,
+        ))
+        if snapshots is not None:
+            registry.register(PageChangeReviewWorkflow(
+                registry.get("seo_page_metadata"), site, snapshots, settings.agent_tool_timeout,
+                observability=observability,
+            ))
+        if model_runner is not None:
+            registry.register(PageSuggestionsWorkflow(
+                registry.get("seo_page_metadata"), model_runner, settings.agent_tool_timeout,
+                observability=observability, user_messages=user_messages,
+            ))
+    tools = {tool.name: tool for tool in registry.values()}
+    if {
+        Capability.ORGANIC_KEYWORDS, Capability.PAGE_METADATA, Capability.SERP_OVERVIEW,
+    } <= live_capabilities:
+        registry.register(RankingPageOptimizationWorkflow(
+            dict(tools), site, settings.agent_tool_timeout, observability=observability,
+        ))
+    if {Capability.SEARCH_METRICS, Capability.ORGANIC_KEYWORDS} <= live_capabilities:
+        registry.register(SearchDiagnosisWorkflow(
+            dict(tools), settings.agent_tool_timeout, observability=observability,
+        ))
+    if Capability.SERP_OVERVIEW in live_capabilities and live_capabilities & {
+        Capability.AUTOCOMPLETE, Capability.KEYWORD_OVERVIEW,
+    }:
+        registry.register(KeywordOpportunityWorkflow(
+            dict(tools), settings.agent_tool_timeout, observability=observability,
+        ))
+    if "seo_site_audit" in tools and (
+        "seo_search_diagnosis" in registry.names() or "seo_keyword_opportunity" in registry.names()
+    ):
+        registry.register(SiteDiagnosisWorkflow(
+            {tool.name: tool for tool in registry.values()}, settings.agent_tool_timeout,
             observability=observability,
         ))
     return registry

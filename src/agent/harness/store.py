@@ -7,7 +7,13 @@ from datetime import UTC, datetime
 from typing import Any
 
 from src.agent.harness.summary import build_survival_summary
-from src.agent.models import AgentEvent, AgentRun, RunStatus
+from src.agent.models import (
+    AgentEvent,
+    AgentRun,
+    HumanInputAnswer,
+    HumanInputState,
+    RunStatus,
+)
 from src.seo_agent.db.database import SeoAgentDatabase
 
 
@@ -157,6 +163,7 @@ class AgentChatHarnessStore:
             stage=stage,
             token_usage=token_usage,
         )
+        summary.human_input = run.human_input.model_dump(mode="json") if run.human_input else None
         checkpoint_no = int(
             await self.database.fetch_value(
                 "SELECT COALESCE(MAX(checkpoint_no), 0) + 1 FROM agent_run_checkpoints "
@@ -299,6 +306,8 @@ class AgentChatHarnessStore:
                 else None
             ),
             error=detail.get("error_message"),
+            human_input=HumanInputState.model_validate(checkpoint["survival_summary"]["human_input"])
+            if checkpoint["survival_summary"].get("human_input") else None,
         )
         if mark_recovering:
             await self.database.execute(
@@ -313,6 +322,43 @@ class AgentChatHarnessStore:
                 (_now(), run.task_id),
             )
         return run
+
+    async def submit_input(
+        self, run_id: str, answer: HumanInputAnswer
+    ) -> tuple[AgentRun, bool, int]:
+        async with self.database.transaction() as session:
+            store = AgentChatHarnessStore(session)
+            run = await store.restore_run(run_id, mark_recovering=False)
+            for event in run.events:
+                if (
+                    event.type == "input.submitted"
+                    and event.payload.get("request_id") == answer.request_id
+                ):
+                    if (
+                        event.payload.get("answer") != answer.answer
+                        or event.payload.get("action", "answer") != answer.action
+                    ):
+                        raise ValueError("这次补充已提交，不能用同一请求替换回答")
+                    return run, True, event.sequence
+            pending = run.human_input
+            if run.status != RunStatus.WAITING_FOR_INPUT or pending is None:
+                raise ValueError("当前运行没有等待用户补充")
+            if pending.request_id != answer.request_id:
+                raise ValueError("补充请求已经变化，请刷新后回答当前问题")
+            if answer.action == "use_available" and not pending.allow_use_available:
+                raise ValueError("当前步骤必须补充必要信息，不能直接跳过")
+            pending.answer = answer.answer
+            pending.action = answer.action
+            run.messages.append({"role": "user", "content": answer.answer})
+            run.status = RunStatus.RECOVERING
+            event = run.emit("input.submitted", answer.model_dump(mode="json"))
+            await store.persist_event(run, event)
+            await store.save_checkpoint(
+                run, messages=run.messages, iteration=run.iteration, tool_count=run.tool_count,
+                pending_tool_calls=run.pending_tool_calls, stage="input_submitted",
+                token_usage=run.token_usage,
+            )
+            return run, False, event.sequence
 
     async def list_recoverable_runs(self) -> list[str]:
         rows = await self.database.fetch_all(
@@ -470,7 +516,7 @@ def _db_run_status(status: RunStatus) -> str:
 def _status_group(status: str) -> str:
     if status in {"PENDING"}:
         return "pending"
-    if status in {"RUNNING", "RECOVERING", "RECOVERY_BLOCKED"}:
+    if status in {"RUNNING", "RECOVERING", "RECOVERY_BLOCKED", "WAITING_FOR_INPUT"}:
         return "running"
     return "ended"
 

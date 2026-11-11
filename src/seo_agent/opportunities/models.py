@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class OpportunityScoreFactors(BaseModel):
@@ -46,3 +46,9 @@ class OpportunityScore(BaseModel):
     priority: str
     policy_version: str
     factors: OpportunityScoreFactors
+
+
+class OpportunityDiscoveryOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    candidates: list[OpportunityCandidate] = Field(max_length=3)

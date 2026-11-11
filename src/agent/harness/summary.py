@@ -14,6 +14,7 @@ class SurvivalSummary(BaseModel):
     pending: str = ""
     next_action: str = ""
     token_usage: dict[str, int] = Field(default_factory=dict)
+    human_input: dict[str, Any] | None = None
 
     def as_prompt(self) -> str:
         lines = [

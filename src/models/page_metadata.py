@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import Field
 
@@ -38,6 +38,11 @@ class PageMetadataReport(BaseEvidence):
     h1_count: int = Field(default=0, ge=0)
     og_title: str | None = None
     og_description: str | None = None
+    og_image: str | None = None
+    meta_tags: dict[str, str] = Field(default_factory=dict)
+    content_excerpt: str = ""
+    content_excerpt_truncated: bool = False
+    existing_json_ld: list[Any] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
     analyzer_name: str | None = None

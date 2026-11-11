@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from html.parser import HTMLParser
 from typing import Any
@@ -197,6 +198,7 @@ def parse_page_metadata(page: FetchedHtmlPage) -> dict[str, Any]:
     declared_noindex = _contains_noindex(robots, googlebot, x_robots)
 
     warnings: list[str] = []
+    warnings.extend(parser.structured_warnings)
     if not 200 <= page.status_code < 300:
         warnings.append(f"页面返回 HTTP {page.status_code}，当前元信息可能来自错误页。")
     if not title:
@@ -235,6 +237,12 @@ def parse_page_metadata(page: FetchedHtmlPage) -> dict[str, Any]:
         "h1_count": len(parser.h1s),
         "og_title": _first(parser.og_titles),
         "og_description": _first(parser.og_descriptions),
+        "og_image": urljoin(page.final_url, parser.meta_tags["og:image"])
+        if parser.meta_tags.get("og:image") else None,
+        "meta_tags": parser.meta_tags,
+        "content_excerpt": _clean(" ".join(parser.text_parts)) or "",
+        "content_excerpt_truncated": parser.text_truncated,
+        "existing_json_ld": parser.json_ld,
         "warnings": warnings,
     }
 
@@ -256,10 +264,22 @@ class _MetadataParser(HTMLParser):
         self._title_buffer: list[str] | None = None
         self._h1_buffer: list[str] | None = None
         self._h1_depth = 0
+        self.meta_tags: dict[str, str] = {}
+        self.text_parts: list[str] = []
+        self.text_length = 0
+        self.text_truncated = False
+        self._excluded: list[str] = []
+        self._json_buffer: str | None = None
+        self.json_ld: list[Any] = []
+        self.structured_warnings: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = {str(k).lower(): (v or "") for k, v in attrs}
         tag = tag.lower()
+        if tag in {"head", "script", "style", "template", "noscript", "title"}:
+            self._excluded.append(tag)
+        if tag == "script" and values.get("type", "").strip().lower() == "application/ld+json":
+            self._json_buffer = ""
         if tag == "html" and not self.html_lang:
             self.html_lang = _clean(values.get("lang"))
         elif tag == "title":
@@ -278,6 +298,19 @@ class _MetadataParser(HTMLParser):
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
+        if tag in self._excluded:
+            self._excluded = self._excluded[:self._excluded.index(tag)]
+        if tag == "script" and self._json_buffer is not None:
+            try:
+                if len(self.json_ld) >= 5 or len(self._json_buffer) > 20000:
+                    raise ValueError("JSON-LD 超出读取范围")
+                value = json.loads(self._json_buffer)
+                if not isinstance(value, (dict, list)):
+                    raise ValueError("JSON-LD 不是对象或数组")
+                self.json_ld.append(value)
+            except (ValueError, RecursionError):
+                self.structured_warnings.append("页面存在无法解析或超出读取范围的 JSON-LD。")
+            self._json_buffer = None
         if tag == "title" and self._title_buffer is not None:
             text = _clean("".join(self._title_buffer))
             if text:
@@ -294,6 +327,15 @@ class _MetadataParser(HTMLParser):
                 self._h1_buffer = None
 
     def handle_data(self, data: str) -> None:
+        if self._json_buffer is not None:
+            self._json_buffer = (self._json_buffer + data)[:20001]
+        if not self._excluded and (text := _clean(data)):
+            remaining = max(0, 6000 - self.text_length - bool(self.text_parts))
+            if len(text) > remaining:
+                self.text_truncated = True
+            if remaining:
+                self.text_parts.append(text[:remaining])
+                self.text_length += len(text[:remaining]) + (len(self.text_parts) > 1)
         if self._title_buffer is not None:
             self._title_buffer.append(data)
         if self._h1_buffer is not None:
@@ -319,6 +361,12 @@ class _MetadataParser(HTMLParser):
             targets[name].append(content or "")
         if not content:
             return
+        key = prop or name
+        if key in {
+            "author", "article:author", "article:published_time", "article:modified_time",
+            "og:site_name", "og:type", "og:url", "og:image",
+        }:
+            self.meta_tags.setdefault(key, content[:1000])
         if prop == "og:title":
             self.og_titles.append(content)
         elif prop == "og:description":

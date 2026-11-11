@@ -55,6 +55,10 @@ class SiteAuditWorkflow(AgentTool):
             raise ValueError("strategy 仅支持 mobile 或 desktop")
 
         started = time.monotonic()
+        deadline = started + self.timeout
+        inherited = runtime.metadata.get("workflow_deadline") if runtime else None
+        if isinstance(inherited, (int, float)):
+            deadline = min(deadline, inherited)
         page_args = {key: arguments[key] for key in ("url", "force_refresh") if key in arguments}
         page_result = await run_observed_tool(
             self.observability, self.page, page_args, runtime=runtime, component_name="page_html"
@@ -88,7 +92,7 @@ class SiteAuditWorkflow(AgentTool):
             else:
                 # shortcut: shared deadline; persist steps separately for mid-check recovery.
                 remaining = (
-                    self.timeout - (time.monotonic() - started) - min(0.5, self.timeout / 10)
+                    deadline - time.monotonic() - min(0.5, self.timeout / 10)
                 )
                 try:
                     if remaining <= 0:

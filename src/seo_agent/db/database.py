@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +14,7 @@ class SeoAgentDatabase:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self._connection: aiosqlite.Connection | None = None
+        self._autocommit = True
 
     @property
     def started(self) -> bool:
@@ -68,12 +71,36 @@ class SeoAgentDatabase:
     async def execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
         connection = self._require_connection()
         await connection.execute(sql, params)
-        await connection.commit()
+        if self._autocommit:
+            await connection.commit()
 
     async def execute_many(self, sql: str, params: list[tuple[Any, ...]]) -> None:
         connection = self._require_connection()
         await connection.executemany(sql, params)
-        await connection.commit()
+        if self._autocommit:
+            await connection.commit()
+
+    @asynccontextmanager
+    async def transaction(self) -> AsyncIterator[SeoAgentDatabase]:
+        """在独立连接中原子执行一组现有业务服务调用。"""
+        self._require_connection()
+        if not self._autocommit:
+            raise RuntimeError("不支持嵌套业务事务")
+        connection = await aiosqlite.connect(self.path)
+        connection.row_factory = aiosqlite.Row
+        session = SeoAgentDatabase(self.path)
+        session._connection, session._autocommit = connection, False
+        try:
+            await connection.execute("PRAGMA foreign_keys = ON")
+            await connection.execute("BEGIN IMMEDIATE")
+            yield session
+            await connection.commit()
+        except BaseException:
+            await connection.rollback()
+            raise
+        finally:
+            session._connection = None
+            await connection.close()
 
     async def fetch_one(self, sql: str, params: tuple[Any, ...] = ()) -> dict[str, Any] | None:
         connection = self._require_connection()

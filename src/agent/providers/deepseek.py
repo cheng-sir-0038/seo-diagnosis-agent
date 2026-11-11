@@ -56,6 +56,7 @@ class DeepSeekProvider(ModelProvider):
             "messages": messages,
             "stream": True,
             "stream_options": {"include_usage": True},
+            "thinking": {"type": "disabled"},
         }
         if tools:
             payload["tools"] = tools

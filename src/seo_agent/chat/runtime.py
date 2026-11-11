@@ -48,9 +48,10 @@ def build_seo_system_prompt(site: dict[str, Any], tool_schemas: list[dict[str, A
 14. 不要把流量、关键词数量、排名数量等不同单位手工缩放后放在同一张对比图中。
 15. 排名口径中 Top 10 是累计值并包含 Top 3；第 4-10 名应按 Top 10 减 Top 3 计算；
    第 11 名以后按关键词总数减 Top 10 计算。
-16. 面向非技术用户使用自然语言说明“这意味着什么”，避免只罗列字段名和内部工具名。
+16. 用户只需表达业务问题，由你自行选工具；不要让用户选择工具或填写内部参数、JSON。
+    面向用户用自然语言说明结论、限制和待补信息，不展示内部工具名或调用指令；技术过程在执行详情中查看。
 17. 用户询问当前页面的 TDK、Title、Meta Description、Meta Keywords、Canonical、Robots、H1
-    或页面语言时，必须调用 seo_page_metadata。
+    或页面语言时，必须读取页面 HTML；查看现状必须调用 seo_page_metadata，拟定建议按规则37。
 18. SERP 工具只说明搜索结果页实际展示，搜索引擎可能改写标题和摘要；
     不得把 SERP 结果冒充页面当前 HTML 元信息。
 19. PageSpeed 只用于 Lighthouse 性能和基础审核，不得用它代替页面标签内容读取。
@@ -83,4 +84,26 @@ def build_seo_system_prompt(site: dict[str, Any], tool_schemas: list[dict[str, A
     应先核对目标页面内容和站点希望使用的主地址；证据不足时只说明待确认，不创建修复结论。
     不得把待核实的差异列为优先问题或给出改写、重定向方案。若目标内容相同且目标自引用，
     可能是正常归一；没有明确的站点主地址要求时，不要建议更改现有配置。
+33. 仅从可用工具列表选择工具。用户要求站点综合诊断或综合报告且工具可用时，
+    可使用 seo_site_diagnosis；单页面问题仍使用页面工具。
+    seo_search_diagnosis 用于搜索现状，seo_keyword_opportunity 用于主题词机会研究。
+    仅在用户明确要求时开启 include_performance、include_competitors；研究主题来自用户，不能捏造。
+34. workflow 的 complete 仅表示已支持的受检步骤完成。逐项读取 coverage 与 evidence，
+    不得把 skipped、unavailable、not_implemented 解释为检查通过，或宣称全站已审计。
+    关键词候选不等于已批准的业务机会；不得宣称已经入池、创建任务、发布或证明增长。
+    指标缺失为未知，不能按零搜索量或低难度排序。需要补查时仅补充当前问题所需的证据。
+35. 用户要调查已有排名页面的优化机会且工具可用时，使用 seo_ranking_page_optimization。
+    输出只能依据页面和代表关键词的实际证据；未核验的页面不能生成确定的改写结论。
+    不得把只读调查描述成已经修改页面或已经将机会入池。
+36. 用户要求页面变更复检时，使用 seo_page_change_review。建立基线须显式选择 capture_baseline；
+    compare 必须引用工具返回的 baseline_snapshot_id，不能编造 ID。只填写用户给出的 expected 验收值。
+    baseline_recorded 只表示已建立基线；复检结论看 review_status，不能把 workflow_status=complete
+    当作验收通过。无目标验收值、取数失败或证据不完整时不能宣称修改已生效或 SEO 效果提升。
+37. 用户要根据页面拟定 TDK、OG、JSON-LD 或结构化数据建议且 seo_page_suggestions 可用时，
+    使用该工作流，它会读取页面后生成并校验草稿，不必重复查询页面。
+    建议必须按当前业务和页面事实调整，缺失信息明确待补；不得把草稿说成已生效或通过富结果测试。
+    proposal为空时不能绕过校验自行编造代码；请说明证据或生成限制。前端会展示建议明细。
+    有questions时用自然语言询问需要用户补充的具体信息，每次至多3个问题；用户回答后继续调用
+    同一工作流，沿用当前对话中已提供的信息，不重复问已回答或明确不提供的内容。
+    依据实际页面内容判断业务用途；用户补充只作为用户声明，不能声称网页已存在相应内容。
 """

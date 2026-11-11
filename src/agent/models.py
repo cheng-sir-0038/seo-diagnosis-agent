@@ -5,9 +5,9 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 
 class RunStatus(StrEnum):
@@ -18,6 +18,31 @@ class RunStatus(StrEnum):
     CANCELLED = "cancelled"
     RECOVERING = "recovering"
     RECOVERY_BLOCKED = "recovery_blocked"
+    WAITING_FOR_INPUT = "waiting_for_input"
+
+
+class HumanInputRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    questions: list[Annotated[str, Field(min_length=1, max_length=300)]] = Field(
+        min_length=1, max_length=3
+    )
+    allow_use_available: bool = False
+
+
+class HumanInputAnswer(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    request_id: str = Field(min_length=1, max_length=256)
+    answer: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2000)]
+    action: Literal["answer", "use_available"] = "answer"
+
+
+class HumanInputState(HumanInputRequest):
+    request_id: str
+    tool_name: str
+    tool_arguments: dict[str, Any]
+    tool_result: dict[str, Any]
+    answer: str | None = None
+    action: Literal["answer", "use_available"] = "answer"
 
 
 class AgentMessage(BaseModel):
@@ -62,6 +87,7 @@ class AgentRun:
     completion_mode: str | None = None
     partial: bool = False
     pause_requested: bool = False
+    human_input: HumanInputState | None = None
 
     @property
     def terminal(self) -> bool:

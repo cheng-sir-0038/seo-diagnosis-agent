@@ -1,5 +1,6 @@
 from src.agent.harness.store import AgentChatHarnessStore
 from src.agent.run_manager import run_manager
+from src.core.cache import cache_manager
 from src.core.config import settings
 from src.facade.data_facade import facade
 from src.observability.runtime import observability_client
@@ -23,7 +24,6 @@ from src.seo_agent.automation.schedules import (
     DigestScheduleCoordinator,
     ScheduleAutomationCoordinator,
 )
-from src.seo_agent.automation.structured import StructuredModelAutomation
 from src.seo_agent.chat.service import SeoChatRecoveryService
 from src.seo_agent.checkpoints import CheckpointManager
 from src.seo_agent.db.database import SeoAgentDatabase
@@ -42,6 +42,9 @@ from src.seo_agent.services.system import SeoAgentSystemService
 from src.seo_agent.tasks.service import TaskDeliveryService
 from src.seo_agent.tools.seo_data import SeoDataToolBridge
 from src.seo_agent.workbench.service import WorkbenchService
+from src.seo_agent.workflows.opportunity_discovery import OpportunityDiscoveryWorkflow
+from src.seo_agent.workflows.task_delivery import TaskDeliveryWorkflows
+from src.seo_agent.workflows.task_planning import TaskPlanningWorkflow
 
 seo_agent_database = SeoAgentDatabase(settings.seo_agent_sqlite_path)
 checkpoint_manager = CheckpointManager(settings.langgraph_checkpoint_sqlite_path)
@@ -128,11 +131,19 @@ def build_structured_model():
 
 
 seo_prompt_seeder = SeoPromptSeeder(prompt_registry)
-structured_model_automation = StructuredModelAutomation(
+structured_model_automation = TaskDeliveryWorkflows(
     seo_agent_database,
     task_delivery_service,
     model_factory=build_structured_model,
     prompt_registry=prompt_registry,
+    observability=observability_client,
+)
+opportunity_discovery_workflow = OpportunityDiscoveryWorkflow(
+    seo_agent_database, facade, opportunity_service, cache_manager,
+    structured_model_automation.model_runner, observability=observability_client,
+)
+task_planning_workflow = TaskPlanningWorkflow(
+    seo_agent_database, task_delivery_service, structured_model_automation,
     observability=observability_client,
 )
 notification_outbox_worker = NotificationOutboxWorker(
