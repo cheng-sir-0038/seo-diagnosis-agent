@@ -5,7 +5,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.core.exceptions import ErrorCode, InternalProviderResponseError
+from src.core.exceptions import (
+    ErrorCode,
+    InternalDataNotAvailableError,
+    InternalProviderResponseError,
+)
 from src.providers.dataforseo.client import DataForSEOClient
 from src.providers.dataforseo.provider import DataForSEOProvider
 
@@ -66,3 +70,44 @@ async def test_legitimate_empty_rankings_remain_empty(status: int):
         }
     )
     assert await provider.get_organic_keywords("example.com") == []
+
+
+def empty_items_response(items=None) -> dict:
+    return {
+        "status_code": 20000,
+        "tasks": [{
+            "status_code": 20000,
+            "result": [{"target": "example.com", "items_count": 0, "items": items}],
+        }],
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("items", [None, []])
+@pytest.mark.parametrize("method,args", [
+    ("get_organic_keywords", ["example.com"]),
+    ("get_keyword_overview", [["unknown topic"]]),
+    ("get_organic_competitors", ["example.com"]),
+    ("get_backlinks", ["example.com"]),
+])
+async def test_successful_nested_empty_items_are_not_upstream_errors(items, method, args):
+    provider = provider_for(empty_items_response(items))
+    assert await getattr(provider, method)(*args) == []
+    assert provider.client._session.post.call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("items", [None, []])
+async def test_empty_domain_overview_has_no_metrics_instead_of_zero_or_upstream_error(items):
+    provider = provider_for(empty_items_response(items))
+    with pytest.raises(InternalDataNotAvailableError) as exc:
+        await provider.get_search_metrics("example.com")
+    assert exc.value.error_code == ErrorCode.DATA_NOT_AVAILABLE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("items", [{"keyword": "unexpected object"}, "unexpected string"])
+async def test_malformed_nested_items_are_still_response_errors(items):
+    provider = provider_for(empty_items_response(items))
+    with pytest.raises(InternalProviderResponseError):
+        await provider.get_organic_keywords("example.com")

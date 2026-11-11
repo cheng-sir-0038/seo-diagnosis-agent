@@ -369,7 +369,7 @@ export function isTableResultData(data: unknown): data is TableResultData {
 
 export function isCardResultData(data: unknown): data is CardResultData {
   if (!isRecord(data) || data.view_type !== 'cards' || !Array.isArray(data.items)) return false
-  return data.items.length > 0 && data.items.every((item) => (
+  return data.items.every((item) => (
     isRecord(item)
     && typeof item.key === 'string'
     && typeof item.title === 'string'

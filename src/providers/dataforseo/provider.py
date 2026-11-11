@@ -30,7 +30,7 @@ from typing import Any
 from loguru import logger
 
 from src.core.config import settings
-from src.core.exceptions import InternalProviderResponseError
+from src.core.exceptions import InternalDataNotAvailableError, InternalProviderResponseError
 from src.models.backlink import Backlink, BrokenBacklink, RefDomain
 from src.models.common import (
     Capability,
@@ -187,17 +187,20 @@ class DataForSEOProvider(BaseProvider):
         task = tasks[0]
 
         result = task.get("result")
-        if result and isinstance(result, list) and len(result) > 0:
+        if isinstance(result, list) and result:
             # 检查是否嵌套了 items
             if isinstance(result[0], dict) and "items" in result[0]:
-                return result[0]["items"]
-            return result
-
-        data = task.get("data")
-        if data and isinstance(data, dict):
-            return data.get("items", [])
-
-        return []
+                result = result[0]["items"]
+        else:
+            data = task.get("data")
+            result = data.get("items") if isinstance(data, dict) else None
+        if result is None:
+            return []
+        if not isinstance(result, list):
+            raise InternalProviderResponseError(
+                "DataForSEO items 必须是数组或 null", provider="dataforseo"
+            )
+        return result
 
     # ============================================================
     # 搜索表现 — SEARCH_METRICS / ORGANIC_KEYWORDS
@@ -230,7 +233,7 @@ class DataForSEOProvider(BaseProvider):
                 str(group.get("target") or ""), site_id
             ):
                 continue
-            own = next((item for item in group.get("items", []) if isinstance(item, dict)), None)
+            own = next((item for item in group.get("items") or [] if isinstance(item, dict)), None)
             if own is not None:
                 break
         # 兼容已有离线样本，仍必须准确匹配域名。
@@ -243,6 +246,10 @@ class DataForSEOProvider(BaseProvider):
                 and _is_same_domain(row["domain"], site_id)
             ), None)
         if own is None:
+            if not results:
+                raise InternalDataNotAvailableError(
+                    "DataForSEO 未返回当前域名在所选市场的自然搜索指标", provider="dataforseo"
+                )
             raise InternalProviderResponseError(
                 "站点总览响应缺少当前域名的指标，不能使用竞品数据代替",
                 provider="dataforseo",

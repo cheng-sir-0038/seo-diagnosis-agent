@@ -1,3 +1,5 @@
+import { Empty } from 'antd'
+
 import type { CardResultData } from './contracts'
 
 interface CardResultProps {
@@ -21,6 +23,9 @@ export function CardResult({ data }: CardResultProps) {
     : value
   return (
     <section className={`tool-card-result${data.variant ? ` ${data.variant}` : ''}`} data-testid="card-result">
+      {data.items.length === 0 ? (
+        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="本次查询未返回可展示条目，不代表指标为零。" />
+      ) : null}
       {data.items.map((item) => (
         <article className={`tool-card-item${item.image_url ? '' : ' no-image'}`} key={item.key}>
           {item.image_url ? (

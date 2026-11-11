@@ -1,5 +1,5 @@
-import { render, screen } from '@testing-library/react'
-import { describe, expect, it } from 'vitest'
+import { cleanup, render, screen } from '@testing-library/react'
+import { afterEach, describe, expect, it } from 'vitest'
 
 import { ToolResultView } from '../components/ToolResultView'
 
@@ -12,6 +12,21 @@ const data = {
 }
 
 describe('CardResult', () => {
+  afterEach(cleanup)
+
+  it('shows an empty query as no returned items instead of a rendering failure', () => {
+    render(<ToolResultView hint="cards" data={{ ...data, items: [] }} mode="chat" />)
+    expect(screen.getByText('本次查询未返回可展示条目，不代表指标为零。')).toBeInTheDocument()
+    expect(screen.queryByTestId('raw-tool-result')).not.toBeInTheDocument()
+  })
+
+  it('keeps rejecting malformed items rather than treating them as empty', () => {
+    render(<ToolResultView hint="cards" data={{ ...data, items: [{ key: 'invalid' }] }} mode="chat" />)
+    expect(screen.queryByTestId('card-result')).not.toBeInTheDocument()
+    expect(screen.queryByText('本次查询未返回可展示条目，不代表指标为零。')).not.toBeInTheDocument()
+    expect(screen.getByText(/该结果暂时无法以图表展示/)).toBeInTheDocument()
+  })
+
   it('renders reusable card contracts instead of raw JSON', () => {
     render(<ToolResultView hint="cards" data={data} mode="chat" />)
     expect(screen.getByTestId('card-result')).toBeInTheDocument()
