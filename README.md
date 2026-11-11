@@ -2,6 +2,14 @@
 
 一个网站 SEO 诊断 Agent MVP。用户用自然语言提问，DeepSeek 根据问题和已有证据选择工具、决定是否继续查询，最后整理结论。代码负责限制执行次数、处理超时并保存运行过程。项目使用 Python、FastAPI、React 和 SQLite。
 
+## 对话效果
+
+![自然语言对话入口](docs/screenshots/01-chat-overview.png)
+
+[查看完整对话截图](docs/screenshots/README.md)：包含 7 个只读工作流、人工补充后继续执行、工具与事件详情、竞品和外链查询、新闻／图片／视频搜索，以及手机端效果。
+
+截图来自测试域名的真实只读运行及界面回放。数据来源、查询市场和未返回数据的范围见截图目录；页面建议仍需人工确认。
+
 ## Agent 如何运行
 
 [SEO Chat 入口](src/api/routes/seo_agent_chat.py)读取站点信息，构建[系统提示词](src/seo_agent/chat/runtime.py)和可用工具，再交给[工具循环](src/agent/loop.py)执行。模型负责选择查询和解读结果；页面体检、关键词研究和综合报告等步骤由工作流代码组织。
