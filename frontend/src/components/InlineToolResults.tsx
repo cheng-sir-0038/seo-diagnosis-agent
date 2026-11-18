@@ -1,8 +1,8 @@
 import { CodeOutlined, SearchOutlined } from '@ant-design/icons'
+import { lazy, Suspense } from 'react'
 
 import type { ToolRun } from '../types/agent'
 import { ResultTag } from './ResultTag'
-import { ToolResultView } from './ToolResultView'
 import {
   isPageMetadataData,
   isPresentationBase,
@@ -10,6 +10,11 @@ import {
   resolveLocalizedText,
   unwrapToolResult,
 } from './renderers/contracts'
+
+const ToolResultView = lazy(async () => {
+  const module = await import('./ToolResultView')
+  return { default: module.ToolResultView }
+})
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -89,7 +94,9 @@ export function InlineToolResults({ tools }: { tools?: ToolRun[] }) {
                 ) : null}
               </header>
             ) : null}
-            <ToolResultView hint={tool.render_hint} data={tool.result} mode="chat" />
+            <Suspense fallback={<div className="tool-result-loading" role="status">正在加载结果…</div>}>
+              <ToolResultView hint={tool.render_hint} data={tool.result} mode="chat" />
+            </Suspense>
           </article>
         )
       })}

@@ -1,5 +1,5 @@
 import { cleanup, render, screen } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 
 import { InlineToolResults } from '../components/InlineToolResults'
 import type { ToolRun } from '../types/agent'
@@ -61,6 +61,10 @@ const searchOverview = {
 describe('InlineToolResults', () => {
   const OriginalResizeObserver = globalThis.ResizeObserver
 
+  beforeAll(async () => {
+    await import('../components/ToolResultView')
+  })
+
   beforeEach(() => {
     class TestResizeObserver implements ResizeObserver {
       constructor(private readonly callback: ResizeObserverCallback) {}
@@ -84,7 +88,7 @@ describe('InlineToolResults', () => {
     Object.defineProperty(globalThis, 'ResizeObserver', { configurable: true, value: OriginalResizeObserver })
   })
 
-  it('shows identical business evidence once even when tool ids and fetched times differ', () => {
+  it('shows identical business evidence once even when tool ids and fetched times differ', async () => {
     const rows = [{ domain: 'competitor.example', common_keywords: 126 }]
     const tools: ToolRun[] = [
       {
@@ -107,12 +111,12 @@ describe('InlineToolResults', () => {
 
     render(<InlineToolResults tools={tools} />)
 
-    expect(screen.getAllByRole('table')).toHaveLength(1)
+    expect(await screen.findAllByRole('table')).toHaveLength(1)
     expect(screen.getAllByText('自然搜索竞争对手')).toHaveLength(1)
     expect(screen.getAllByText('competitor.example')).toHaveLength(1)
   })
 
-  it('keeps separate results when the business rows are different', () => {
+  it('keeps separate results when the business rows are different', async () => {
     const tools: ToolRun[] = [
       {
         id: 'call-1',
@@ -132,9 +136,9 @@ describe('InlineToolResults', () => {
 
     render(<InlineToolResults tools={tools} />)
 
+    expect(await screen.findByText('first.example')).toBeInTheDocument()
+    expect(await screen.findByText('second.example')).toBeInTheDocument()
     expect(screen.getAllByRole('table')).toHaveLength(2)
-    expect(screen.getByText('first.example')).toBeInTheDocument()
-    expect(screen.getByText('second.example')).toBeInTheDocument()
   })
 
   it('does not repeat the title of a self-contained search overview', async () => {

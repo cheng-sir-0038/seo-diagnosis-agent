@@ -235,7 +235,7 @@ describe('ChatPage SEO Agent integration', () => {
     const reply = answer.closest('article')!
     const evidence = within(reply).getByRole('region', { name: '本次结果' })
     expect(evidence).toBeInTheDocument()
-    expect(within(evidence).getByRole('table')).toBeInTheDocument()
+    expect(await within(evidence).findByRole('table')).toBeInTheDocument()
     expect(screen.getByText('关键词明细')).toBeInTheDocument()
     expect(within(evidence).getByText('seo agent')).toBeInTheDocument()
     const stored = JSON.parse(window.localStorage.getItem('agent-workspace-conversations-v1') ?? '[]')

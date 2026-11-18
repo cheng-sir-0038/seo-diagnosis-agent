@@ -1,15 +1,21 @@
 import { ConfigProvider, Result, Spin } from 'antd'
 import zhCN from 'antd/locale/zh_CN'
+import { lazy, Suspense } from 'react'
 
 import { ProductShell } from './components/ProductShell'
 import { ProductProvider, useProduct } from './context/ProductContext'
-import { SetupPage } from './pages/SetupPage'
 import './styles.css'
+
+const SetupPage = lazy(async () => {
+  const module = await import('./pages/SetupPage')
+  return { default: module.SetupPage }
+})
 
 function ProductRoot() {
   const { config, site, loading, error, reset } = useProduct()
-  if (loading) return <div className="app-loading"><Spin size="large" /><p>正在连接 SEO 优化专员...</p></div>
-  if (!config) return <SetupPage />
+  const loadingView = <div className="app-loading"><Spin size="large" /><p>正在连接 SEO 优化专员...</p></div>
+  if (loading) return loadingView
+  if (!config) return <Suspense fallback={loadingView}><SetupPage /></Suspense>
   if (!site) return <Result status="error" title="无法加载站点" subTitle={error ?? '站点配置不可用'} extra={<button className="plain-action" onClick={reset}>重新初始化</button>} />
   return <ProductShell />
 }

@@ -9,11 +9,10 @@ import {
   StopOutlined,
 } from '@ant-design/icons'
 import { Alert, Button, Input, Tag, Tooltip } from 'antd'
-import { useEffect, useMemo, useReducer, useRef, useState } from 'react'
+import { lazy, Suspense, useEffect, useMemo, useReducer, useRef, useState } from 'react'
 
 import { ChatRunDetails } from '../components/ChatRunDetails'
 import { InlineToolResults } from '../components/InlineToolResults'
-import { MarkdownMessage } from '../components/MarkdownMessage'
 import {
   cancelAgentRun,
   createAgentRun,
@@ -33,6 +32,11 @@ import type {
 } from '../types/agent'
 
 const { TextArea } = Input
+const MarkdownMessage = lazy(async () => {
+  const module = await import('../components/MarkdownMessage')
+  return { default: module.MarkdownMessage }
+})
+const replyLoading = <div className="agent-activity" role="status">正在加载回复…</div>
 
 const starters = [
   {
@@ -489,10 +493,12 @@ export function ChatPage() {
                   <>
                     <div className="assistant-name">SEO 优化专员</div>
                     <ChatRunDetails tools={item.id === currentReplyId ? run.tools : item.toolResults} />
-                    <MarkdownMessage
-                      content={item.content}
-                      results={<InlineToolResults tools={item.toolResults} />}
-                    />
+                    <Suspense fallback={replyLoading}>
+                      <MarkdownMessage
+                        content={item.content}
+                        results={<InlineToolResults tools={item.toolResults} />}
+                      />
+                    </Suspense>
                   </>
                 ) : item.content}
               </div>
@@ -515,10 +521,12 @@ export function ChatPage() {
                 ) : null}
                 <ChatRunDetails tools={run.tools} />
                 {run.assistantText ? (
-                  <MarkdownMessage
-                    content={run.assistantText}
-                    results={<InlineToolResults tools={run.tools} />}
-                  />
+                  <Suspense fallback={replyLoading}>
+                    <MarkdownMessage
+                      content={run.assistantText}
+                      results={<InlineToolResults tools={run.tools} />}
+                    />
+                  </Suspense>
                 ) : <InlineToolResults tools={run.tools} />}
                 {run.assistantText ? <span className="cursor" /> : null}
               </div>

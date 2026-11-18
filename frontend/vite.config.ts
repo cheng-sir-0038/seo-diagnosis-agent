@@ -7,6 +7,15 @@ export default defineConfig({
   resolve: {
     dedupe: ['react', 'react-dom'],
   },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (/\/node_modules\/(?:react|react-dom|scheduler)\//.test(id)) return 'react-runtime'
+        },
+      },
+    },
+  },
   server: {
     port: 5173,
     proxy: {
