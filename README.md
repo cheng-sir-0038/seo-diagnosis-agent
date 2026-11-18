@@ -1,25 +1,30 @@
 # SEO Diagnosis Agent
 
-一个网站 SEO 诊断 Agent MVP。用户用自然语言提问，DeepSeek 根据问题和已有证据选择工具、决定是否继续查询，最后整理结论。代码负责限制执行次数、处理超时并保存运行过程。项目使用 Python、FastAPI、React 和 SQLite。
+选一个网站，直接说你想查什么。DeepSeek 根据问题和取回的证据选择下一步工具，帮你查页面问题、研究关键词和排名页，也能生成 SEO 建议和分享图方案。
 
-## 对话效果
+## 一次真实对话
 
-![自然语言对话入口](docs/screenshots/01-chat-overview.png)
+用户请 Agent 根据页面拟定标题和结构化数据。DeepSeek 选了页面建议工作流。读完源 HTML 后，流程发现页面主体和分享图需要确认，保存证据并暂停。用户选择「先用现有信息生成」，同一次运行从检查点继续，复用已读页面，校验草稿的 JSON Schema 和引用。
 
-[查看完整对话截图](docs/screenshots/README.md)：包含 7 个只读工作流、人工补充后继续执行、工具与事件详情、竞品和外链查询、新闻／图片／视频搜索，以及手机端效果。
+```text
+tool.completed (seo_page_suggestions) → run.waiting_for_input → input.submitted
+→ run.resumed → tool.completed (seo_page_suggestions) → run.completed
+```
 
-搜索案例使用 Python 官网的美国市场样本。自然搜索现状展示关键词、位次和对应页面，排名页优化进一步核对页面和代表词搜索结果。[搜索现状截图](docs/screenshots/03-search-diagnosis.png) · [排名页优化截图](docs/screenshots/05-ranking-pages.png)
+[人工补充与执行记录](docs/screenshots/README.md#对话与人工补充) · [完整对话截图](docs/screenshots/README.md) · [本地启动](#本地启动)
 
 ## Agent 如何运行
 
-[SEO Chat 入口](src/api/routes/seo_agent_chat.py)读取站点信息，构建[系统提示词](src/seo_agent/chat/runtime.py)和可用工具，再交给[工具循环](src/agent/loop.py)执行。模型负责选择查询和解读结果；页面体检、关键词研究和综合报告等步骤由工作流代码组织。
+- DeepSeek 根据问题和已有证据选择工具。代码限制模型轮次、工具调用总数和超时，复用本次运行中重复的成功查询。[对话入口](src/api/routes/seo_agent_chat.py) · [工具循环](src/agent/loop.py)
+- 工作流安排取证步骤、校验实际来源和结构化产物。需要人工补充时，运行检查点保存已查到的证据。[工作流代码](src/seo_agent/workflows/) · [检查点与恢复](src/agent/harness/)
+- 模型、工具及其子步骤保留输入、输出、状态和耗时，可按配置在 Langfuse 中查看一次运行的调用树。[观测代码](src/observability/)
 
 ```mermaid
 flowchart TB
     UI["React 工作台"] --> API["FastAPI"]
     API --> CHAT["SEO Chat：站点上下文、提示词、可用工具"]
     CHAT --> LOOP["DeepSeek + 工具循环"]
-    LOOP --> WF["诊断工作流：页面 / 搜索 / 关键词 / 综合报告"]
+    LOOP --> WF["业务工作流：页面 / 搜索 / 关键词 / 草稿"]
     LOOP --> TOOL["只读 SEO 工具"]
     WF --> TOOL
     TOOL --> DATA["Data Facade + Provider Router"]
@@ -43,8 +48,9 @@ flowchart TB
 | --- | --- | --- |
 | 页面体检：“检查首页 SEO，也看看性能。” | `seo_site_audit` → `seo_page_metadata`，按需调用 `seo_page_performance` | 页面元信息和可选性能证据；已封装为单页工作流 |
 | 页面信息建议：“根据这一页的内容，帮我拟定标题、描述、分享信息和结构化数据。” | `seo_page_suggestions` → 页面事实、模型草稿、引用校验、缺失信息追问 | 给出 TDK、OG、JSON-LD 建议；用户补充后沿用对话继续生成，不修改网站 |
+| 页面分享图：“根据这页内容拟一份分享图方案。” | `seo_share_image` → 读取页面文案、提取画面主体、校验原文依据 | 在对话中给出页面文案和可复制的绘图提示词 |
 | 搜索现状：“看看本站目前有哪些关键词和排名。” | `seo_search_diagnosis` → `seo_search_metrics` + `seo_organic_keywords` | 站点指标、有限排名样本和对应页面；已封装为工作流，不提供历史下降归因 |
-| 关键词机会：“围绕企业名录，有哪些关键词值得研究？” | `seo_keyword_opportunity` → 联想词、批量关键词指标、输入主题的 SERP | 去重后的候选词和可用指标；已封装为工作流，缺失指标保持未知 |
+| 关键词机会：“围绕手冲咖啡，有哪些关键词值得研究？” | `seo_keyword_opportunity` → 联想词、批量关键词指标、输入主题的 SERP | 去重后的候选词和可用指标；已封装为工作流，缺失指标保持未知 |
 | 机会生成与入池：显式提交一次机会发现请求 | `OpportunityDiscoveryWorkflow` → 关键词研究、冻结快照、模型候选、证据校验、既有入池服务 | 生成至多 3 个机会并沿用原有评分和审批策略；独立业务接口触发，不是只读 Chat 工具 |
 | 已有排名页优化：“哪些已有排名的页面值得进一步检查？” | `seo_ranking_page_optimization` → 排名样本、少量站内 HTML、每页一个代表词 SERP | 默认调查第 4–20 名样本中的 2 个站内页面，输出实际标签、搜索证据和待核实项；不修改页面 |
 | 页面变更复检：“按之前的快照，检查 Title、H1 和 Canonical 是否符合目标。” | `seo_page_change_review` → 本站基线、重新读取页面、冻结新快照、逐项比较 | 输出变更明细和验收结论；先显式建立基线，缺少目标值或完整证据时不判定通过 |
@@ -57,7 +63,7 @@ flowchart TB
 
 ## 工具与业务工作流
 
-[`src/seo_agent/chat/tools.py`](src/seo_agent/chat/tools.py) 定义了 16 个基础数据工具，并按依赖注册最多 7 个只读组合工作流。正式对话只使用 `live_capabilities` 支持的工具；实际可用数量取决于配置和数据源状态。
+[`src/seo_agent/chat/tools.py`](src/seo_agent/chat/tools.py) 定义了 16 个基础数据工具，并按依赖注册最多 8 个对话工作流。实际可用工具取决于当前数据源和配置。
 
 | 分组 | 工具 | 数据来源 |
 | --- | --- | --- |
@@ -74,6 +80,7 @@ flowchart TB
 | --- | --- | --- |
 | [`site_audit.py`](src/seo_agent/workflows/site_audit.py) | `seo_site_audit` | 保留现有入口，读取单页元信息和可选 PageSpeed 数据 |
 | [`page_suggestions.py`](src/seo_agent/workflows/page_suggestions.py) | `seo_page_suggestions` | 依据页面和用户补充拟定 SEO 信息，校验引用，追问必要缺项并继续生成建议 |
+| [`share_image.py`](src/seo_agent/workflows/share_image.py) | `seo_share_image` | 根据当前页面生成分享图文案和绘图提示词，缺标题时等待补充 |
 | [`search_diagnosis.py`](src/seo_agent/workflows/search_diagnosis.py) | `seo_search_diagnosis` | 汇总站点指标与排名关键词，保留当前快照和来源 |
 | [`keyword_opportunity.py`](src/seo_agent/workflows/keyword_opportunity.py) | `seo_keyword_opportunity` | 围绕用户主题，组合联想词、候选词指标与主题 SERP |
 | [`ranking_page_optimization.py`](src/seo_agent/workflows/ranking_page_optimization.py) | `seo_ranking_page_optimization` | 从排名样本选少量站内页面，核对 HTML、代表词 SERP 和可选性能证据 |
@@ -128,9 +135,15 @@ seo_site_diagnosis
 
 结果始终是待人工确认的建议，不修改外部网站、Canonical、审批或发布记录。已有 JSON-LD 需人工确认合并，不能直接覆盖。运行时只做 JSON 结构与来源校验，落地前需使用 [Schema.org 验证器](https://validator.schema.org/)和适用的 [Google 富结果测试](https://search.google.com/test/rich-results)另行验证；语法通过不保证符合 Google 展示规则。站点名称不适用富结果测试，需按 [Google 站点名称规则](https://developers.google.com/search/docs/appearance/site-names)核对。[Google 不使用 Meta Keywords 参与收录和排名](https://developers.google.com/search/docs/crawling-indexing/special-tags#unsupported)，关键词仅作为主题文案建议。
 
+### 页面分享图方案
+
+在对话中说「给这页拟一份分享图方案」即可，省略地址时取当前站点首页。工作流从页面的 `og:title`、Title、H1 中依次选取标题，描述取 `og:description` 或 Meta Description。标题都缺失时，同一次运行等待用户输入，恢复后复用页面证据。
+
+DeepSeek 根据页面内容和当前用户要求描述主体、场景、光线与构图。代码校验 JSON Schema 和引用原文，缺少主体依据时请用户补充。对话回复提供可复制的绘图提示词，供图片生成工具使用。[真实对话](docs/screenshots/18-share-image-brief.png) · [工作流](src/seo_agent/workflows/share_image.py) · [画面格式](src/models/share_image.py) · [不同主题和缺失证据测试](tests/seo_agent/test_share_image.py)
+
 ### 机会生成与入池
 
-先为本站 `OPPORTUNITY_SCAN` 计划创建状态为 `RUNNING` 的扫描记录，再通过业务接口显式执行：
+以咖啡教程站为例，想找下一篇值得写的手冲咖啡教程。先为本站的 `OPPORTUNITY_SCAN` 计划创建一条 `RUNNING` 状态的扫描记录，再调用下面的接口研究这个主题，将通过校验的候选加入机会池。
 
 ```text
 POST /api/v1/seo-agent/scan-runs/{run_id}/discover-opportunities
@@ -138,7 +151,7 @@ POST /api/v1/seo-agent/scan-runs/{run_id}/discover-opportunities
 
 ```json
 {
-  "query": "企业名录",
+  "query": "pour over coffee",
   "changed_by_actor_id": "有效操作人 ID",
   "default_approver_actor_id": "可选的有效审批人 ID",
   "idempotency_key": "本次请求的唯一键",
