@@ -1,17 +1,17 @@
 # 对话截图
 
-本组截图于 2026-11-11 使用用户提供的测试域名 `test0922.guxiguxi.com` 拍摄，来自真实只读运行及其界面回放。用户用自然语言提出业务问题，不需要输入工具名或 JSON 参数。
+这些截图来自真实只读运行及界面回放。2026-11-18 更新的搜索现状和排名页优化使用公开站点 `python.org`，其他案例使用测试域名 `test0922.guxiguxi.com`。
 
-页面内容来自测试页；页面中提及的机构身份尚未确认。搜索查询采用站点配置的美国市场，不代表中国市场的排名。DataForSEO 对该子域名及部分主题词未返回数据，截图保留空结果和未知指标，不将其解释为零流量或全网没有排名。页面建议均未发布，内部运行标识已遮挡。
+搜索查询采用美国市场，指标和排名样本来自第三方数据源。测试站点及部分主题词缺少的数据保留为未知。页面建议待人工确认，截图已遮住内部运行标识。
 
 ## 7 个只读工作流
 
 | 对话场景 | 截图 | 工作流代码 |
 | --- | --- | --- |
 | 首页体检 | [页面证据与检查范围](02-page-audit.png) | [site_audit.py](../../src/seo_agent/workflows/site_audit.py) |
-| 搜索现状 | [区分无数据与零流量](03-search-diagnosis.png) | [search_diagnosis.py](../../src/seo_agent/workflows/search_diagnosis.py) |
+| 搜索现状 | [排名关键词与对应页面](03-search-diagnosis.png) | [search_diagnosis.py](../../src/seo_agent/workflows/search_diagnosis.py) |
 | 关键词机会 | [候选词与未知指标](04-keyword-opportunities.png) | [keyword_opportunity.py](../../src/seo_agent/workflows/keyword_opportunity.py) |
-| 已有排名页优化 | [样本中没有匹配页](05-ranking-pages.png) | [ranking_page_optimization.py](../../src/seo_agent/workflows/ranking_page_optimization.py) |
+| 已有排名页优化 | [排名样本与页面核验](05-ranking-pages.png) | [ranking_page_optimization.py](../../src/seo_agent/workflows/ranking_page_optimization.py) |
 | 综合诊断 | [汇总证据与覆盖范围](06-site-diagnosis.png) | [site_diagnosis.py](../../src/seo_agent/workflows/site_diagnosis.py) |
 | 页面信息建议 | [TDK 与 OG](07-page-suggestions.png)、[JSON-LD 与待确认项](15-structured-data.png) | [page_suggestions.py](../../src/seo_agent/workflows/page_suggestions.py) |
 | 页面变更复检 | [保存基线](09-page-review-baseline.png)、[按目标复检](10-page-change-review.png) | [page_change_review.py](../../src/seo_agent/workflows/page_change_review.py) |
@@ -26,11 +26,11 @@
 </details>
 
 <details>
-<summary>搜索现状：没有返回指标时，明确说明未知</summary>
+<summary>搜索现状：查看关键词、位次和对应页面</summary>
 
-本次美国市场查询未返回该子域名的排名条目或站点指标。模型收到明确的数据不可用错误码，说明本次没有数据，不再将空结果解释为需要授权或绑定站点，也不生成排名清单或零流量结论。
+本次查询返回 Python 官网的站点指标和 5 条美国市场排名样本。图中展示关键词、位次和对应页面，流量指标为 DataForSEO 的估算值。
 
-![自然搜索现状与数据限制](03-search-diagnosis.png)
+![自然搜索现状、关键词和对应页面](03-search-diagnosis.png)
 
 </details>
 
@@ -44,11 +44,11 @@
 </details>
 
 <details>
-<summary>已有排名页优化：没有匹配样本时，不编造待优化页</summary>
+<summary>已有排名页优化：从排名样本选页核对</summary>
 
-请求调查美国市场第 4–20 名、最多两个页面。本次没有返回匹配排名页，因此没有生成已核实的页面优化问题。
+从美国市场第 1–20 名范围的 5 条样本中选 1 个版本发布页，核对源码中的标题、描述和代表词搜索结果。对话保留了第三方排名快照与本次 SERP 的差异，建议限定在受检页面。
 
-![已有排名页优化的空样本结果](05-ranking-pages.png)
+![已有排名页的页面证据和搜索结果](05-ranking-pages.png)
 
 </details>
 
