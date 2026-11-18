@@ -16,6 +16,7 @@ from src.seo_agent.workflows.page_change_review import PageChangeReviewWorkflow
 from src.seo_agent.workflows.page_suggestions import PageSuggestionsWorkflow
 from src.seo_agent.workflows.ranking_page_optimization import RankingPageOptimizationWorkflow
 from src.seo_agent.workflows.search_diagnosis import SearchDiagnosisWorkflow
+from src.seo_agent.workflows.share_image import ShareImageWorkflow
 from src.seo_agent.workflows.site_audit import SiteAuditWorkflow
 from src.seo_agent.workflows.site_diagnosis import SiteDiagnosisWorkflow
 from src.seo_agent.workflows.structured_model import StructuredModelRunner
@@ -494,22 +495,26 @@ def build_seo_agent_registry(
         ]
     )
     if Capability.PAGE_METADATA in live_capabilities:
+        page = registry.get("seo_page_metadata")
         performance = (
             registry.get("seo_page_performance")
             if Capability.PAGE_PERFORMANCE in live_capabilities else None
         )
         registry.register(SiteAuditWorkflow(
-            registry.get("seo_page_metadata"), performance, settings.agent_tool_timeout,
-            observability=observability,
+            page, performance, settings.agent_tool_timeout, observability=observability,
+        ))
+        registry.register(ShareImageWorkflow(
+            page, settings.agent_tool_timeout, observability=observability,
+            model_runner=model_runner, user_messages=user_messages,
         ))
         if snapshots is not None:
             registry.register(PageChangeReviewWorkflow(
-                registry.get("seo_page_metadata"), site, snapshots, settings.agent_tool_timeout,
+                page, site, snapshots, settings.agent_tool_timeout,
                 observability=observability,
             ))
         if model_runner is not None:
             registry.register(PageSuggestionsWorkflow(
-                registry.get("seo_page_metadata"), model_runner, settings.agent_tool_timeout,
+                page, model_runner, settings.agent_tool_timeout,
                 observability=observability, user_messages=user_messages,
             ))
     tools = {tool.name: tool for tool in registry.values()}
