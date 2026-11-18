@@ -1954,6 +1954,12 @@ a:focus-visible,
   background: transparent;
 }
 
+.markdown-body pre code.language-text {
+  font-size: 13px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .markdown-body table {
   width: 100%;
   display: block;
