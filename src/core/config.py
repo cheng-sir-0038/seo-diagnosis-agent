@@ -9,7 +9,7 @@
     from src.core.config import settings
     print(settings.ahrefs_api_base_url)
 
-环境变量优先级: .env.local > .env > 系统环境变量 > 默认值
+配置优先级: 系统环境变量 > 项目根目录 .env.local > .env > 默认值
 """
 
 from __future__ import annotations
@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 class Settings(BaseSettings):
@@ -49,7 +51,7 @@ class Settings(BaseSettings):
     """
 
     model_config = SettingsConfigDict(
-        env_file=(".env", ".env.local"),
+        env_file=(PROJECT_ROOT / ".env", PROJECT_ROOT / ".env.local"),
         env_file_encoding="utf-8",
         extra="ignore",
     )

@@ -17,9 +17,9 @@
 | 页面变更复检 | [保存基线](09-page-review-baseline.png)、[按目标复检](10-page-change-review.png) | [page_change_review.py](../../src/seo_agent/workflows/page_change_review.py) |
 
 <details>
-<summary>首页体检：先看页面事实，性能未配置时保留缺项</summary>
+<summary>首页体检：组合 HTML 核验与移动端性能证据</summary>
 
-读取标题、描述、H1、Canonical 等源 HTML 信息。此次没有配置 PageSpeed，性能不被判为通过；单页结果不代表整站审计或 Google 收录检查。
+本次已启用 HTML 基础扫描和 PageSpeed，工作流汇总标题、描述、H1、Canonical 及移动端 Lighthouse 结果：性能 95、无障碍 96、最佳实践 100、SEO 100。证据保留缓存状态；单页实验室结果不代表整站审计、Google 收录状态或真实用户体验。
 
 ![首页 SEO 体检](02-page-audit.png)
 

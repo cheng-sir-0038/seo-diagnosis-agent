@@ -26,6 +26,7 @@ data/
 
 # 虚拟环境
 .venv/
+.venv-pyseoanalyzer/
 venv/
 /uv.lock
 

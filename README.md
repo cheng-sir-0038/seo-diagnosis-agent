@@ -220,7 +220,7 @@ SEO Chat 可调用 `seo_page_change_review`；需要 live 页面 HTML 能力和�
 
 ## 配置与外部服务
 
-按需将配置写入本地 `.env.local`，修改后重启后端。变量定义见 [`.env.example`](.env.example) 和 [`Settings`](src/core/config.py)；不要提交真实凭据。
+按需将配置写入项目根目录的 `.env.local`，修改后重启后端。配置文件位置不随启动目录变化，系统环境变量优先。变量定义见 [`.env.example`](.env.example) 和 [`Settings`](src/core/config.py)；不要提交真实凭据。
 
 | 服务 | 用途 | 配置变量 | 使用前提 |
 | --- | --- | --- | --- |
@@ -248,6 +248,8 @@ DataForSEO Labs 不覆盖所有国家和语言，使用前需核对 `dataforseo_
 
 只读工具将错误码同时交给模型和运行记录，区分数据不可用、认证失败、超时和内部异常。空结果或未知异常不代表用户缺少站点授权；DataForSEO 的第三方排名查询不以连接 GSC/GA4 或绑定站点项目为前提。
 
+PageSpeed 检测可能耗时较长，启用时可将 `AGENT_TOOL_TIMEOUT` 设为 `150` 秒，让页面体检有足够时间保留检测结果；模型轮次与工具调用次数预算不随之增加。
+
 ## 本地启动
 
 需要 Python 3.11+、Node.js 20.19+ 或 22.12+，以及 npm。自然语言诊断至少需要上表中的 DeepSeek 配置，其他数据源按需启用。
@@ -261,6 +263,17 @@ sh start.sh
 访问 `http://localhost:5173`，API 文档位于 `http://localhost:8000/docs`。脚本会复用已有虚拟环境和前端依赖；前端依赖变化时，可运行 `npm ci --prefix frontend`。
 
 API 没有登录或鉴权，默认仅供本机使用，不要直接暴露到局域网或公网。
+
+### 可选：启用 HTML 基础扫描
+
+`python-seo-analyzer` 使用独立 Python 环境，避免与主项目的 LangChain 版本冲突。已有隔离环境时直接复用；首次安装：
+
+```bash
+.venv/bin/python -m venv .venv-pyseoanalyzer
+.venv-pyseoanalyzer/bin/python -m pip install -r requirements-pyseoanalyzer.txt
+```
+
+在 `.env.local` 设置 `PYTHON_SEO_ANALYZER_ENABLED=true`，将 `PYTHON_SEO_ANALYZER_PYTHON` 填为该环境 Python 的绝对路径，再重启后端。扫描器分析已经获取的 HTML，补充词数、标题层级、内链和图片等检查；不启用其中的 LLM 分析。未启用时，这些结果保持未知。
 
 ### Docker 启动后端
 
