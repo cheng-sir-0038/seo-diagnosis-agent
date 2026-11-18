@@ -5,6 +5,11 @@ from pydantic import BaseModel, Field
 from src.agent.models import AgentRun
 
 
+class AnswerFact(BaseModel):
+    tool: str
+    path: list[str | int]
+
+
 class TrajectoryCase(BaseModel):
     case_id: str
     user_input: str
@@ -13,6 +18,7 @@ class TrajectoryCase(BaseModel):
     forbidden_available_tools: list[str] = Field(default_factory=list)
     ordered_tools: list[str] = Field(default_factory=list)
     terminal_status: str = "completed"
+    answer_facts: list[AnswerFact] = Field(default_factory=list)
 
 
 class TrajectoryEvaluation(BaseModel):

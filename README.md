@@ -379,4 +379,12 @@ npm run dev
 
 [`tests/agent_evals/`](tests/agent_evals/)根据实际运行事件检查工具选择、失败和终态；自动化用例使用模拟模型，不代表 DeepSeek 的真实选工具准确率。新增诊断流程见[业务工作流用例](tests/seo_agent/test_business_workflows.py)，关键词接口字段见[DataForSEO 契约用例](tests/providers/test_dataforseo_keyword_overview.py)。其他业务用例可参阅[机会管理](tests/seo_agent/test_opportunities_workbench.py)、[任务与交付](tests/seo_agent/test_tasks_delivery.py)、[发布与监控](tests/seo_agent/test_publishing_monitoring.py)和[自动化集成](tests/seo_agent/test_automation_integration.py)。
 
+配置 DeepSeek 并启动本地后端后，可以用同一组业务问题评测真实运行。将 `<测试站点 ID>` 换成已初始化的测试站点 ID。
+
+```bash
+.venv/bin/python -m src.agent.evals.seo_chat --site-id '<测试站点 ID>'
+```
+
+报告记录选中的工具、证据来源、需逐字核对的字段、终态、耗时和对话模型 Token。评测需要的工具未注册，或必需工具因上游失败拿不到证据时，记为 `BLOCKED`。加 `--case tdk` 可单独复跑一题。
+
 本项目采用 [MIT 许可证](LICENSE)。

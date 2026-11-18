@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from src.agent.evals.seo_chat import score_run
 from src.agent.evals.trajectory import TrajectoryCase, evaluate_agent_run, evaluate_trajectory
 from src.agent.loop import AgentLoop
 from src.agent.providers.base import ModelChunk, ToolCall
@@ -104,3 +105,46 @@ def test_eval_rejects_pseudo_tool_exposure() -> None:
     )
     assert result.passed is False
     assert "禁止工具出现在可用工具列表: seo_search_history" in result.failures
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected", "available"),
+    [
+        ("Title 是 Example Home，H1 是 Editorial Guide。", "PASS", ["seo_page_metadata"]),
+        ("Title 和 H1 看起来都正常。", "FAIL", ["seo_page_metadata"]),
+        ("暂时无法读取页面。", "BLOCKED", []),
+    ],
+)
+def test_live_report_checks_evidence_in_the_answer(answer, expected, available) -> None:
+    case = next(item for item in load_cases() if item.case_id == "tdk")
+    data = {
+        "raw": {"data": {"title": "Example Home", "h1s": ["Editorial Guide"]}},
+        "provenance": {"source": "page_html"},
+    }
+    recorded = []
+    if available:
+        recorded.extend([
+            ("tool.started", {"name": "seo_page_metadata"}),
+            ("tool.completed", {"name": "seo_page_metadata", "result": {"data": data}}),
+        ])
+    recorded.extend([
+        ("message.completed", {"content": answer}),
+        ("run.completed", {"status": "completed"}),
+    ])
+    run = {
+        "id": "run_recorded", "status": "COMPLETED", "model_name": "recorded-model",
+        "token_usage": {"total_tokens": 42},
+        "events": [
+            {"id": f"evt_{i}", "event_type": kind, "sequence": i, "payload": payload,
+             "created_at": "2026-01-01T00:00:00Z"}
+            for i, (kind, payload) in enumerate(recorded, start=1)
+        ],
+    }
+    task = {"user_intent": case.user_input, "available_tools": available}
+    report = score_run(case, run, task, 10)
+    assert report["status"] == expected
+    assert report["chat_loop_token_usage"] == {"total_tokens": 42}
+    if available:
+        assert report["evidence"][0]["source"] == "page_html"
+        matches = [check["matched"] for check in report["answer_fact_checks"]]
+        assert matches == [expected == "PASS"] * 2

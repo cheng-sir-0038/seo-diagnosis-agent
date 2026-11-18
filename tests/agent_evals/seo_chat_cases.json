@@ -1,11 +1,15 @@
 [
   {
     "case_id": "tdk",
-    "user_input": "检查当前首页的 TDK 情况",
+    "user_input": "检查本站首页的 TDK。请逐字列出页面源 HTML 中的 Title 和第一个 H1，按原文给出。",
     "required_tools": ["seo_page_metadata"],
     "forbidden_tools": ["seo_serp_overview", "seo_page_performance"],
     "ordered_tools": ["seo_page_metadata"],
-    "terminal_status": "completed"
+    "terminal_status": "completed",
+    "answer_facts": [
+      {"tool": "seo_page_metadata", "path": ["raw", "data", "title"]},
+      {"tool": "seo_page_metadata", "path": ["raw", "data", "h1s", 0]}
+    ]
   },
   {
     "case_id": "pagespeed",
@@ -17,7 +21,7 @@
   },
   {
     "case_id": "serp-display",
-    "user_input": "查看百度搜索结果里首页如何展示",
+    "user_input": "在 Google 美国搜索本站域名，看看搜索结果里首页的标题和摘要怎么展示。",
     "required_tools": ["seo_serp_overview"],
     "forbidden_tools": ["seo_page_metadata"],
     "ordered_tools": ["seo_serp_overview"],
@@ -25,11 +29,35 @@
   },
   {
     "case_id": "organic-keywords",
-    "user_input": "查询当前自然关键词",
+    "user_input": "查一下本站在美国市场当前有哪些自然排名关键词，给我几个实际样本。",
     "required_tools": ["seo_organic_keywords"],
     "forbidden_tools": ["seo_search_history", "seo_audit_issues"],
     "forbidden_available_tools": ["seo_search_history", "seo_audit_issues"],
     "ordered_tools": ["seo_organic_keywords"],
     "terminal_status": "completed"
+  },
+  {
+    "case_id": "homepage-audit",
+    "user_input": "帮我给本站首页做一次 SEO 体检。我希望从搜索点进来的客户很快看懂我们提供什么。根据页面内容告诉我最先改哪里，并给依据。",
+    "required_tools": ["seo_site_audit"],
+    "forbidden_tools": ["seo_serp_overview", "seo_page_performance"]
+  },
+  {
+    "case_id": "crawl-check",
+    "user_input": "给本站做一次综合诊断，核对首页、抓取规则和站点地图。说明哪些证据查得到、哪些还缺。",
+    "required_tools": ["seo_site_diagnosis"],
+    "forbidden_tools": ["seo_search_history"]
+  },
+  {
+    "case_id": "content-opportunity",
+    "user_input": "围绕 product selection 研究美国市场的内容机会。列出候选关键词和实际能查到的指标，缺数据就标未知。",
+    "required_tools": ["seo_keyword_opportunity"],
+    "forbidden_tools": ["seo_search_history", "seo_audit_issues"]
+  },
+  {
+    "case_id": "page-suggestions",
+    "user_input": "我想给本站首页拟搜索标题、分享信息和 JSON-LD。请先读取页面，缺少站点主体或分享图依据时先等我补充。",
+    "required_tools": ["seo_page_suggestions"],
+    "terminal_status": "waiting_for_input"
   }
 ]
