@@ -2,9 +2,9 @@
 
 选一个网站，直接说你想查什么。DeepSeek 根据问题和取回的证据选择下一步工具，能查页面问题、研究关键词和排名页、拟定 SEO 建议。配置 Cloudflare Workers AI 后，也能在对话里生成页面分享图。
 
-## 一次真实对话
+## 真实对话
 
-用户请 Agent 根据页面拟定标题和结构化数据。
+用户准备更新首页在搜索结果和分享链接上的文案，希望先拿到一份可评审的草稿。DeepSeek 根据这句需求选择页面建议流程。读到页面后，Agent 发现站点主体和配图需要确认，于是保留证据，等待用户决定。用户选择「先用现有信息生成」，同一次运行继续，交付标题、摘要、分享信息和 JSON-LD 草稿，并标出待确认事项。[完整对话](docs/screenshots/07-page-suggestions.png) · [执行详情](docs/screenshots/11-execution-details.png)
 
 ```mermaid
 flowchart TD
@@ -16,13 +16,13 @@ flowchart TD
     Read --> Pause --> Choice --> Resume --> Draft
 ```
 
-[人工补充与执行记录](docs/screenshots/README.md#对话与人工补充) · [完整对话截图](docs/screenshots/README.md) · [本地启动](#本地启动)
+[首页体检](docs/screenshots/19-homepage-priority.png) · [关键词机会](docs/screenshots/04-keyword-opportunities.png) · [已有排名页优化](docs/screenshots/05-ranking-pages.png) · [完整对话截图](docs/screenshots/README.md) · [本地启动](#本地启动)
 
 ## Agent 如何运行
 
 - DeepSeek 根据问题和已有证据选择工具。代码限制模型轮次、工具调用总数和超时，复用本次运行中重复的成功查询。[对话入口](src/api/routes/seo_agent_chat.py) · [工具循环](src/agent/loop.py)
 - 工作流安排取证步骤、校验实际来源和结构化产物。需要人工补充时，运行检查点保存已查到的证据。[工作流代码](src/seo_agent/workflows/) · [检查点与恢复](src/agent/harness/)
-- 模型、工具及其子步骤保留输入、输出、状态和耗时，可按配置在 Langfuse 中查看一次运行的调用树。[观测代码](src/observability/)
+- 查询结果和来源紧跟对话结论。「执行详情」默认折叠，展开可查看调用状态、耗时和已取得的参数。配置 Langfuse 后可查看模型和工作流的完整调用树。[观测代码](src/observability/)
 
 ```mermaid
 flowchart TB
@@ -52,7 +52,7 @@ flowchart TB
 
 | 业务场景与输入示例 | 实际工具或服务 | 产出与当前状态 |
 | --- | --- | --- |
-| 页面体检：“检查首页 SEO，也看看性能。” | `seo_site_audit` → `seo_page_metadata`，按需调用 `seo_page_performance` | 页面元信息和可选性能证据；已封装为单页工作流 |
+| 页面体检：“客户从搜索点进首页，能看懂我们提供什么吗？帮我找出最值得先改的地方。” | `seo_site_audit` → `seo_page_metadata`，按需调用 `seo_page_performance` | 页面证据和优先建议。需要检查速度时可加上移动端性能数据 |
 | 页面信息建议：“根据这一页的内容，帮我拟定标题、描述、分享信息和结构化数据。” | `seo_page_suggestions` → 页面事实、模型草稿、引用校验、缺失信息追问 | 给出 TDK、OG、JSON-LD 建议；用户补充后沿用对话继续生成，不修改网站 |
 | 页面分享图：“按这页内容帮我生成一张分享图。” | `seo_share_image` → 读取页面、校验主体依据、调用 Cloudflare Workers AI | 配置生图服务后在对话中直接显示图片 |
 | 搜索现状：“看看本站目前有哪些关键词和排名。” | `seo_search_diagnosis` → `seo_search_metrics` + `seo_organic_keywords` | 站点指标、有限排名样本和对应页面；已封装为工作流，不提供历史下降归因 |

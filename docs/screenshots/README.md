@@ -8,7 +8,7 @@
 
 | 对话场景 | 截图 | 工作流代码 |
 | --- | --- | --- |
-| 首页体检 | [页面证据与检查范围](02-page-audit.png) | [site_audit.py](../../src/seo_agent/workflows/site_audit.py) |
+| 首页体检 | [首页最值得先改的地方](19-homepage-priority.png)、[加做移动端性能检查](02-page-audit.png) | [site_audit.py](../../src/seo_agent/workflows/site_audit.py) |
 | 搜索现状 | [排名关键词与对应页面](03-search-diagnosis.png) | [search_diagnosis.py](../../src/seo_agent/workflows/search_diagnosis.py) |
 | 关键词机会 | [候选词与未知指标](04-keyword-opportunities.png) | [keyword_opportunity.py](../../src/seo_agent/workflows/keyword_opportunity.py) |
 | 已有排名页优化 | [排名样本与页面核验](05-ranking-pages.png) | [ranking_page_optimization.py](../../src/seo_agent/workflows/ranking_page_optimization.py) |
@@ -18,7 +18,16 @@
 | 页面变更复检 | [保存基线](09-page-review-baseline.png)、[按目标复检](10-page-change-review.png) | [page_change_review.py](../../src/seo_agent/workflows/page_change_review.py) |
 
 <details>
-<summary>首页体检：组合 HTML 核验与移动端性能证据</summary>
+<summary>首页体检后该先改哪里</summary>
+
+用户想让第一次从搜索点进首页的客户看懂网站能提供什么。Agent 读取缓存的首页源码，建议把页面摘要里的资料评估、试用样品、采购协同写到首屏。
+
+![首页现状、页面依据和优先建议](19-homepage-priority.png)
+
+</details>
+
+<details>
+<summary>首页体检加做移动端性能检查</summary>
 
 本次已启用 HTML 基础扫描和 PageSpeed，工作流汇总标题、描述、H1、Canonical 及移动端 Lighthouse 结果：性能 95、无障碍 96、最佳实践 100、SEO 100。证据保留缓存状态；单页实验室结果不代表整站审计、Google 收录状态或真实用户体验。
 
@@ -114,18 +123,11 @@
 </details>
 
 <details>
-<summary>执行详情：查看实际工具、状态、耗时和运行事件</summary>
+<summary>执行详情：在对应回复中展开调用记录</summary>
 
-左侧保留原问题、用户选择和最终回复，右侧展示恢复后执行的工具和最近事件。模型输入输出与工作流内部子步骤可按配置上传到 Langfuse。[观测模块](../../src/observability/)
+「执行详情」默认折叠在对应回复里。展开后可查看调用的状态、耗时和传入参数，也可以进一步查看返回数据。模型和工作流的完整记录可按配置上传到 Langfuse。[观测模块](../../src/observability/)
 
-![实际工具调用与运行事件](11-execution-details.png)
-
-</details>
-
-<details>
-<summary>手机端：对话、建议卡片和输入框随屏幕排列</summary>
-
-![手机端页面信息建议](14-mobile-chat.png)
+![调用参数、状态和耗时](11-execution-details.png)
 
 </details>
 
@@ -145,7 +147,7 @@
 <details>
 <summary>新闻、图片与视频：为内容研究提供搜索线索</summary>
 
-同一轮对话查了新闻、图片和视频，保留了搜索结果的标题、链接或缩略图及来源。后两张图同时展示这次对话和相应工具的执行详情。
+同一轮对话查了新闻、图片和视频。缩略图、标题和来源显示在结论后面，后两张图额外展开了对应查询的调用记录。
 
 ![新闻与内容搜索结果](13-content-search.png)
 
