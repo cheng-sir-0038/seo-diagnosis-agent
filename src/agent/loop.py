@@ -14,7 +14,7 @@ from src.agent.harness.summary import compact_model_context
 from src.agent.models import AgentRun, HumanInputRequest, HumanInputState, RunStatus
 from src.agent.observability import AgentRunObserver
 from src.agent.providers.base import ModelProvider, ToolCall
-from src.agent.tools.base import ToolRuntimeContext, resolve_render_hint
+from src.agent.tools.base import ToolResult, ToolRuntimeContext, resolve_render_hint
 from src.agent.tools.registry import ToolRegistry
 from src.observability.context import (
     get_current_context,
@@ -612,7 +612,8 @@ class AgentLoop:
         async def execute() -> tuple[dict[str, Any], Status, str | None, str | None]:
             if tool is None:
                 return (
-                    {"success": False, "error": f"未知工具: {call.name}"},
+                    ToolResult(success=False, error=f"未知工具: {call.name}",
+                               error_code="UNKNOWN_TOOL").model_dump(mode="json"),
                     Status.FAILED,
                     "UNKNOWN_TOOL",
                     f"未知工具: {call.name}",
@@ -635,25 +636,21 @@ class AgentLoop:
                     timeout=self.tool_timeout,
                 )
                 payload = result.model_dump(mode="json")
+                if not result.success:
+                    payload["error_code"] = result.error_code or "TOOL_FAILED"
                 return (
                     payload,
                     Status.COMPLETED if result.success else Status.FAILED,
-                    None if result.success else "TOOL_FAILED",
+                    None if result.success else payload["error_code"],
                     result.error,
                 )
-            except TimeoutError as exc:
-                return (
-                    {"success": False, "error": "工具执行超时"},
-                    Status.FAILED,
-                    "TOOL_TIMEOUT",
-                    str(exc) or "工具执行超时",
-                )
             except Exception as exc:
+                failure = ToolResult.from_exception(exc)
                 return (
-                    {"success": False, "error": str(exc)},
+                    failure.model_dump(mode="json"),
                     Status.FAILED,
-                    type(exc).__name__,
-                    str(exc),
+                    failure.error_code,
+                    str(exc) or failure.error,
                 )
 
         if tool_span is not None:

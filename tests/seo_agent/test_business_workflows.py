@@ -34,6 +34,44 @@ CAPABILITIES = {
 }
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unexpected", [False, True])
+@pytest.mark.parametrize("observed", [False, True])
+async def test_workflow_preserves_explicit_error_codes_and_handles_unexpected_errors(
+    unexpected, observed, tmp_path,
+):
+    from src.agent.tools.base import ToolResult
+    from src.seo_agent.workflows.execution import WorkflowSteps
+
+    class FailedTool:
+        name = "failed_source"
+        description = "Failed external source."
+        parameters_schema = {"type": "object", "properties": {}}
+        render_hint = None
+
+        async def execute(self, arguments, runtime=None):
+            if unexpected:
+                raise RuntimeError("private external detail")
+            return ToolResult(success=False, error="没有数据", error_code="DATA_NOT_AVAILABLE")
+
+    database = ObservabilityDatabase(tmp_path / "observations.db") if observed else None
+    observer = ObservabilityClient(database, project_key="seo-agent") if observed else None
+    try:
+        steps = WorkflowSteps({"failed_source": FailedTool()}, 1, observer, None)
+        assert await steps.run("metrics", "failed_source", {}) is None
+        assert steps.coverage["metrics"]["error_code"] == (
+            "TOOL_FAILED" if unexpected else "DATA_NOT_AVAILABLE"
+        )
+        if observed and not unexpected:
+            row = await database.fetch_one(
+                "SELECT error_code FROM obs_spans WHERE operation_name='failed_source'"
+            )
+            assert row["error_code"] == "DATA_NOT_AVAILABLE"
+    finally:
+        if observer:
+            await observer.shutdown()
+
+
 class ExternalData:
     def __init__(self, capabilities: set[Capability] | None = None) -> None:
         self.capabilities = CAPABILITIES if capabilities is None else capabilities

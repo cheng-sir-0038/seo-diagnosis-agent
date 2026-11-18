@@ -21,6 +21,23 @@ class FakeFacade:
         return {"meta": {"source": "dataforseo"}, "data": {"ok": True}}
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authentication", [False, True])
+async def test_protocol_bridge_preserves_data_source_error_codes(authentication):
+    from src.core.exceptions import InternalAuthError, InternalDataNotAvailableError
+
+    class UnavailableFacade:
+        async def query(self, **kwargs):
+            error = InternalAuthError if authentication else InternalDataNotAvailableError
+            raise error("数据源本次不可用", debug_context={"api_key": "private-debug"})
+
+    tool = SeoDataToolBridge(UnavailableFacade()).build_protocol_tools()[0]
+    result = await tool.execute({"site_id": "example.com"})
+    assert result.success is False
+    assert result.error_code == ("AUTH_FAILED" if authentication else "DATA_NOT_AVAILABLE")
+    assert "private-debug" not in result.model_dump_json()
+
+
 def test_diagnosis_engine_protocol_remains_unchanged() -> None:
     assert "diagnose" in DiagnosisEngine.__dict__
 

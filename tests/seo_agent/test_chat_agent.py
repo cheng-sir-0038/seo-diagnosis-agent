@@ -169,6 +169,9 @@ def test_seo_system_prompt_contains_site_context_and_autonomous_tool_rules() -> 
     assert "有哪些、是谁、名单或排名" in prompt
     assert "不要在正文中再生成表格、数据摘要或完整明细" in prompt
     assert "seo_search_metrics" in prompt
+    assert "AUTH_FAILED" in prompt
+    assert "不得要求用户为每个域名重新授权或绑定项目" in prompt
+    assert "只读查询不需要重复索要批准" in prompt
 
 
 @pytest.mark.asyncio

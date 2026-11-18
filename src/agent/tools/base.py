@@ -6,6 +6,8 @@ from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from src.core.exceptions import InternalAdapterError, InternalConfigError
+
 
 class ToolResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -13,7 +15,20 @@ class ToolResult(BaseModel):
     success: bool
     data: Any = Field(default_factory=dict)
     error: str | None = None
+    error_code: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @classmethod
+    def from_exception(cls, exc: Exception) -> ToolResult:
+        if isinstance(exc, InternalConfigError):
+            code, message = "CONFIG_ERROR", exc.message
+        elif isinstance(exc, InternalAdapterError):
+            code, message = exc.error_code.value, exc.message
+        elif isinstance(exc, TimeoutError):
+            code, message = "TOOL_TIMEOUT", "工具执行超时"
+        else:
+            code, message = "INTERNAL_ERROR", "工具执行失败，具体原因尚未确认。"
+        return cls(success=False, error=message, error_code=code)
 
 
 RenderHint = Literal["chart", "table", "tree", "cards"]

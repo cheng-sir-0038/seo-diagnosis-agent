@@ -88,7 +88,7 @@ class WorkflowSteps:
             step.update(status="failed", error_code="TOOL_FAILED")
             return None
         if not result.success or not isinstance(result.data, dict):
-            step.update(status="failed", error_code="TOOL_FAILED")
+            step.update(status="failed", error_code=result.error_code or "TOOL_FAILED")
             return None
         self.evidence[key] = result.data
         step["status"] = result.data.get("workflow_status", "complete")

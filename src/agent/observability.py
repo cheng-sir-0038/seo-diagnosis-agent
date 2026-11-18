@@ -183,5 +183,7 @@ async def run_observed_tool(
         if span is not None:
             span.output_data = result.model_dump(mode="json")
         if not result.success and span is not None:
-            await span.capture_exception(RuntimeError("工具返回失败"), error_code="TOOL_FAILED")
+            await span.capture_exception(
+                RuntimeError("工具返回失败"), error_code=result.error_code or "TOOL_FAILED"
+            )
         return result

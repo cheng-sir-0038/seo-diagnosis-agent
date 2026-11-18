@@ -102,7 +102,8 @@ class SiteAuditWorkflow(AgentTool):
                         runtime=runtime, component_name="pagespeed", timeout=remaining,
                     )
                     performance = result.data if result.success else {
-                        "error_code": "TOOL_FAILED", "message": "性能检查失败。"
+                        "error_code": result.error_code or "TOOL_FAILED",
+                        "message": "性能检查失败。",
                     }
                 except TimeoutError:
                     performance = {"error_code": "TOOL_TIMEOUT", "message": "性能检查超时。"}

@@ -239,7 +239,7 @@ class SeoDataProtocolTool(AgentTool):
                 force_refresh=bool(arguments.get("force_refresh", False)),
             )
         except Exception as exc:
-            return ToolResult(success=False, error=str(exc))
+            return ToolResult.from_exception(exc)
         return ToolResult(success=True, data=result)
 
 
