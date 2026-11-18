@@ -220,7 +220,7 @@ async def test_live_capabilities_exclude_all_pseudo_providers(monkeypatch):
     facade = DataFacade()
     await facade.startup()
     try:
-        assert facade.live_capabilities() == {Capability.PAGE_METADATA}
+        assert facade.live_capabilities() == {Capability.PAGE_METADATA, Capability.SITE_RESOURCE}
         assert Capability.SEARCH_HISTORY not in facade.live_capabilities()
     finally:
         await facade.shutdown()

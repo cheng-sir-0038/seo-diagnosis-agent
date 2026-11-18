@@ -125,6 +125,7 @@ class QueryRequest(BaseModel):
     | 审计 | `audit_health` | 站点健康分 |
     | 审计 | `audit_issues` | 技术问题列表 |
     | 审计 | `audit_page_explorer` | Page Explorer |
+    | 审计 | `site_resource` | 本站 robots.txt 或 XML sitemap |
     | 关键词 | `keyword_overview` | 关键词概览 |
     | 关键词 | `serp_overview` | SERP 结果 |
     | 关键词 | `autocomplete` | Google 搜索联想词 |

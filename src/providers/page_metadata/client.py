@@ -22,7 +22,14 @@ from src.core.exceptions import (
     InternalProviderRequestError,
     InternalProviderResponseError,
 )
+from src.models.page_metadata import SiteResourceKind
 from src.providers.page_metadata.config import PageMetadataConfig
+
+_MEDIA_TYPES = {
+    None: {"text/html", "application/xhtml+xml"},
+    "robots": {"text/plain"},
+    "sitemap": {"application/xml", "text/xml", "text/plain"},
+}
 
 
 def _public_address(value: str) -> bool:
@@ -94,14 +101,23 @@ class _PublicResolver(AbstractResolver):
 
 
 @dataclass(frozen=True, slots=True)
-class FetchedHtmlPage:
+class FetchedDocument:
     requested_url: str
     final_url: str
     status_code: int
     content_type: str | None
     content_length_bytes: int
     headers: dict[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class FetchedHtmlPage(FetchedDocument):
     html: str
+
+
+@dataclass(frozen=True, slots=True)
+class FetchedSiteResource(FetchedDocument):
+    text: str
 
 
 class PageMetadataClient:
@@ -135,20 +151,41 @@ class PageMetadataClient:
             self._resolver = None
 
     async def fetch(self, *, site_id: str, url: str | None = None) -> FetchedHtmlPage:
+        page = await self._fetch(site_id, url or site_id, resource_type=None)
+        assert isinstance(page, FetchedHtmlPage)
+        return page
+
+    async def fetch_site_resource(
+        self, *, site_id: str, url: str, resource_type: SiteResourceKind
+    ) -> FetchedSiteResource:
+        resource = await self._fetch(site_id, url, resource_type=resource_type)
+        assert isinstance(resource, FetchedSiteResource)
+        return resource
+
+    async def _fetch(
+        self, site_id: str, url: str, *, resource_type: SiteResourceKind | None
+    ) -> FetchedHtmlPage | FetchedSiteResource:
+        requested = normalize_site_url(url)
+        site_host = normalized_host(site_id)
+        if not site_host or normalized_host(requested) != site_host:
+            raise _invalid("只允许检测当前站点域名下的公开地址", requested)
+
         if self._session is None:
             await self.startup()
         assert self._session is not None
 
-        requested = normalize_site_url(url or site_id)
-        site_host = normalized_host(site_id)
-        if not site_host or normalized_host(requested) != site_host:
-            raise _invalid("页面元信息只允许检测当前站点域名下的页面", requested)
-
         current = requested
+        allowed_types = _MEDIA_TYPES[resource_type]
+        headers = {"Accept": ", ".join(sorted(allowed_types))} if resource_type else {}
+        max_bytes = self.config.max_response_bytes
+        if resource_type:
+            max_bytes = min(max_bytes, 512_000 if resource_type == "robots" else 2_000_000)
         for redirect_index in range(self.config.max_redirects + 1):
             self._request_count += 1
             try:
-                async with self._session.get(current, allow_redirects=False) as response:
+                async with self._session.get(
+                    current, allow_redirects=False, headers=headers
+                ) as response:
                     status = int(response.status)
                     if 300 <= status < 400 and response.headers.get("Location"):
                         if redirect_index >= self.config.max_redirects:
@@ -160,20 +197,37 @@ class PageMetadataClient:
                         next_url = normalize_site_url(
                             urljoin(current, response.headers["Location"])
                         )
-                        if normalized_host(next_url) != site_host:
+                        if normalized_host(next_url) != site_host or (
+                            resource_type and site_origin(next_url) != site_origin(requested)
+                        ):
                             raise _invalid("页面重定向到了当前站点以外的域名", next_url)
                         current = next_url
                         continue
 
                     content_type = response.headers.get("Content-Type")
                     media_type = (content_type or "").split(";", 1)[0].strip().lower()
-                    if media_type not in {"text/html", "application/xhtml+xml"}:
+                    if resource_type and not 200 <= status < 300:
+                        return FetchedSiteResource(
+                            requested, current, status, content_type, 0, {}, ""
+                        )
+                    if media_type not in allowed_types:
                         raise InternalDataNotAvailableError(
-                            "目标 URL 返回的不是 HTML 页面",
+                            "站点文件的响应类型不受支持"
+                            if resource_type else "目标 URL 返回的不是 HTML 页面",
                             provider="page_html",
                             debug_context={"status": status, "content_type": content_type},
                         )
-                    body = await _read_limited(response, self.config.max_response_bytes)
+                    body = await _read_limited(response, max_bytes)
+                    if resource_type:
+                        try:
+                            text = body.decode("utf-8-sig")
+                        except UnicodeDecodeError as exc:
+                            raise InternalProviderResponseError(
+                                "站点文件不是有效的 UTF-8", provider="page_html"
+                            ) from exc
+                        return FetchedSiteResource(
+                            requested, current, status, content_type, len(body), {}, text
+                        )
                     charset = response.charset or "utf-8"
                     try:
                         html = body.decode(charset, errors="replace")
@@ -207,7 +261,7 @@ class PageMetadataClient:
                 raise
             except Exception as exc:
                 raise InternalProviderRequestError(
-                    f"页面 HTML 请求失败: {exc}",
+                    "站点文件请求失败" if resource_type else f"页面 HTML 请求失败: {exc}",
                     provider="page_html",
                     debug_context={"requested_url": requested},
                 ) from exc
@@ -221,7 +275,7 @@ async def _read_limited(response: Any, limit: int) -> bytes:
         total += len(chunk)
         if total > limit:
             raise InternalProviderResponseError(
-                "页面 HTML 响应超过大小限制",
+                "站点文档响应超过大小限制",
                 provider="page_html",
                 debug_context={"max_response_bytes": limit},
             )
@@ -295,6 +349,12 @@ def normalized_host(value: str) -> str:
     if "://" not in text:
         text = f"https://{text}"
     return (urlparse(text).hostname or "").lower().removeprefix("www.")
+
+
+def site_origin(url: str) -> str:
+    parsed = urlparse(url)
+    default_port = ":443" if parsed.scheme == "https" else ":80"
+    return f"{parsed.scheme}://{parsed.netloc.lower().removesuffix(default_port)}"
 
 
 def _invalid(message: str, url: str) -> InternalAdapterError:

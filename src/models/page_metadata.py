@@ -8,6 +8,23 @@ from pydantic import Field
 
 from src.models.common import BaseEvidence
 
+SiteResourceKind = Literal["robots", "sitemap"]
+
+
+class SiteResourceReport(BaseEvidence):
+    resource_type: SiteResourceKind
+    requested_url: str
+    final_url: str
+    status_code: int = Field(ge=100, le=599)
+    status: Literal["parsed", "not_found", "http_error", "invalid"]
+    message: str | None = None
+    rules: list[str] = Field(default_factory=list)
+    declared_sitemaps: list[str] = Field(default_factory=list)
+    document_type: Literal["urlset", "sitemapindex"] | None = None
+    entry_count: int | None = None
+    excluded_entry_count: int = 0
+    sample_urls: list[str] = Field(default_factory=list)
+
 
 class PageMetadataReport(BaseEvidence):
     """直接读取页面源 HTML 后得到的元信息证据。"""
@@ -27,6 +44,7 @@ class PageMetadataReport(BaseEvidence):
 
     canonical_url: str | None = None
     canonical_count: int = Field(default=0, ge=0)
+    canonical_hrefs: list[str] = Field(default_factory=list)
     robots: str | None = None
     googlebot: str | None = None
     x_robots_tag: str | None = None

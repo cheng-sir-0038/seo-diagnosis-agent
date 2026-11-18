@@ -24,6 +24,7 @@ from src.seo_agent.chat.tools import build_seo_agent_registry
 SITE = {"id": "site-1", "domain": "example.com", "default_country": "US", "default_language": "en"}
 CAPABILITIES = {
     Capability.PAGE_METADATA,
+    Capability.SITE_RESOURCE,
     Capability.PAGE_PERFORMANCE,
     Capability.SEARCH_METRICS,
     Capability.ORGANIC_KEYWORDS,
@@ -89,6 +90,21 @@ class ExternalData:
             await asyncio.sleep(1)
         if capability in self.fail:
             raise InternalProviderRequestError("private upstream body with credential")
+        if capability == Capability.SITE_RESOURCE:
+            url = kwargs["params"]["url"]
+            kind = kwargs["params"]["resource_type"]
+            return {
+                "meta": {"capability": capability.value, "source": "page_html"},
+                "data": {
+                    "resource_type": kind,
+                    "status": "parsed",
+                    "status_code": 200,
+                    "final_url": "https://example.com/robots.txt" if kind == "robots" else url,
+                    "declared_sitemaps": [] if kind == "sitemap" else [
+                        "https://example.com/site-map.xml"
+                    ],
+                },
+            }
         data: Any = {
             Capability.PAGE_METADATA: {
                 "status_code": 200,
@@ -152,6 +168,8 @@ def test_registry_registers_only_workflows_with_useful_live_dependencies() -> No
     assert build_seo_agent_registry(ExternalData({Capability.SEARCH_METRICS}), SITE).names() == [
         "seo_search_metrics"
     ]
+    technical_only = build_seo_agent_registry(ExternalData({Capability.PAGE_METADATA}), SITE)
+    assert technical_only.get("seo_site_diagnosis") is not None
 
 
 @pytest.mark.asyncio
@@ -250,22 +268,26 @@ async def test_site_report_runs_selected_business_steps_without_duplicate_querie
         .execute({"query": "waterjet", "include_competitors": True})
     )
     assert result.success and result.data["workflow_status"] == "complete"
-    assert set(result.data["evidence"]) == {"page", "search", "opportunities", "competitors"}
-    capabilities = [call["capability"] for call in facade.calls]
-    assert len(capabilities) == len(set(capabilities))
-    assert Capability.PAGE_PERFORMANCE not in capabilities
+    assert set(result.data["evidence"]) == {
+        "page", "robots_txt", "sitemap", "search", "opportunities", "competitors",
+    }
+    calls = [(call["capability"], call["params"].get("resource_type")) for call in facade.calls]
+    assert len(calls) == len(set(calls))
+    assert (Capability.PAGE_PERFORMANCE, None) not in calls
     assert result.data["coverage"]["indexing"]["status"] == "not_implemented"
-    assert result.data["coverage"]["robots_txt"]["status"] == "not_implemented"
-    assert result.data["coverage"]["sitemap"]["status"] == "not_implemented"
+    assert result.data["coverage"]["robots_txt"]["status"] == "complete"
+    assert result.data["coverage"]["sitemap"]["status"] == "complete"
+    assert facade.calls[2]["params"]["url"] == "https://example.com/site-map.xml"
 
 
 @pytest.mark.asyncio
-async def test_site_report_rejects_cross_site_url_before_paid_queries() -> None:
+@pytest.mark.parametrize("field", ["url", "sitemap_url"])
+async def test_site_report_rejects_cross_site_url_before_queries(field: str) -> None:
     facade = ExternalData()
     result = (
         await build_seo_agent_registry(facade, SITE)
         .get("seo_site_diagnosis")
-        .execute({"url": "https://other.example/", "query": "waterjet"})
+        .execute({field: "https://other.example/", "query": "waterjet"})
     )
     assert not result.success
     assert facade.calls == []
@@ -349,6 +371,11 @@ async def test_report_records_real_nested_tools_and_model_choice(tmp_path: Path)
         } <= names
         assert "seo_keyword_opportunity" not in names and "seo_page_performance" not in names
         by_name = {row["operation_name"]: row for row in spans}
+        files = [row for row in spans if row["operation_name"] == "seo_site_resource"]
+        assert len(files) == 2
+        assert all(row["parent_span_id"] == by_name["seo_site_diagnosis"]["id"] for row in files)
+        assert any('"resource_type":"robots"' in row["input_json"] for row in files)
+        assert any('"resource_type":"sitemap"' in row["input_json"] for row in files)
         for child, parent in (
             ("seo_site_audit", "seo_site_diagnosis"),
             ("seo_page_metadata", "seo_site_audit"),

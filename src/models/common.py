@@ -68,6 +68,7 @@ class Capability(enum.StrEnum):
     AUDIT_PAGE_CONTENT = "audit_page_content"
     PAGE_PERFORMANCE = "page_performance"
     PAGE_METADATA = "page_metadata"
+    SITE_RESOURCE = "site_resource"
 
     # ---- 关键词研究 (Keywords Explorer + SERP) ----
     KEYWORD_OVERVIEW = "keyword_overview"

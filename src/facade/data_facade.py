@@ -500,6 +500,9 @@ class DataFacade:
                 **params,
             )
 
+        if capability == Capability.SITE_RESOURCE:
+            return await provider.get_site_resource(site_id=site_id or "", url=url, **params)
+
         if capability == Capability.PAGE_PERFORMANCE:
             return await provider.get_page_performance(
                 site_id=site_id or "",

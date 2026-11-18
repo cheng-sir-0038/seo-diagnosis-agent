@@ -7,6 +7,7 @@ from src.agent.observability import run_observed_tool
 from src.agent.tools.base import AgentTool, ToolProtocol, ToolResult, ToolRuntimeContext
 from src.core.exceptions import InternalAdapterError
 from src.observability.client import ObservabilityClient
+from src.seo_agent.workflows.page_findings import page_findings
 from src.seo_presentation.contracts import base_contract
 
 
@@ -67,23 +68,38 @@ class SiteAuditWorkflow(AgentTool):
             return page_result
         page = page_result.data
         evidence: dict[str, Any] = {"page": page}
+        raw = page.get("raw", {})
+        raw_page = raw.get("data", {})
+        cached = raw.get("meta", {}).get("cached") is True
+        status_code = raw_page.get("status_code") if isinstance(raw_page, dict) else None
+        complete = (
+            type(status_code) is int and 200 <= status_code < 300
+            and status_code not in {204, 205, 206} and raw_page.get("content_length_bytes") != 0
+        )
+        findings = page_findings(raw_page, cached=cached) if complete else []
         warnings = [str(item) for item in page.get("warnings", [])]
+        summary = " ".join(warnings) if warnings else "已读取页面元信息。"
+        if findings:
+            summary = f"已读取页面元信息，有 {len(findings)} 项观察可核对。"
+        elif not complete:
+            summary = (
+                f"页面返回 HTTP {status_code}，本次无法确认页面标签状态。"
+                if status_code is not None else "缺少有效的 HTTP 页面证据。"
+            )
+        checks = [
+            {"label": str(item.get("label")), "value": str(item.get("value") or "未提供")}
+            for item in page.get("checks", []) if isinstance(item, dict)
+        ] if complete else []
         cards = [{
             "key": "page",
             "title": "页面源 HTML",
-            "summary": " ".join(warnings) if warnings else "已读取页面元信息。",
-            "metadata": [
-                {"label": str(item.get("label")), "value": str(item.get("value") or "未提供")}
-                for item in page.get("checks", []) if isinstance(item, dict)
-            ] + [{"label": "数据来源", "value": "页面源 HTML"}],
+            "summary": summary,
+            "metadata": checks + [{"label": "数据来源", "value": "页面源 HTML"}],
         }]
-        if page.get("raw", {}).get("meta", {}).get("cached") is True:
+        if cached:
             cards[0]["metadata"].append({"label": "读取方式", "value": "缓存数据"})
-        status = "complete"
-        raw_page = page.get("raw", {}).get("data", {})
-        status_code = raw_page.get("status_code") if isinstance(raw_page, dict) else None
-        if not isinstance(status_code, int) or not 200 <= status_code < 300:
-            status = "partial"
+        cards.extend(finding.card() for finding in findings)
+        status = "complete" if complete else "partial"
 
         if include_performance:
             performance: dict[str, Any]
@@ -137,7 +153,7 @@ class SiteAuditWorkflow(AgentTool):
                 "已获取页面证据；部分检查未完成。"
                 if status == "partial" else "基于本次只读查询整理页面证据。"
             ),
-            response=page.get("raw", {}),
+            response=raw,
             limitations=[
                 "只检查一个页面的源 HTML，不代表整站，也不能证明 Google 抓取或收录状态。",
                 "性能数据仅在用户要求且数据源可用时获取；实验室结果不代表真实用户体验。",
@@ -147,6 +163,7 @@ class SiteAuditWorkflow(AgentTool):
             "items": cards,
             "workflow_status": status,
             "evidence": evidence,
+            "findings": [finding.model_dump(mode="json") for finding in findings],
         })
-        presentation["provenance"]["cached"] = page.get("raw", {}).get("meta", {}).get("cached")
+        presentation["provenance"]["cached"] = raw.get("meta", {}).get("cached")
         return ToolResult(success=True, data=presentation)

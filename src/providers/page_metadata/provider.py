@@ -8,11 +8,18 @@ from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import urljoin
 
+from src.core.exceptions import ErrorCode, InternalAdapterError
 from src.models.common import Capability, DataIntegrity, DataSource
-from src.models.page_metadata import PageMetadataReport
+from src.models.page_metadata import PageMetadataReport, SiteResourceKind, SiteResourceReport
 from src.providers.base import BaseProvider, ProviderMeta
-from src.providers.page_metadata.client import FetchedHtmlPage, PageMetadataClient
+from src.providers.page_metadata.client import (
+    FetchedHtmlPage,
+    PageMetadataClient,
+    normalize_site_url,
+    site_origin,
+)
 from src.providers.page_metadata.pyseo_client import PythonSeoAnalyzerClient
+from src.providers.page_metadata.site_resources import parse_site_resource
 
 
 class PageMetadataProvider(BaseProvider):
@@ -31,7 +38,7 @@ class PageMetadataProvider(BaseProvider):
             name="page_html",
             label="Direct Page HTML",
             source=DataSource.PAGE_HTML,
-            supported_capabilities={Capability.PAGE_METADATA},
+            supported_capabilities={Capability.PAGE_METADATA, Capability.SITE_RESOURCE},
         )
 
     @property
@@ -70,6 +77,27 @@ class PageMetadataProvider(BaseProvider):
             **parsed,
             **analyzer_evidence,
         )
+
+    async def get_site_resource(
+        self,
+        site_id: str,
+        url: str | None = None,
+        resource_type: SiteResourceKind = "robots",
+        **kwargs: Any,
+    ) -> SiteResourceReport:
+        if resource_type not in ("robots", "sitemap"):
+            raise InternalAdapterError(
+                "站点文件类型必须为 robots 或 sitemap", error_code=ErrorCode.INVALID_PARAMS
+            )
+        target = normalize_site_url(url or site_id)
+        if resource_type == "robots":
+            target = f"{site_origin(target)}/robots.txt"
+        elif url is None:
+            target = f"{site_origin(target)}/sitemap.xml"
+        resource = await self.client.fetch_site_resource(
+            site_id=site_id, url=target, resource_type=resource_type
+        )
+        return parse_site_resource(resource, resource_type)
 
     async def _analyze_page(self, page: FetchedHtmlPage) -> dict[str, Any]:
         if not getattr(self.analyzer, "enabled", False):
@@ -227,6 +255,7 @@ def parse_page_metadata(page: FetchedHtmlPage) -> dict[str, Any]:
         "meta_keywords_count": len(parser.keywords),
         "canonical_url": canonical,
         "canonical_count": len(parser.canonicals),
+        "canonical_hrefs": parser.canonicals[:5],
         "robots": robots,
         "googlebot": googlebot,
         "x_robots_tag": x_robots,

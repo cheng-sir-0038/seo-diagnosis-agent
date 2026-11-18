@@ -49,7 +49,7 @@ flowchart TB
 | 已有排名页优化：“哪些已有排名的页面值得进一步检查？” | `seo_ranking_page_optimization` → 排名样本、少量站内 HTML、每页一个代表词 SERP | 默认调查第 4–20 名样本中的 2 个站内页面，输出实际标签、搜索证据和待核实项；不修改页面 |
 | 页面变更复检：“按之前的快照，检查 Title、H1 和 Canonical 是否符合目标。” | `seo_page_change_review` → 本站基线、重新读取页面、冻结新快照、逐项比较 | 输出变更明细和验收结论；先显式建立基线，缺少目标值或完整证据时不判定通过 |
 | 竞品分析：“谁在和本站竞争这些搜索词？” | `seo_site_diagnosis` 的可选竞品步骤，或 `seo_organic_competitors`、`seo_serp_overview` | 自然搜索竞品、交集指标及指定关键词的搜索结果，不代表完整关键词差距 |
-| 站点综合诊断：“诊断本站，并研究企业名录相关机会。” | `seo_site_diagnosis` → 页面体检、搜索现状、指定主题的关键词机会，按需读竞品 | 结构化卡片报告、证据和检查覆盖范围；已封装为组合工作流 |
+| 站点综合诊断：“检查本站页面、抓取规则和站点地图。” | `seo_site_diagnosis` → 页面体检、robots.txt、sitemap，可补查询搜索表现和关键词机会 | 页面问题证据、站点文件和已完成的检查范围 |
 | 已批准机会任务规划：显式提交已批准机会与负责人 | `TaskPlanningWorkflow` → 校验最新审批、生成 PRD 内容、原子写入任务和文档记录 | 创建草稿任务、PRD 和本地 Markdown/PDF；支持幂等重试，不自动派发或发布 |
 | 交付审核：提交交付后，按对应 PRD 检查 | [`review_delivery`](src/seo_agent/workflows/task_delivery.py) | 模型生成通过项、失败项和修改意见，再由服务校验并记录审核；通过后仍需走发布规则 |
 
@@ -78,7 +78,7 @@ flowchart TB
 | [`keyword_opportunity.py`](src/seo_agent/workflows/keyword_opportunity.py) | `seo_keyword_opportunity` | 围绕用户主题，组合联想词、候选词指标与主题 SERP |
 | [`ranking_page_optimization.py`](src/seo_agent/workflows/ranking_page_optimization.py) | `seo_ranking_page_optimization` | 从排名样本选少量站内页面，核对 HTML、代表词 SERP 和可选性能证据 |
 | [`page_change_review.py`](src/seo_agent/workflows/page_change_review.py) | `seo_page_change_review` | 为本站页面建立基线，重新读取同一页面并核对明确的验收值 |
-| [`site_diagnosis.py`](src/seo_agent/workflows/site_diagnosis.py) | `seo_site_diagnosis` | 汇总代表页面、搜索现状、可选关键词和竞品证据，形成报告 |
+| [`site_diagnosis.py`](src/seo_agent/workflows/site_diagnosis.py) | `seo_site_diagnosis` | 汇总代表页面、robots.txt、站点地图和可用搜索证据 |
 | [`opportunity_discovery.py`](src/seo_agent/workflows/opportunity_discovery.py) | `OpportunityDiscoveryWorkflow.execute` | 冻结研究证据、生成候选并校验后，原子执行既有入池和审批请求处理；仅由业务接口调用 |
 | [`task_planning.py`](src/seo_agent/workflows/task_planning.py) | `TaskPlanningWorkflow.execute` | 将已批准机会转成草稿任务与 PRD，原子记录结果并按幂等键复用回执；仅由业务接口调用 |
 | [`task_delivery.py`](src/seo_agent/workflows/task_delivery.py) | `TaskDeliveryWorkflows.generate_prd` / `review_delivery` | 已有任务 PRD 生成和交付审核流程；通过业务接口调用，不注册为只读 Chat 工具 |
@@ -90,6 +90,8 @@ seo_site_diagnosis
   ├─ seo_site_audit
   │   ├─ seo_page_metadata
   │   └─ seo_page_performance（仅用户要求性能时）
+  ├─ seo_site_resource（robots.txt）
+  ├─ seo_site_resource（sitemap XML）
   ├─ seo_search_diagnosis（依赖可用时）
   │   ├─ seo_search_metrics
   │   └─ seo_organic_keywords
@@ -102,11 +104,15 @@ seo_site_diagnosis
 
 关键词研究的 `limit` 默认 5、上限 10，主题词和联想词合并去重后受此数量限制；SERP 不会逐个核验所有候选词。综合诊断仅在提供 `query` 时研究关键词，性能和竞品步骤分别由 `include_performance`、`include_competitors` 显式开启。
 
-组合工作流只有在具备必要 live 依赖时才注册：搜索现状需要站点指标和排名关键词；关键词研究需要 SERP 及联想词或关键词指标中的至少一种；综合诊断需要页面体检及搜索现状或关键词研究中的至少一种。
+搜索现状需要站点指标和排名关键词；关键词研究需要 SERP 及联想词或关键词指标中的至少一种。综合诊断可仅用页面和站点文件完成技术检查，DataForSEO、Serper 等数据源按需配置。自然语言对话仍需要 DeepSeek。
+
+技术检查读取受检页面所在源的根路径 `/robots.txt`。站点地图优先使用用户提供的同源地址，其次用 robots.txt 中的首个同源 Sitemap 声明，最后尝试 `/sitemap.xml`。每次最多读取一个地图，展示最多 5 个同源条目；遇到 sitemap 索引只展示子地图地址。文件和页面共用请求超时与站内 URL 校验。报告展示读到的抓取指令样例。
 
 排名页优化需要排名关键词、页面元信息和 SERP 三种 live 能力。`limit` 默认读取 20 条排名样本、最多 50 条；`min_position` / `max_position` 默认 4 / 20；`max_pages` 默认 2、上限 3。相同页面去重，只取站内 HTTP(S) URL，每页查询一个代表词的 SERP；`include_performance=true` 时才检查性能。未找到匹配页只代表本次样本没有匹配，未核验页面不会被描述成已确认的优化问题。
 
-搜索、关键词和综合诊断通过 `coverage` 记录步骤成功、失败、不可用或跳过，保留已取得的证据；受检步骤未完成时返回 `workflow_status=partial`，没有任何证据时返回失败。综合报告将 robots.txt、sitemap 和 Google 收录标为 `not_implemented`；`complete` 只表示已支持的本次受检范围完成，不代表整站爬取或收录审核。页面读取不执行 JavaScript。
+报告通过 `coverage` 记录完成、失败、不可用或跳过，并保留已取得的证据。文件返回 404 或 410 时显示该地址未发现文件；HTTP 错误或 XML 无法解析时对应步骤为部分完成。Google 实际收录保持未检查。源码读取不执行 JavaScript。
+
+页面体检及综合诊断的 `findings` 使用[带 JSON Schema 的页面问题模型](src/seo_agent/workflows/page_findings.py)，记录问题码、受检 URL、观察值、来源和读取时间。前端沿用证据卡片展示。重复 Canonical 或声明 noindex 时标为待核实；HTTP 错误页的标签不作为正常页面的问题证据。
 
 ### 页面 SEO 信息建议
 
@@ -304,10 +310,16 @@ npm run dev
 
 ## 目前的边界
 
-- 综合诊断覆盖代表单页和有限搜索样本；robots.txt、sitemap、Google 收录和完整历史仍未实现。机会入池通过独立接口显式触发，完整“诊断 → 机会审批 → 执行 → 复检”仍需真实端到端验收。
+- 综合诊断覆盖代表单页、站点文件和有限搜索样本。Google 实际收录、完整搜索历史和整站抓取仍不在检查范围内。机会入池通过独立接口显式触发，完整“诊断 → 机会审批 → 执行 → 复检”仍需真实端到端验收。
 - 这是单机 MVP，SQLite 不适合多实例生产部署。[seo-audit-plugin](https://github.com/cheng-sir-0038/seo-audit-plugin) 是独立项目，本仓库尚未接入其 MCP，也不支持 GSC 或 GA4 数据源。
 
 ## 测试
+
+页面诊断回归覆盖健康页、缺 Title、重复 Canonical 和 noindex，以及 robots.txt 和 sitemap 读取。复检用例先保存缺 Title 的页面基线，确认目标未达成，再模拟同一页面的标题修复并重新核对结果。以下测试可在本地复跑，无需第三方 API Key。
+
+```bash
+.venv/bin/python -m pytest -q -s tests/seo_agent/test_lab_diagnosis.py
+```
 
 ```bash
 .venv/bin/python -m pytest \

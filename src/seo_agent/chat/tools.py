@@ -411,6 +411,8 @@ class SeoFacadeTool(AgentTool):
             return self._page_metadata_params(params)
         if self.definition.capability == Capability.PAGE_PERFORMANCE:
             return self._pagespeed_params(params)
+        if self.definition.capability == Capability.SITE_RESOURCE:
+            return params
         if self.definition.capability in {
             Capability.AUTOCOMPLETE,
             Capability.NEWS_SEARCH,
@@ -527,11 +529,21 @@ def build_seo_agent_registry(
         registry.register(KeywordOpportunityWorkflow(
             dict(tools), settings.agent_tool_timeout, observability=observability,
         ))
-    if "seo_site_audit" in tools and (
-        "seo_search_diagnosis" in registry.names() or "seo_keyword_opportunity" in registry.names()
-    ):
+    if "seo_site_audit" in tools:
+        steps = {tool.name: tool for tool in registry.values()}
+        if Capability.SITE_RESOURCE in live_capabilities:
+            resource = SeoFacadeTool(facade, site, SeoToolDefinition(
+                "seo_site_resource",
+                "读取本站 robots.txt 或 sitemap XML。",
+                Capability.SITE_RESOURCE,
+                _parameters(extra={
+                    "url": {"type": "string"},
+                    "resource_type": {"type": "string", "enum": ["robots", "sitemap"]},
+                }),
+            ))
+            steps[resource.name] = resource
         registry.register(SiteDiagnosisWorkflow(
-            {tool.name: tool for tool in registry.values()}, settings.agent_tool_timeout,
+            steps, settings.agent_tool_timeout, site_domain=str(site["domain"]),
             observability=observability,
         ))
     return registry
