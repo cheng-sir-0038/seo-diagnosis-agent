@@ -1,14 +1,19 @@
 # SEO Diagnosis Agent
 
-选一个网站，直接说你想查什么。DeepSeek 根据问题和取回的证据选择下一步工具，帮你查页面问题、研究关键词和排名页，也能生成 SEO 建议和分享图方案。
+选一个网站，直接说你想查什么。DeepSeek 根据问题和取回的证据选择下一步工具，能查页面问题、研究关键词和排名页、拟定 SEO 建议。配置 Cloudflare Workers AI 后，也能在对话里生成页面分享图。
 
 ## 一次真实对话
 
-用户请 Agent 根据页面拟定标题和结构化数据。DeepSeek 选了页面建议工作流。读完源 HTML 后，流程发现页面主体和分享图需要确认，保存证据并暂停。用户选择「先用现有信息生成」，同一次运行从检查点继续，复用已读页面，校验草稿的 JSON Schema 和引用。
+用户请 Agent 根据页面拟定标题和结构化数据。
 
-```text
-tool.completed (seo_page_suggestions) → run.waiting_for_input → input.submitted
-→ run.resumed → tool.completed (seo_page_suggestions) → run.completed
+```mermaid
+flowchart TD
+    Read["DeepSeek 选择页面建议流程<br/>Agent 读取页面源码"]
+    Pause["页面主体和分享图待确认<br/>保存已读证据，暂停运行"]
+    Choice(["用户点击「先用现有信息生成」"])
+    Resume["继续同一次运行<br/>复用已读页面证据"]
+    Draft["校验 JSON Schema 和引用<br/>返回草稿，标出待确认项"]
+    Read --> Pause --> Choice --> Resume --> Draft
 ```
 
 [人工补充与执行记录](docs/screenshots/README.md#对话与人工补充) · [完整对话截图](docs/screenshots/README.md) · [本地启动](#本地启动)
@@ -27,6 +32,7 @@ flowchart TB
     LOOP --> WF["业务工作流：页面 / 搜索 / 关键词 / 草稿"]
     LOOP --> TOOL["只读 SEO 工具"]
     WF --> TOOL
+    WF --> CF["Cloudflare Workers AI（分享图）"]
     TOOL --> DATA["Data Facade + Provider Router"]
     DATA --> EXT["页面 HTML / Serper / DataForSEO / PageSpeed"]
     LOOP <--> HARNESS["Harness：事件、检查点、恢复"]
@@ -38,7 +44,7 @@ flowchart TB
     BIZ --> RUNDB
 ```
 
-对话工具全部只读，不会修改网站、创建执行任务或发布内容。后续业务操作通过各自的接口和审批规则执行。
+对话中的站点取证只读，建议和生成图保存在本应用。创建执行任务、审批和发布走各自的业务接口。
 
 ## 业务场景与现有入口
 
@@ -48,7 +54,7 @@ flowchart TB
 | --- | --- | --- |
 | 页面体检：“检查首页 SEO，也看看性能。” | `seo_site_audit` → `seo_page_metadata`，按需调用 `seo_page_performance` | 页面元信息和可选性能证据；已封装为单页工作流 |
 | 页面信息建议：“根据这一页的内容，帮我拟定标题、描述、分享信息和结构化数据。” | `seo_page_suggestions` → 页面事实、模型草稿、引用校验、缺失信息追问 | 给出 TDK、OG、JSON-LD 建议；用户补充后沿用对话继续生成，不修改网站 |
-| 页面分享图：“根据这页内容拟一份分享图方案。” | `seo_share_image` → 读取页面文案、提取画面主体、校验原文依据 | 在对话中给出页面文案和可复制的绘图提示词 |
+| 页面分享图：“按这页内容帮我生成一张分享图。” | `seo_share_image` → 读取页面、校验主体依据、调用 Cloudflare Workers AI | 配置生图服务后在对话中直接显示图片 |
 | 搜索现状：“看看本站目前有哪些关键词和排名。” | `seo_search_diagnosis` → `seo_search_metrics` + `seo_organic_keywords` | 站点指标、有限排名样本和对应页面；已封装为工作流，不提供历史下降归因 |
 | 关键词机会：“围绕手冲咖啡，有哪些关键词值得研究？” | `seo_keyword_opportunity` → 联想词、批量关键词指标、输入主题的 SERP | 去重后的候选词和可用指标；已封装为工作流，缺失指标保持未知 |
 | 机会生成与入池：显式提交一次机会发现请求 | `OpportunityDiscoveryWorkflow` → 关键词研究、冻结快照、模型候选、证据校验、既有入池服务 | 生成至多 3 个机会并沿用原有评分和审批策略；独立业务接口触发，不是只读 Chat 工具 |
@@ -80,7 +86,7 @@ flowchart TB
 | --- | --- | --- |
 | [`site_audit.py`](src/seo_agent/workflows/site_audit.py) | `seo_site_audit` | 保留现有入口，读取单页元信息和可选 PageSpeed 数据 |
 | [`page_suggestions.py`](src/seo_agent/workflows/page_suggestions.py) | `seo_page_suggestions` | 依据页面和用户补充拟定 SEO 信息，校验引用，追问必要缺项并继续生成建议 |
-| [`share_image.py`](src/seo_agent/workflows/share_image.py) | `seo_share_image` | 根据当前页面生成分享图文案和绘图提示词，缺标题时等待补充 |
+| [`share_image.py`](src/seo_agent/workflows/share_image.py) | `seo_share_image` | 根据页面证据生成绘图指令和分享图，缺标题时等待补充 |
 | [`search_diagnosis.py`](src/seo_agent/workflows/search_diagnosis.py) | `seo_search_diagnosis` | 汇总站点指标与排名关键词，保留当前快照和来源 |
 | [`keyword_opportunity.py`](src/seo_agent/workflows/keyword_opportunity.py) | `seo_keyword_opportunity` | 围绕用户主题，组合联想词、候选词指标与主题 SERP |
 | [`ranking_page_optimization.py`](src/seo_agent/workflows/ranking_page_optimization.py) | `seo_ranking_page_optimization` | 从排名样本选少量站内页面，核对 HTML、代表词 SERP 和可选性能证据 |
@@ -135,11 +141,11 @@ seo_site_diagnosis
 
 结果始终是待人工确认的建议，不修改外部网站、Canonical、审批或发布记录。已有 JSON-LD 需人工确认合并，不能直接覆盖。运行时只做 JSON 结构与来源校验，落地前需使用 [Schema.org 验证器](https://validator.schema.org/)和适用的 [Google 富结果测试](https://search.google.com/test/rich-results)另行验证；语法通过不保证符合 Google 展示规则。站点名称不适用富结果测试，需按 [Google 站点名称规则](https://developers.google.com/search/docs/appearance/site-names)核对。[Google 不使用 Meta Keywords 参与收录和排名](https://developers.google.com/search/docs/crawling-indexing/special-tags#unsupported)，关键词仅作为主题文案建议。
 
-### 页面分享图方案
+### 页面分享图
 
-在对话中说「给这页拟一份分享图方案」即可，省略地址时取当前站点首页。工作流从页面的 `og:title`、Title、H1 中依次选取标题，描述取 `og:description` 或 Meta Description。标题都缺失时，同一次运行等待用户输入，恢复后复用页面证据。
+在对话中说「按这页内容帮我生成一张分享图」即可，省略地址时取当前站点首页。工作流从页面的 `og:title`、Title、H1 中依次选取标题，描述取 `og:description` 或 Meta Description。标题都缺失时，同一次运行等待用户输入，恢复后复用页面证据。
 
-DeepSeek 根据页面内容和当前用户要求描述主体、场景、光线与构图。代码校验 JSON Schema 和引用原文，缺少主体依据时请用户补充。对话回复提供可复制的绘图提示词，供图片生成工具使用。[真实对话](docs/screenshots/18-share-image-brief.png) · [工作流](src/seo_agent/workflows/share_image.py) · [画面格式](src/models/share_image.py) · [不同主题和缺失证据测试](tests/seo_agent/test_share_image.py)
+DeepSeek 根据页面内容和用户要求选取主体及构图。代码校验 JSON Schema 和引用原文，缺少主体依据时请用户补充。Cloudflare Workers AI 生成 1216 × 640 的图片，图片保存在 SEO 业务 SQLite 文件旁的 `*.share-images` 目录，并在对话中与页面文案一起展示。绘图提示词可在运行的模型调用记录中查看。上游失败时保留已取得的页面证据。[对话截图](docs/screenshots/18-share-image-brief.png) · [工作流](src/seo_agent/workflows/share_image.py) · [Cloudflare 接入](src/seo_agent/workflows/cloudflare_images.py) · [业务测试](tests/seo_agent/test_share_image.py)
 
 ### 机会生成与入池
 
@@ -248,6 +254,7 @@ SEO Chat 可调用 `seo_page_change_review`；需要 live 页面 HTML 能力和�
 | Serper | Google SERP、联想词、新闻、图片、视频搜索 | `SERPER_API_KEY` | 需要 Serper API 账号、有效 Key 和相应调用额度 |
 | DataForSEO | 关键词指标、自然排名、竞品、外链及 SERP | `DATAFORSEO_LOGIN`、`DATAFORSEO_API_KEY` | 分别填写 API Access 提供的 login 和 API password（API 专用密码）；还需相应端点权限及可用余额或额度 |
 | PageSpeed | 单页面 Lighthouse 实验室检查 | `PAGESPEED_API_KEY` | 本项目要求配置 PageSpeed API Key，且请求需满足对应 Google API 项目的权限、限制和配额 |
+| Cloudflare Workers AI（可选） | 用 FLUX.2 klein 4B 生成页面分享图 | `CLOUDFLARE_ACCOUNT_ID`、`CLOUDFLARE_API_TOKEN` | 同时需配置 DeepSeek。[配置步骤](#cloudflare-workers-ai-生图) |
 | Langfuse Cloud（可选） | 将模型和工具运行记录上传到项目 | `LANGFUSE_HOST`、`LANGFUSE_PUBLIC_KEY`、`LANGFUSE_SECRET_KEY` | 需要 Langfuse 项目及有写入权限的项目密钥，Host 与项目区域一致；不配置时保留本地记录 |
 
 DataForSEO 的关键词和站点指标分别使用 [Keyword Overview](https://docs.dataforseo.com/v3/dataforseo_labs-google-keyword_overview-live/) 和 [Domain Rank Overview](https://docs.dataforseo.com/v3/dataforseo_labs-google-domain_rank_overview-live/)；可按官方文档核对端点权限与返回字段。
@@ -268,6 +275,23 @@ DataForSEO Labs 不覆盖所有国家和语言，使用前需核对 `dataforseo_
 只读工具将错误码同时交给模型和运行记录，区分数据不可用、认证失败、超时和内部异常。空结果或未知异常不代表用户缺少站点授权；DataForSEO 的第三方排名查询不以连接 GSC/GA4 或绑定站点项目为前提。
 
 PageSpeed 检测可能耗时较长，启用时可将 `AGENT_TOOL_TIMEOUT` 设为 `150` 秒，让页面体检有足够时间保留检测结果；模型轮次与工具调用次数预算不随之增加。
+
+### Cloudflare Workers AI 生图
+
+Agent 读取页面，DeepSeek 根据页面内容规划画面，Cloudflare Workers AI 的 FLUX.2 klein 4B 负责出图。先配好 `DEEPSEEK_API_KEY`。[模型文档](https://developers.cloudflare.com/workers-ai/models/flux-2-klein-4b/)
+
+1. 打开 Cloudflare 控制台，进入 **Workers AI → Use REST API**，复制当前账号的 **Account ID**。
+2. 点击 **Create a Workers AI API Token**，将账号范围设为当前账号，使用已实测可生图的 `Workers AI Read` 权限。创建后复制 Token。[Cloudflare 创建步骤](https://developers.cloudflare.com/workers-ai/get-started/rest-api/)
+3. 将下面两项填入项目根目录的 `.env.local`。使用 Docker 时，通过容器环境变量传入。[Docker 配置方式](#docker-启动后端)
+
+   ```dotenv
+   CLOUDFLARE_ACCOUNT_ID=your_account_id
+   CLOUDFLARE_API_TOKEN=your_workers_ai_api_token
+   ```
+
+4. 重启后端，在对话中输入「按当前页面内容生成一张分享图」。成功后会在回复里直接看到图片和页面文案。[实际对话截图](docs/screenshots/18-share-image-brief.png)
+
+`AGENT_TOOL_TIMEOUT` 覆盖页面读取、画面规划和生图。需要为分享图留出更多时间时，可将它设为 `90` 秒。Workers AI 每天提供 10,000 Neurons 免费额度。[额度与计费](https://developers.cloudflare.com/workers-ai/platform/pricing/)
 
 ## 本地启动
 

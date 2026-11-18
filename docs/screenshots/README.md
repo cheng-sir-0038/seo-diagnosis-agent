@@ -1,6 +1,6 @@
 # 对话截图
 
-这些截图来自真实只读运行及界面回放。2026-11-18 更新的搜索现状和排名页优化使用公开站点 `python.org`，其他案例使用测试域名 `test0922.guxiguxi.com`。
+这些截图来自实际运行及界面回放。搜索现状和排名页优化使用公开站点 `python.org`，其他案例使用测试域名 `test0922.guxiguxi.com`。
 
 搜索查询采用美国市场，指标和排名样本来自第三方数据源。测试站点及部分主题词缺少的数据保留为未知。页面建议待人工确认，截图已遮住内部运行标识。
 
@@ -14,7 +14,7 @@
 | 已有排名页优化 | [排名样本与页面核验](05-ranking-pages.png) | [ranking_page_optimization.py](../../src/seo_agent/workflows/ranking_page_optimization.py) |
 | 综合诊断 | [汇总证据与覆盖范围](06-site-diagnosis.png) | [site_diagnosis.py](../../src/seo_agent/workflows/site_diagnosis.py) |
 | 页面信息建议 | [TDK 与 OG](07-page-suggestions.png)、[JSON-LD 与待确认项](15-structured-data.png) | [page_suggestions.py](../../src/seo_agent/workflows/page_suggestions.py) |
-| 分享图方案 | [对话中的绘图提示词](18-share-image-brief.png) | [share_image.py](../../src/seo_agent/workflows/share_image.py) |
+| 页面分享图 | [对话中的生成图片与页面文案](18-share-image-brief.png) | [share_image.py](../../src/seo_agent/workflows/share_image.py) |
 | 页面变更复检 | [保存基线](09-page-review-baseline.png)、[按目标复检](10-page-change-review.png) | [page_change_review.py](../../src/seo_agent/workflows/page_change_review.py) |
 
 <details>
