@@ -30,7 +30,12 @@ from typing import Any
 from loguru import logger
 
 from src.core.config import settings
-from src.core.exceptions import InternalDataNotAvailableError, InternalProviderResponseError
+from src.core.exceptions import (
+    ErrorCode,
+    InternalAdapterError,
+    InternalDataNotAvailableError,
+    InternalProviderResponseError,
+)
 from src.models.backlink import Backlink, BrokenBacklink, RefDomain
 from src.models.common import (
     Capability,
@@ -66,7 +71,7 @@ class DataForSEOProvider(BaseProvider):
     @property
     def runtime_mode(self) -> ProviderMode:
         client = getattr(self, "client", None)
-        return "live" if client is not None and client._session is not None else "pseudo"
+        return "live" if getattr(client, "_session", None) is not None else "pseudo"
 
     @property
     def routing_profile(self) -> ProviderProfile:
@@ -202,6 +207,60 @@ class DataForSEOProvider(BaseProvider):
             )
         return result
 
+    async def _labs_market(self, country: str, language: str) -> dict[str, str | int]:
+        if self.runtime_mode == "pseudo":
+            return {
+                "location_name": _country_to_name(country),
+                "language_code": _language_code(language),
+            }
+
+        raw = await self.client.request("locations_and_languages")
+        markets = {
+            row["country_iso_code"]: row
+            for row in self._extract_result(raw)
+            if _mapping(row).get("country_iso_code")
+        }
+        if not markets:
+            raise InternalProviderResponseError(
+                "DataForSEO Labs 市场目录为空", provider="dataforseo",
+            )
+
+        country_code = country.strip().upper()
+        market = markets.get(country_code)
+        if market is None:
+            raise InternalAdapterError(
+                f"DataForSEO Labs 不覆盖 {country_code} 市场。",
+                error_code=ErrorCode.INVALID_PARAMS, provider="dataforseo",
+            )
+
+        location_code = market.get("location_code")
+        available = market.get("available_languages")
+        if not isinstance(location_code, int) or not isinstance(available, list):
+            raise InternalProviderResponseError(
+                "DataForSEO Labs 市场目录格式异常", provider="dataforseo",
+            )
+
+        languages = {
+            item["language_code"].casefold(): item["language_code"]
+            for item in available
+            if isinstance(_mapping(item).get("language_code"), str)
+            and "google" in (item.get("available_sources") or [])
+        }
+        requested = language.strip().replace("_", "-").casefold()
+        selected = languages.get(requested) or languages.get(requested.split("-", 1)[0])
+        if selected is None and "-" not in requested:
+            variants = [code for key, code in languages.items() if key.startswith(f"{requested}-")]
+            if len(variants) == 1:
+                selected = variants[0]
+        if selected is None:
+            supported = ", ".join(sorted(languages.values())) or "无"
+            raise InternalAdapterError(
+                f"DataForSEO Labs 不支持 {country_code} 市场的 {language}。"
+                f"可用语言为 {supported}。",
+                error_code=ErrorCode.INVALID_PARAMS, provider="dataforseo",
+            )
+        return {"location_code": location_code, "language_code": selected}
+
     # ============================================================
     # 搜索表现 — SEARCH_METRICS / ORGANIC_KEYWORDS
     # ============================================================
@@ -214,12 +273,12 @@ class DataForSEOProvider(BaseProvider):
         使用域名总览端点，并校验响应 target；没有本站指标时明确报错。
         """
         limit = self._resolve_limit(kwargs.get("limit"))
+        market = await self._labs_market(country, str(kwargs.get("language") or "en"))
         raw = await self.client.request(
             "domain_rank_overview",
             task_body={
                 "target": site_id,
-                "location_name": _country_to_name(country),
-                "language_code": _language_code(str(kwargs.get("language") or "en")),
+                **market,
                 "limit": limit,
             },
         )
@@ -286,12 +345,13 @@ class DataForSEOProvider(BaseProvider):
         嵌套契约，并兼容项目历史伪响应的扁平结构。
         """
         limit = self._resolve_limit(limit)
+        market = await self._labs_market(country, str(kwargs.get("language") or "en"))
         raw = await self.client.request(
             "ranked_keywords",
             task_body={
                 "target": site_id,
-                "location_name": _country_to_name(country),
-                "language_code": _language_code(str(kwargs.get("language") or "en")),
+                **market,
+                "item_types": ["organic"],
                 "limit": min(limit, 1000),
             },
             max_pages=(limit // 100) + 1 if limit > 100 else 1,
@@ -350,6 +410,7 @@ class DataForSEOProvider(BaseProvider):
             for word in keywords
         ):
             raise ValueError("需要 1-50 个非空关键词，每个最多 80 个字符、10 个词")
+        market = await self._labs_market(country, str(kwargs.get("language") or "en"))
         all_items = []
         batch_size = 20
 
@@ -359,8 +420,7 @@ class DataForSEOProvider(BaseProvider):
                 "keyword_overview",
                 task_body={
                     "keywords": batch,
-                    "location_name": _country_to_name(country),
-                    "language_code": _language_code(str(kwargs.get("language") or "en")),
+                    **market,
                     "include_serp_info": False,
                 },
             )
@@ -614,12 +674,12 @@ class DataForSEOProvider(BaseProvider):
         返回的 items 第一个是目标自身，需跳过。
         """
         limit = self._resolve_limit(limit)
+        market = await self._labs_market(country, str(kwargs.get("language") or "en"))
         raw = await self.client.request(
             "competitors_domain",
             task_body={
                 "target": site_id,
-                "location_name": _country_to_name(country),
-                "language_code": _language_code(str(kwargs.get("language") or "en")),
+                **market,
                 "include_clickstream_data": False,
                 "limit": limit,
             },

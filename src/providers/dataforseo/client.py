@@ -4,7 +4,7 @@ DataForSEO API v3 异步客户端
 职责:
   1. 管理 aiohttp session 生命周期
   2. HTTP Basic Auth 认证（login:api_key → Base64）
-  3. 发送 POST JSON Array 请求（DataForSEO 统一请求格式）
+  3. 发送 POST JSON Array 或 GET 目录请求
   4. 速率限制控制（Semaphore）
   5. 指数退避重试（429 / 5xx）
   6. 异步任务轮询（非 live 端点）
@@ -14,7 +14,7 @@ DataForSEO API v3 异步客户端
 
 与 AhrefsClient 的关键差异:
   - 认证: Basic Auth vs Bearer Token
-  - 请求: 全部 POST JSON Array vs GET/POST 混合
+  - 请求: 数据任务使用 POST JSON Array
   - 响应: {tasks: [{result: [...]}]} vs 直接的 dict
   - 任务: 非 live 端点需 POST → 轮询 → 获取结果
 
@@ -148,9 +148,7 @@ class DataForSEOClient:
             request()
               ├── _check_cache()           ← 检查本地短期缓存
               ├── _acquire_rate_limit()    ← 等待速率令牌
-              ├── _do_request()            ← POST JSON Array（含重试）
-              │     ├── _build_task_array()
-              │     ├── HTTP POST
+              ├── _do_request()            ← HTTP 请求（含重试）
               │     ├── _handle_response()
               │     ├── _track_cost()
               │     └── _poll_task()        ← 非 live 端点轮询
@@ -320,11 +318,7 @@ class DataForSEOClient:
         endpoint: DataForSEOEndpoint,
         task_body: dict,
     ) -> dict[str, Any]:
-        """执行单次 POST JSON Array 请求。
-
-        DataForSEO v3 统一请求格式:
-          POST {base_url}{path}
-          Body: [task_body]
+        """执行单次数据或目录请求。
 
         伪代码模式:
           当 self._session 为 None（未配置 API 凭证）时，
@@ -343,14 +337,17 @@ class DataForSEOClient:
 
         # ---- 真实请求模式 ----
         url = f"{self.config.api_base_url}{endpoint.path}"
-        task_array = self._build_task_array(task_body)
 
         logger.debug(
-            f"DataForSEO POST {endpoint.path} | body_keys={list(task_body.keys())}"
+            f"DataForSEO {endpoint.method} {endpoint.path} | body_keys={list(task_body.keys())}"
         )
 
         try:
-            async with self._session.post(url, json=task_array) as resp:
+            request = (
+                self._session.get(url) if endpoint.method == "GET"
+                else self._session.post(url, json=self._build_task_array(task_body))
+            )
+            async with request as resp:
                 data = await self._handle_response(resp, endpoint)
         except InternalAdapterError:
             raise

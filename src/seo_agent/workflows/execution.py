@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from src.agent.observability import run_observed_tool
 from src.agent.tools.base import ToolProtocol, ToolResult, ToolRuntimeContext
-from src.core.exceptions import InternalAdapterError
+from src.core.exceptions import ErrorCode, InternalAdapterError
 from src.observability.client import ObservabilityClient
 from src.seo_presentation.contracts import base_contract, build_provenance
 
@@ -80,6 +80,8 @@ class WorkflowSteps:
             return None
         except InternalAdapterError as exc:
             step.update(status="failed", error_code=exc.error_code.value)
+            if exc.error_code == ErrorCode.INVALID_PARAMS:
+                step["reason"] = exc.message
             return None
         except ValueError:
             step.update(status="failed", error_code="INVALID_ARGUMENT")

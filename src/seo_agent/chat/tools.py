@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Protocol
 from urllib.parse import urlparse
@@ -43,7 +44,10 @@ _COMMON_PROPERTIES = {
         "type": "string",
         "description": "ISO 3166-1 两位国家代码。未提供时使用站点默认国家。",
     },
-    "language": {"type": "string", "description": "语言代码；未提供时使用站点默认语言。"},
+    "language": {
+        "type": "string",
+        "description": "语言代码，可带地区，例如 zh-CN 或 zh-TW。未提供时使用站点默认语言。",
+    },
     "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
     "force_refresh": {"type": "boolean", "default": False},
 }
@@ -65,7 +69,7 @@ def _parameters(
 SEO_TOOL_DEFINITIONS = (
     SeoToolDefinition(
         "seo_search_metrics",
-        "读取当前站点的自然搜索总览指标。适合先判断流量、关键词数量和排名覆盖是否异常。",
+        "读取站点级自然流量估算、关键词总量和排名分布。该工具不提供逐条排名关键词和页面样本。",
         Capability.SEARCH_METRICS,
         _parameters(),
         "chart",
@@ -280,9 +284,12 @@ SEO_TOOL_DEFINITIONS = (
     ),
     SeoToolDefinition(
         "seo_organic_keywords",
-        "读取站点当前自然关键词及排名、流量等字段。",
+        "读取所选市场的自然排名关键词样本，以及数据源返回的位次和对应页面。空列表表示本次未取得样本。",
         Capability.ORGANIC_KEYWORDS,
-        _parameters(),
+        _parameters(extra={"limit": {
+            "type": "integer", "minimum": 1, "maximum": 100,
+            "description": "最多返回的样本数。用户明确要求几条时，传入该数量。",
+        }}),
         "table",
     ),
     SeoToolDefinition(
@@ -480,6 +487,27 @@ class SeoFacadeTool(AgentTool):
         }
 
 
+def _asks_only_for_organic_keyword_samples(message: str) -> bool:
+    # shortcut: Match clear list requests, extend only with observed examples.
+    ranked_keywords = re.search(
+        r"自然(?:搜索)?(?:排名)?(?:的)?(?:关键词|排名词)|"
+        r"\borganic(?: search)?(?: ranking)? keywords?\b",
+        message, re.IGNORECASE,
+    )
+    asks_for_list = re.search(
+        r"哪些|列出|列举|清单|列表|样本|几个|几条|\b(?:list|which|samples?|examples?)\b",
+        message, re.IGNORECASE,
+    )
+    wider_scope = re.search(
+        r"总量|总数|数量|多少|流量|分布|指标|概况|现状|表现|总览|整体|综合|趋势|历史|变化|"
+        r"对比|诊断|体检|优化|机会|竞品|抓取|站点地图|收录|"
+        r"\b(?:totals?|how many|traffic|distribution|metrics|overview|trends?|history|"
+        r"compar\w+|audit|diagnos\w+|competit\w+|optimi\w+|sitemap|indexing)\b",
+        message, re.IGNORECASE,
+    )
+    return ranked_keywords is not None and asks_for_list is not None and wider_scope is None
+
+
 def build_seo_agent_registry(
     facade: FacadeProtocol, site: dict[str, Any], *,
     observability: ObservabilityClient | None = None,
@@ -489,6 +517,12 @@ def build_seo_agent_registry(
     image_generator: CloudflareShareImages | None = None,
 ) -> ToolRegistry:
     live_capabilities = facade.live_capabilities()
+    if (
+        Capability.ORGANIC_KEYWORDS in live_capabilities
+        and user_messages
+        and _asks_only_for_organic_keyword_samples(user_messages[-1])
+    ):
+        live_capabilities = live_capabilities - {Capability.SEARCH_METRICS}
     registry = ToolRegistry(
         [
             SeoFacadeTool(facade, site, definition)

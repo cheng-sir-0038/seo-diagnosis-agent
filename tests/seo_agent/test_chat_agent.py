@@ -169,6 +169,8 @@ def test_seo_system_prompt_contains_site_context_and_autonomous_tool_rules() -> 
     assert "有哪些、是谁、名单或排名" in prompt
     assert "不要在正文中再生成表格、数据摘要或完整明细" in prompt
     assert "seo_search_metrics" in prompt
+    assert "排名样本为空时，直接说明本次在所查市场未取得样本" in prompt
+    assert "需要综合查看站点汇总和排名词时" in prompt
     assert "AUTH_FAILED" in prompt
     assert "不得要求用户为每个域名重新授权或绑定项目" in prompt
     assert "只读查询不需要重复索要批准" in prompt
@@ -224,6 +226,33 @@ def test_registry_only_exposes_live_capabilities() -> None:
     assert "seo_search_history" not in names
     assert "seo_audit_issues" not in names
     assert "seo_top_pages" not in names
+
+
+@pytest.mark.parametrize(
+    ("question", "include_site_metrics"),
+    [
+        ("查一下本站在美国市场当前有哪些自然排名关键词，给我几个实际样本。", False),
+        ("列出本站有自然排名的关键词样本，带上各自位次和落地页。", False),
+        ("List a few organic ranking keywords and their positions.", False),
+        ("列出几个自然排名关键词，再给我关键词总量和排名分布。", True),
+        ("查一下本站的自然流量估算。", True),
+        ("给本站做一次综合诊断，看看有哪些自然排名关键词。", True),
+    ],
+)
+def test_registry_keeps_site_metrics_for_questions_that_may_need_them(
+    question: str, include_site_metrics: bool,
+) -> None:
+    facade = FakeFacade({
+        Capability.ORGANIC_KEYWORDS, Capability.SEARCH_METRICS, Capability.PAGE_METADATA,
+    })
+    registry = build_seo_agent_registry(
+        facade, SITE, user_messages=["先看本站自然流量", question],
+    )
+    assert "seo_organic_keywords" in registry.names()
+    assert ("seo_search_metrics" in registry.names()) is include_site_metrics
+    assert ("seo_search_diagnosis" in registry.names()) is include_site_metrics
+    site_diagnosis = registry.get("seo_site_diagnosis")
+    assert ("seo_search_diagnosis" in site_diagnosis.tools) is include_site_metrics
 
 
 @pytest.mark.asyncio

@@ -448,6 +448,7 @@ class DataFacade:
             return await provider.get_search_metrics(
                 site_id=site_id,
                 country=country,
+                language=language,
                 limit=limit,
                 **params,
             )
@@ -464,6 +465,7 @@ class DataFacade:
             return await provider.get_organic_keywords(
                 site_id=site_id,
                 country=country,
+                language=language,
                 limit=provider_limit,
                 **params,
             )
@@ -519,6 +521,7 @@ class DataFacade:
             return await provider.get_keyword_overview(
                 keywords=keywords,
                 country=country,
+                language=language,
                 **params,
             )
 
@@ -610,6 +613,7 @@ class DataFacade:
             return await provider.get_organic_competitors(
                 site_id=site_id,
                 country=country,
+                language=language,
                 limit=limit,
                 **params,
             )

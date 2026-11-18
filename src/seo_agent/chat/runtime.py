@@ -43,6 +43,8 @@ def build_seo_system_prompt(site: dict[str, Any], tool_schemas: list[dict[str, A
    不得把未知错误猜成授权过期，也不得要求用户为每个域名重新授权或绑定项目。
    已配置数据源的只读查询不需要重复索要批准。没有可用 GSC/GA4 工具时，不得要求连接它们
    作为第三方排名查询的前置条件，也不能承诺用户授权后当前项目就能查询这些第一方数据。
+   如果数据源明确提示市场或语言不受支持，直接说明所查组合和覆盖限制。保留已取得的其他证据，
+   等用户指定新的组合再查询，避免重试同一组合或猜测其他市场有数据。
 9. 不要使用 Markdown 代码块、ASCII 字符条、文本进度条或手工空格来绘制图表；
    前端会自动展示结构化工具结果。
 10. 生成最终回答时，第一段直接回答用户原问题，不要先输出通用 SEO 报告模板。
@@ -95,7 +97,12 @@ def build_seo_system_prompt(site: dict[str, Any], tool_schemas: list[dict[str, A
     可能是正常归一；没有明确的站点主地址要求时，不要建议更改现有配置。
 33. 仅从可用工具列表选择工具。用户要求站点综合诊断、抓取规则或站点地图且工具可用时，
     调用 seo_site_diagnosis；单页面问题仍使用页面工具。仅在用户提供地址时指定 sitemap_url。
-    seo_search_diagnosis 用于搜索现状，seo_keyword_opportunity 用于主题词机会研究。
+    用户只问当前有哪些自然排名关键词，或要这些词的位次和对应页面时，调用 seo_organic_keywords。
+    用户指定样本数量时，将该数量传给 limit，只取回答所需的样本。
+    排名样本为空时，直接说明本次在所查市场未取得样本，结束本次查询。不要据此断言本站没有排名，
+    也不要主动建议切换市场或用站点汇总补关键词清单。
+    seo_search_metrics 用于站点级流量估算、关键词总量和排名分布。需要综合查看站点汇总和排名词时
+    使用 seo_search_diagnosis。seo_keyword_opportunity 用于主题词机会研究。
     仅在用户明确要求时开启 include_performance、include_competitors；研究主题来自用户，不能捏造。
 34. workflow 的 complete 仅表示已支持的受检步骤完成。逐项读取 coverage 与 evidence，
     不得把 skipped、unavailable、not_implemented 解释为检查通过，或宣称全站已审计。

@@ -64,18 +64,20 @@ class DataForSEOConfig:
 class DataForSEOEndpoint:
     """单个 API 端点的定义。
 
-    所有 DataForSEO v3 端点为 POST，body 为 JSON array of task objects。
+    数据端点默认用 POST JSON 数组，辅助目录可用 GET。
 
     Attributes:
         path: API 路径（相对于 api_base_url/v3/）。
         description: 端点简短描述。
         is_live: 是否为 live 端点（同步返回结果，无需轮询）。
         estimated_cost: 估计单次调用消耗（美元）。
+        method: HTTP 方法，默认为 POST。
     """
     path: str = ""
     description: str = ""
     is_live: bool = True  # live 端点直接返回结果
     estimated_cost: float = 0.01
+    method: str = "POST"
 
 
 ENDPOINTS: dict[str, DataForSEOEndpoint] = {
@@ -185,7 +187,7 @@ ENDPOINTS: dict[str, DataForSEOEndpoint] = {
     "locations_and_languages": DataForSEOEndpoint(
         path="/v3/dataforseo_labs/locations_and_languages",
         description="获取可用位置和语言列表（免费、用于参数映射）",
-        is_live=False,
         estimated_cost=0.0,
+        method="GET",
     ),
 }

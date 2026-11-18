@@ -55,7 +55,7 @@ flowchart TB
 | 页面体检：“客户从搜索点进首页，能看懂我们提供什么吗？帮我找出最值得先改的地方。” | `seo_site_audit` → `seo_page_metadata`，按需调用 `seo_page_performance` | 页面证据和优先建议。需要检查速度时可加上移动端性能数据 |
 | 页面信息建议：“根据这一页的内容，帮我拟定标题、描述、分享信息和结构化数据。” | `seo_page_suggestions` → 页面事实、模型草稿、引用校验、缺失信息追问 | 给出 TDK、OG、JSON-LD 建议；用户补充后沿用对话继续生成，不修改网站 |
 | 页面分享图：“按这页内容帮我生成一张分享图。” | `seo_share_image` → 读取页面、校验主体依据、调用 Cloudflare Workers AI | 配置生图服务后在对话中直接显示图片 |
-| 搜索现状：“看看本站目前有哪些关键词和排名。” | `seo_search_diagnosis` → `seo_search_metrics` + `seo_organic_keywords` | 站点指标、有限排名样本和对应页面；已封装为工作流，不提供历史下降归因 |
+| 搜索现状：“看看本站的自然流量估算、排名分布和代表关键词。” | `seo_search_diagnosis` → `seo_search_metrics` + `seo_organic_keywords` | 站点指标、有限排名样本和对应页面；只查排名词时使用关键词查询，样本为空时说明数据缺口 |
 | 关键词机会：“围绕手冲咖啡，有哪些关键词值得研究？” | `seo_keyword_opportunity` → 联想词、批量关键词指标、输入主题的 SERP | 去重后的候选词和可用指标；已封装为工作流，缺失指标保持未知 |
 | 机会生成与入池：显式提交一次机会发现请求 | `OpportunityDiscoveryWorkflow` → 关键词研究、冻结快照、模型候选、证据校验、既有入池服务 | 生成至多 3 个机会并沿用原有评分和审批策略；独立业务接口触发，不是只读 Chat 工具 |
 | 已有排名页优化：“哪些已有排名的页面值得进一步检查？” | `seo_ranking_page_optimization` → 排名样本、少量站内 HTML、每页一个代表词 SERP | 默认调查第 4–20 名样本中的 2 个站内页面，输出实际标签、搜索证据和待核实项；不修改页面 |
@@ -261,7 +261,7 @@ SEO Chat 可调用 `seo_page_change_review`；需要 live 页面 HTML 能力和�
 
 DataForSEO 的关键词和站点指标分别使用 [Keyword Overview](https://docs.dataforseo.com/v3/dataforseo_labs-google-keyword_overview-live/) 和 [Domain Rank Overview](https://docs.dataforseo.com/v3/dataforseo_labs-google-domain_rank_overview-live/)；可按官方文档核对端点权限与返回字段。
 
-DataForSEO Labs 不覆盖所有国家和语言，使用前需核对 `dataforseo_labs/locations_and_languages` 的可用组合。不支持的市场会导致对应步骤失败，工作流保留其他可用证据，不自动改换市场；接口报错不能当作零搜索量或没有排名。
+自然排名、站点指标、关键词指标和竞品查询会根据 [DataForSEO Labs 市场和语言目录](https://docs.dataforseo.com/v3/dataforseo_labs/locations_and_languages/) 校验查询范围。支持的组合使用目录中的市场编号和语言代码。不支持的组合会在发起付费查询前提示覆盖范围，工作流保留其余证据。有效组合返回空样本时，结论限定在本次查询的数据范围内。
 
 业务通知与发布还有各自的配置前提：
 
