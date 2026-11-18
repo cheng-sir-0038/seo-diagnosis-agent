@@ -57,20 +57,23 @@ function visibleEvidence(tools?: ToolRun[]): ToolRun[] {
 export function InlineToolResults({ tools }: { tools?: ToolRun[] }) {
   const visible = visibleEvidence(tools)
   if (visible.length === 0) return null
+  const onlyShareImages = visible.every(tool => tool.name === 'seo_share_image')
 
   return (
-    <section className="inline-tool-results" aria-label="数据证据">
-      <header className="inline-tool-results-title">
-        <span className="inline-tool-results-icon" aria-hidden="true"><DatabaseOutlined /></span>
-        <div>
-          <strong>数据证据</strong>
-          <span>页面事实和查询结果保留来源；优化建议是待人工确认的草稿。</span>
-        </div>
-      </header>
+    <section className="inline-tool-results" aria-label={onlyShareImages ? '生成的分享图' : '数据证据'}>
+      {!onlyShareImages ? (
+        <header className="inline-tool-results-title">
+          <span className="inline-tool-results-icon" aria-hidden="true"><DatabaseOutlined /></span>
+          <div>
+            <strong>数据证据</strong>
+            <span>页面事实和查询结果保留来源；优化建议是待人工确认的草稿。</span>
+          </div>
+        </header>
+      ) : null}
       <div className="inline-tool-results-list">
         {visible.map((tool) => {
           const presentation = unwrapToolResult(tool.result)
-          const selfContained = isSeoSearchOverviewResultData(presentation)
+          const selfContained = tool.name === 'seo_share_image' || isSeoSearchOverviewResultData(presentation)
           const title = isPresentationBase(presentation)
             ? resolveLocalizedText(presentation.title, '查询结果')
             : '查询结果'

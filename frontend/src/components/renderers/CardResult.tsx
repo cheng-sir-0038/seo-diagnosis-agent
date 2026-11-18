@@ -1,5 +1,6 @@
 import { Empty } from 'antd'
 
+import { agentApiUrl } from '../../services/agentApi'
 import type { CardResultData } from './contracts'
 
 interface CardResultProps {
@@ -29,7 +30,11 @@ export function CardResult({ data }: CardResultProps) {
       {data.items.map((item) => (
         <article className={`tool-card-item${item.image_url ? '' : ' no-image'}`} key={item.key}>
           {item.image_url ? (
-            <img src={item.image_url} alt={item.title} loading="lazy" />
+            <img
+              src={data.variant === 'share-image' ? agentApiUrl(item.image_url) : item.image_url}
+              alt={item.title}
+              loading="lazy"
+            />
           ) : null}
           <div className="tool-card-body">
             <h4>

@@ -8,13 +8,15 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from src.agent.models import HumanInputRequest
-from src.agent.tools.base import AgentTool, ToolProtocol, ToolResult, ToolRuntimeContext
+from src.agent.tools.base import AgentTool, RenderHint, ToolProtocol, ToolResult, ToolRuntimeContext
+from src.core.exceptions import ErrorCode, InternalAdapterError
 from src.models.common import DataSource
 from src.models.page_metadata import PageMetadataReport
 from src.models.share_image import ShareImageBrief
 from src.observability.client import ObservabilityClient
 from src.observability.instrumentation import observed_operation
-from src.observability.models import SpanKind
+from src.observability.models import SpanKind, Status
+from src.seo_agent.workflows.cloudflare_images import MODEL, CloudflareShareImages, ShareImageAsset
 from src.seo_agent.workflows.execution import WorkflowSteps
 from src.seo_agent.workflows.structured_model import StructuredModelRunner
 
@@ -30,8 +32,8 @@ class ShareImageArguments(BaseModel):
 class ShareImageDraft(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    width: Literal[1200] = 1200
-    height: Literal[630] = 630
+    width: Literal[1216] = 1216
+    height: Literal[640] = 640
     host: str = Field(min_length=1, max_length=253)
     title: str = Field(min_length=1, max_length=160)
     description: str | None = Field(default=None, min_length=1, max_length=240)
@@ -48,7 +50,7 @@ def _first_text(*candidates: tuple[str, str | None], limit: int) -> tuple[str, s
 class ShareImageWorkflow(AgentTool):
     name = "seo_share_image"
     description = (
-        "为本站页面拟定分享图方案。根据页面内容提供文案和可直接复制的绘图提示词。"
+        "为本站页面生成分享图。根据页面内容选取文案和画面主体，配置生图服务时返回实际图片。"
         "页面缺少标题时请用户补充。"
     )
     parameters_schema = ShareImageArguments.model_json_schema()
@@ -58,10 +60,15 @@ class ShareImageWorkflow(AgentTool):
         observability: ObservabilityClient | None = None,
         model_runner: StructuredModelRunner | None = None,
         user_messages: list[str] | None = None,
+        image_generator: CloudflareShareImages | None = None,
     ) -> None:
         self.page, self.timeout, self.observability = page, timeout, observability
         self.model_runner = model_runner
         self.user_request = user_messages[-1][:1500] if user_messages else ""
+        self.image_generator = image_generator
+
+    def resolve_render_hint(self, result_payload: dict[str, Any]) -> RenderHint | None:
+        return "cards" if result_payload["data"].get("image_status") == "ready" else None
 
     async def execute(
         self, arguments: dict[str, Any], runtime: ToolRuntimeContext | None = None
@@ -85,7 +92,7 @@ class ShareImageWorkflow(AgentTool):
             )
             user_title = None
 
-        limitations = ["产出为分享图文案和绘图提示词，供后续绘图使用。"]
+        limitations = ["分享图由当前应用保存，供人工预览。"]
         try:
             page = PageMetadataReport.model_validate((payload or {}).get("raw", {}).get("data"))
             url = urlparse(page.final_url)
@@ -102,7 +109,7 @@ class ShareImageWorkflow(AgentTool):
             return steps.finish("share_image", "页面分享图", [{
                 "key": "page", "title": "未取得完整页面",
                 "summary": "请提供当前站点内可公开访问的页面地址。",
-            }], limitations)
+            }], limitations, image_status="not_generated")
 
         title_source, title = _first_text(
             ("og:title", page.og_title), ("Title", page.title),
@@ -114,7 +121,7 @@ class ShareImageWorkflow(AgentTool):
             result = steps.finish("share_image", "页面分享图", [{
                 "key": "title", "title": "页面缺少图片标题", "url": page.final_url,
                 "summary": question,
-            }], limitations)
+            }], limitations, image_status="not_generated")
             result.metadata["human_input"] = HumanInputRequest(
                 questions=[question],
             ).model_dump(mode="json")
@@ -124,7 +131,7 @@ class ShareImageWorkflow(AgentTool):
             ("og:description", page.og_description),
             ("Meta Description", page.meta_description), limit=240,
         )
-        visual_status, visual_card = await self._visual_brief(
+        visual_status, prompt = await self._visual_brief(
             steps, page.final_url,
             {
                 "title": title,
@@ -143,26 +150,28 @@ class ShareImageWorkflow(AgentTool):
         ) as span:
             draft = ShareImageDraft(
                 host=url.hostname, title=title, description=description,
-            ).model_dump(mode="json")
+            )
             if span:
-                span.output_data = draft
+                span.output_data = draft.model_dump(mode="json")
         steps.coverage["compose"] = {"status": "complete"}
+        image_status, asset = await self._generate(steps, prompt, draft)
         metadata = [{"label": "标题来源", "value": title_source}]
         if description_source:
             metadata.append({"label": "描述来源", "value": description_source})
-        items = [{
-            "key": "image", "title": "分享图文案", "url": page.final_url,
-            "share_image": draft, "metadata": metadata,
-        }]
-        if visual_card is not None:
-            items.append(visual_card)
+        card = {
+            "key": "image", "title": title, "summary": description, "url": page.final_url,
+            "share_image": draft.model_dump(mode="json"), "metadata": metadata,
+        }
+        if asset is not None:
+            card["image_url"] = asset["image_url"]
         return steps.finish(
-            "share_image", "页面分享图方案", items, limitations, visual_status=visual_status,
+            "share_image", "页面分享图", [card], limitations, variant="share-image",
+            visual_status=visual_status, image_status=image_status,
         )
 
     async def _visual_brief(
         self, steps: WorkflowSteps, url: str, evidence: dict[str, str],
-    ) -> tuple[str, dict[str, Any] | None]:
+    ) -> tuple[str, str | None]:
         if self.model_runner is None:
             return "not_configured", None
         step = steps.coverage["visual"] = {"status": "failed"}
@@ -177,26 +186,67 @@ class ShareImageWorkflow(AgentTool):
                     business_object={"url": url},
                 )
         except Exception:
-            return "unavailable", {
-                "key": "visual", "title": "绘图提示词暂未生成",
-                "summary": "页面证据已保留，可以稍后重试。",
-            }
+            return "unavailable", None
         visual = result.output.visual
         sources = [*evidence.values(), self.user_request]
         if visual is None or not any(visual.evidence_quote in source for source in sources):
             step["status"] = "needs_subject"
-            return "needs_subject", {
-                "key": "visual", "title": "需要确认画面主体",
-                "summary": "你希望主图里出现什么？",
-            }
+            return "needs_subject", None
         step["status"] = "complete"
-        return "ready", {
-            "key": "visual", "title": "主图提示词",
-            "summary": f"主题依据「{visual.evidence_quote}」",
-            "code": (
-                "为网站分享卡片制作一张主图。\n"
-                f"画面主体是{visual.subject}。场景为{visual.scene}。\n"
-                f"色调和光线采用{visual.tone}。构图为{visual.composition}。\n"
-                f"避开{visual.avoid}。画面只保留图像，由卡片单独排版文字。"
-            ),
-        }
+        return "ready", (
+            "Create a landscape editorial image for a website share card. "
+            "Keep the subject's stated color, material and transparency accurate.\n"
+            f"Focal subject: {visual.subject}. Scene: {visual.scene}.\n"
+            f"Composition: {visual.composition}.\n"
+            f"Ambient palette and lighting: {visual.tone}. Apply the palette to the surroundings. "
+            "Keep the subject's own colors distinct from the ambient palette.\n"
+            f"Avoid: {visual.avoid}. Render the scene without lettering or logos."
+        )
+
+    async def _generate(
+        self, steps: WorkflowSteps, prompt: str | None, draft: ShareImageDraft,
+    ) -> tuple[str, ShareImageAsset | None]:
+        generator = self.image_generator
+        if generator is None or not generator.configured:
+            steps.coverage["image"] = {"status": "unavailable", "error_code": "NOT_CONFIGURED"}
+            return "not_configured", None
+        if prompt is None:
+            steps.coverage["image"] = {"status": "unavailable", "error_code": "NO_VISUAL_BRIEF"}
+            return "not_generated", None
+
+        dimensions = {"width": draft.width, "height": draft.height}
+        input_data = {"prompt": prompt, **dimensions}
+        component = "cloudflare_workers_ai"
+        async with observed_operation(
+            self.observability, "generate_share_image", kind=SpanKind.MODEL,
+            component_name=component, input_data={"model": MODEL, **dimensions},
+        ) as span:
+            model_call = {
+                "provider": component, "model": MODEL, "operation": "cloudflare_image_generate",
+                "input_summary": input_data,
+            }
+            started = time.monotonic()
+            try:
+                async with asyncio.timeout(max(0, steps.deadline - started)):
+                    asset = await generator.generate(prompt, **dimensions)
+            except (InternalAdapterError, TimeoutError) as exc:
+                code = (
+                    exc.error_code if isinstance(exc, InternalAdapterError)
+                    else ErrorCode.UPSTREAM_TIMEOUT
+                )
+                steps.coverage["image"] = {"status": "failed", "error_code": code.value}
+                if span:
+                    await span.model_call(
+                        **model_call, status=Status.FAILED, error_code=code.value,
+                        latency_ms=round((time.monotonic() - started) * 1000, 3),
+                    )
+                    await span.capture_exception(exc, error_code=code.value)
+                return "failed", None
+            if span:
+                span.output_data = asset
+                await span.model_call(
+                    **model_call, output_summary=asset,
+                    latency_ms=round((time.monotonic() - started) * 1000, 3),
+                )
+        steps.coverage["image"] = {"status": "complete", "model": MODEL}
+        return "ready", asset

@@ -3,6 +3,10 @@ import type { AgentEvent, AgentTaskStatusGroup, AgentTaskSummary, ChatMessage } 
 const API_BASE = import.meta.env.VITE_API_BASE ?? ''
 const TERMINAL_EVENTS = new Set<AgentEvent['type']>(['run.completed', 'run.failed', 'run.cancelled', 'run.waiting_for_input'])
 
+export function agentApiUrl(path: string): string {
+  return `${API_BASE}${path}`
+}
+
 export interface CreateRunResponse {
   run_id: string
   task_id?: string
@@ -70,7 +74,7 @@ export class AgentStreamConnectionError extends Error {
 }
 
 export async function createAgentRun(messages: ChatMessage[], context: AgentRunContext): Promise<CreateRunResponse> {
-  const response = await fetch(`${API_BASE}/api/v1/seo-agent/chat/runs`, {
+  const response = await fetch(agentApiUrl('/api/v1/seo-agent/chat/runs'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({

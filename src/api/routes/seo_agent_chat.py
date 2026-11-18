@@ -5,9 +5,10 @@ import hashlib
 import json
 from collections.abc import AsyncIterator
 from typing import Any, Literal
+from uuid import UUID
 
 from fastapi import APIRouter, Header, HTTPException, Query, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from src.agent.harness.persistence import StoreRunPersistence
@@ -29,6 +30,7 @@ from src.seo_agent.runtime import (
     seo_chat_recovery_service,
     structured_model_automation,
 )
+from src.seo_agent.workflows.cloudflare_images import cloudflare_share_images
 
 router = APIRouter(prefix="/seo-agent/chat", tags=["SEO Agent Chat"])
 
@@ -108,6 +110,7 @@ async def _schedule_restored_run(run: AgentRun) -> None:
         observability=observability_client if observability_database.started else None,
         snapshots=cache_manager,
         model_runner=structured_model_automation.model_runner,
+        image_generator=cloudflare_share_images,
         user_messages=[str(message.get("content", "")) for message in run.messages
                        if message.get("role") == "user"],
     )
@@ -139,6 +142,7 @@ async def create_run(body: CreateSeoAgentRunRequest) -> CreateSeoAgentRunRespons
         observability=observability_client if observability_database.started else None,
         snapshots=cache_manager,
         model_runner=structured_model_automation.model_runner,
+        image_generator=cloudflare_share_images,
         user_messages=[message.content for message in body.messages if message.role == "user"],
     )
     if not registry.schemas():
@@ -211,6 +215,18 @@ async def create_run(body: CreateSeoAgentRunRequest) -> CreateSeoAgentRunRespons
         status=run.status.value,
         events_url=f"/api/v1/seo-agent/chat/runs/{run.id}/events",
         cancel_url=f"/api/v1/seo-agent/chat/runs/{run.id}/cancel",
+    )
+
+
+@router.get("/images/{image_id}", response_class=FileResponse)
+def get_share_image(image_id: UUID) -> FileResponse:
+    stored = cloudflare_share_images.get_file(image_id)
+    if stored is None:
+        raise HTTPException(status_code=404, detail="分享图不存在")
+    path, media_type = stored
+    return FileResponse(
+        path, media_type=media_type,
+        headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "private, max-age=86400"},
     )
 
 

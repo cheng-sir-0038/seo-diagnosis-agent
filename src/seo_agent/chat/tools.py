@@ -11,6 +11,7 @@ from src.core.config import settings
 from src.models.common import Capability
 from src.observability.client import ObservabilityClient
 from src.seo_agent.chat.presentation import build_presentation, can_render
+from src.seo_agent.workflows.cloudflare_images import CloudflareShareImages
 from src.seo_agent.workflows.keyword_opportunity import KeywordOpportunityWorkflow
 from src.seo_agent.workflows.page_change_review import PageChangeReviewWorkflow
 from src.seo_agent.workflows.page_suggestions import PageSuggestionsWorkflow
@@ -485,6 +486,7 @@ def build_seo_agent_registry(
     snapshots: CacheManager | None = None,
     model_runner: StructuredModelRunner | None = None,
     user_messages: list[str] | None = None,
+    image_generator: CloudflareShareImages | None = None,
 ) -> ToolRegistry:
     live_capabilities = facade.live_capabilities()
     registry = ToolRegistry(
@@ -505,7 +507,7 @@ def build_seo_agent_registry(
         ))
         registry.register(ShareImageWorkflow(
             page, settings.agent_tool_timeout, observability=observability,
-            model_runner=model_runner, user_messages=user_messages,
+            model_runner=model_runner, user_messages=user_messages, image_generator=image_generator,
         ))
         if snapshots is not None:
             registry.register(PageChangeReviewWorkflow(

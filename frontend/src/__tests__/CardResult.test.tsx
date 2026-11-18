@@ -52,6 +52,18 @@ describe('CardResult', () => {
     expect(screen.queryByText('与目标一致')).not.toBeInTheDocument()
   })
 
+  it('loads a generated share image from the chat API with its page caption', () => {
+    const imagePath = '/api/v1/seo-agent/chat/images/9734c31e-07eb-4a5f-9d9d-9d436966283f'
+    render(<ToolResultView hint="cards" data={{
+      ...data, capability: 'share_image', variant: 'share-image',
+      items: [{ key: 'image', title: '手冲咖啡入门', image_url: imagePath, summary: '从选豆到冲煮' }],
+    }} mode="chat" />)
+    expect(screen.getByTestId('card-result')).toHaveClass('share-image')
+    expect(screen.getByRole('img', { name: '手冲咖啡入门' }))
+      .toHaveAttribute('src', `${import.meta.env.VITE_API_BASE ?? ''}${imagePath}`)
+    expect(screen.getByText('从选豆到冲煮')).toBeInTheDocument()
+  })
+
   it('shows structured suggestions as copyable text without executing HTML', () => {
     const code = '{"name":"<script>alert(1)</script>"}'
     const { container } = render(<ToolResultView hint="cards" data={{

@@ -1,15 +1,24 @@
 from __future__ import annotations
 
 import json
+from base64 import b64encode
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from uuid import uuid4
 
+import httpx
 import pytest
+from fastapi import FastAPI
+from pydantic import SecretStr
 
-from src.agent.tools.base import ToolRuntimeContext
+from src.agent.tools.base import ToolRuntimeContext, resolve_render_hint
+from src.api.routes import seo_agent_chat
+from src.core.config import Settings
 from src.models.common import Capability, DataSource
 from src.models.page_metadata import PageMetadataReport
 from src.seo_agent.chat.tools import build_seo_agent_registry
+from src.seo_agent.workflows.cloudflare_images import CloudflareShareImages
 from src.seo_agent.workflows.structured_model import StructuredModelRunner
 
 SITE = {"id": "site_1", "domain": "example.com"}
@@ -71,11 +80,99 @@ async def test_share_image_brief_uses_the_current_page(
 
     assert result.data["visual_status"] == expected_status
     assert tool.render_hint is None
-    brief_card = next(item for item in result.data["items"] if item["key"] == "visual")
-    if expected_status == "ready":
-        assert subject in brief_card["code"]
-    else:
-        assert "code" not in brief_card
+    assert result.data["image_status"] == "not_configured"
+    assert all("code" not in item for item in result.data["items"])
+
+
+@pytest.mark.parametrize(
+    ("status_code", "image", "expected_error"),
+    [(200, True, None), (200, False, "UPSTREAM_ERROR"), (429, False, "RATE_LIMITED")],
+)
+@pytest.mark.asyncio
+async def test_share_image_serves_only_generated_assets(
+    status_code: int, image: bool, expected_error: str | None,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # One-pixel PNG fixture used by the Workers AI response.
+    encoded_image = (
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGNgAAIAAAUAAen63Ng"
+        "AAAAASUVORK5CYII="
+    )
+    config = Settings(
+        _env_file=None,
+        cloudflare_account_id="a" * 32,
+        cloudflare_api_token=SecretStr("test-token"),
+        seo_agent_sqlite_path=tmp_path / "seo-agent.db",
+    )
+    generator = CloudflareShareImages(config)
+    monkeypatch.setattr(seo_agent_chat, "cloudflare_share_images", generator)
+    calls = []
+
+    def cloudflare(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        assert request.url.host == "api.cloudflare.com"
+        assert request.url.path.endswith("/ai/run/@cf/black-forest-labs/flux-2-klein-4b")
+        assert request.headers["authorization"] == "Bearer test-token"
+        assert request.headers["content-type"].startswith("multipart/form-data; boundary=")
+        assert b"a clear glass dripper" in request.content
+        assert b'name="width"\r\n\r\n1216' in request.content
+        return httpx.Response(
+            status_code, json={"success": True, "result": {
+                "image": encoded_image if image else "PC9zY3JpcHQ+",
+            }},
+        )
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        "src.seo_agent.workflows.cloudflare_images.httpx.AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(cloudflare), **kwargs),
+    )
+
+    class Model:
+        def with_structured_output(self, schema, **kwargs):
+            async def ainvoke(messages):
+                return schema.model_validate({"visual": {
+                    "subject": "a clear glass dripper", "scene": "a coffee counter",
+                    "tone": "warm", "composition": "an editorial close-up",
+                    "avoid": "logos", "evidence_quote": "手冲咖啡",
+                }})
+            return SimpleNamespace(ainvoke=ainvoke)
+
+    tool = build_seo_agent_registry(
+        PageSource(og_title="手冲咖啡入门"), SITE,
+        model_runner=StructuredModelRunner(model_factory=Model),
+        image_generator=generator,
+    ).get("seo_share_image")
+    result = await tool.execute({"url": URL})
+    payload = result.model_dump(mode="json")
+    assert len(calls) == 1
+    assert "a clear glass dripper" not in json.dumps(payload)
+    assert encoded_image not in json.dumps(payload)
+    card = result.data["items"][0]
+    if expected_error:
+        assert result.data["image_status"] == "failed"
+        assert result.data["workflow_status"] == "partial"
+        assert result.data["coverage"]["image"]["error_code"] == expected_error
+        assert "image_url" not in card
+        assert resolve_render_hint(tool, payload) is None
+        assert not list(tmp_path.iterdir())
+        return
+
+    assert result.data["image_status"] == "ready"
+    assert result.data["workflow_status"] == "complete"
+    assert card["title"] == "手冲咖啡入门"
+    assert resolve_render_hint(tool, payload) == "cards"
+    app = FastAPI()
+    app.include_router(seo_agent_chat.router, prefix="/api/v1")
+    transport = httpx.ASGITransport(app=app)
+    async with real_client(transport=transport, base_url="http://test") as client:
+        response = await client.get(card["image_url"])
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "image/png"
+        assert response.headers["x-content-type-options"] == "nosniff"
+        assert b64encode(response.content).decode() == encoded_image
+        assert (await client.get(f"/api/v1/seo-agent/chat/images/{uuid4()}")).status_code == 404
+        assert (await client.get("/api/v1/seo-agent/chat/images/bad-id")).status_code == 422
 
 
 @pytest.mark.asyncio
@@ -89,12 +186,12 @@ async def test_share_image_uses_page_facts_and_fetches_only_the_requested_page()
     result = await tool.execute({"url": URL})
 
     assert tool.parameters_schema["additionalProperties"] is False
-    assert result.data["workflow_status"] == "complete"
+    assert result.data["workflow_status"] == "partial"
     assert result.data["evidence"]["page"]["raw"]["data"]["final_url"] == URL
     card = result.data["items"][0]
     assert card["url"] == URL
     assert card["share_image"] == {
-        "width": 1200, "height": 630, "host": "example.com",
+        "width": 1216, "height": 640, "host": "example.com",
         "title": "手冲咖啡 入门", "description": "从选豆到冲煮",
     }
     assert card["metadata"] == [
@@ -128,7 +225,7 @@ async def test_share_image_waits_for_a_title_and_reuses_page_on_resume() -> None
 
     assert len(source.calls) == 1
     assert result.data["coverage"]["page"]["reused_from_checkpoint"] is True
-    assert result.data["workflow_status"] == "complete"
+    assert result.data["workflow_status"] == "partial"
     assert not result.metadata
     assert result.data["items"][0]["share_image"]["title"] == "手冲咖啡入门"
     assert result.data["items"][0]["metadata"][0]["value"] == "用户补充"

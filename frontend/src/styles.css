@@ -4008,6 +4008,27 @@ a:focus-visible,
 .tool-card-result.image-grid .tool-card-item > img { aspect-ratio: 4 / 3; height: auto; min-height: 0; }
 .tool-card-result.image-grid .tool-card-body { padding: 11px 12px 13px; }
 
+.tool-card-result.share-image {
+  max-width: 740px;
+  padding: 0;
+  background: transparent;
+}
+
+.tool-card-result.share-image .tool-card-item {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+}
+
+.tool-card-result.share-image .tool-card-item > img {
+  aspect-ratio: 1216 / 640;
+  height: auto;
+  min-height: 0;
+  max-height: none;
+  object-fit: contain;
+}
+
+.tool-card-result.share-image .tool-card-body { padding: 14px 16px; }
+
 .tool-card-code {
   max-height: 360px;
   margin: 12px 0 0;
