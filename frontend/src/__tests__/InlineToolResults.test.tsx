@@ -152,4 +152,25 @@ describe('InlineToolResults', () => {
     expect(screen.getAllByText('自然搜索概览')).toHaveLength(1)
     expect(overview.closest('article')).toHaveClass('self-contained')
   })
+
+  it('uses the source and proposal to label a suggestions card', () => {
+    const result = {
+      ...tablePresentation([], '2026-07-28T06:00:00Z').data,
+      capability: 'page_suggestions',
+      view_type: 'cards',
+      provenance: { source: 'page_html', source_label: '页面源 HTML', is_estimated: false },
+      items: [{ key: 'tdk', title: 'TDK 文案建议' }],
+      proposal: { title: '首页标题草稿' },
+    }
+    const tool: ToolRun = {
+      id: 'draft', name: 'seo_page_suggestions', status: 'completed',
+      render_hint: 'cards', result: { success: true, data: result },
+    }
+    const { rerender } = render(<InlineToolResults tools={[tool]} />)
+
+    expect(screen.getByText('页面源 HTML')).toBeInTheDocument()
+    expect(screen.getByText('建议草稿')).toBeInTheDocument()
+    rerender(<InlineToolResults tools={[{ ...tool, result: { data: { ...result, proposal: null } } }]} />)
+    expect(screen.queryByText('建议草稿')).not.toBeInTheDocument()
+  })
 })

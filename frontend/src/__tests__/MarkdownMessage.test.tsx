@@ -6,6 +6,20 @@ import { MarkdownMessage } from '../components/MarkdownMessage'
 afterEach(cleanup)
 
 describe('MarkdownMessage', () => {
+  it('places results after the opening paragraph and keeps the rest of the reply', () => {
+    render(
+      <MarkdownMessage
+        content={'## 首页体检\n\n已查到当前标题。\n\n后续建议核对 H1。'}
+        results={<section aria-label="本次结果">标题来自页面源码</section>}
+      />,
+    )
+
+    const result = screen.getByRole('region', { name: '本次结果' })
+    expect(result.previousElementSibling).toHaveTextContent('已查到当前标题。')
+    expect(result.nextElementSibling).toHaveTextContent('后续建议核对 H1。')
+    expect(screen.getByRole('heading', { name: '首页体检' })).toBeInTheDocument()
+  })
+
   it('converts a business ASCII chart into an accessible data summary', () => {
     render(
       <MarkdownMessage

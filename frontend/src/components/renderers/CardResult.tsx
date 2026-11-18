@@ -1,6 +1,7 @@
 import { Empty } from 'antd'
 
 import { agentApiUrl } from '../../services/agentApi'
+import { ResultTag } from '../ResultTag'
 import type { CardResultData } from './contracts'
 
 interface CardResultProps {
@@ -19,6 +20,7 @@ const pageReviewLabels: Record<string, string> = {
 }
 
 export function CardResult({ data }: CardResultProps) {
+  const generated = data.variant === 'share-image'
   const displayText = (value: string) => data.capability === 'page_change_review'
     ? pageReviewLabels[value] ?? value
     : value
@@ -31,17 +33,20 @@ export function CardResult({ data }: CardResultProps) {
         <article className={`tool-card-item${item.image_url ? '' : ' no-image'}`} key={item.key}>
           {item.image_url ? (
             <img
-              src={data.variant === 'share-image' ? agentApiUrl(item.image_url) : item.image_url}
+              src={generated ? agentApiUrl(item.image_url) : item.image_url}
               alt={item.title}
               loading="lazy"
             />
           ) : null}
           <div className="tool-card-body">
-            <h4>
-              {item.url ? (
-                <a href={item.url} target="_blank" rel="noreferrer">{displayText(item.title)}</a>
-              ) : displayText(item.title)}
-            </h4>
+            <div className="tool-card-heading">
+              <h4>
+                {item.url ? (
+                  <a href={item.url} target="_blank" rel="noreferrer">{displayText(item.title)}</a>
+                ) : displayText(item.title)}
+              </h4>
+              {generated && item.image_url ? <ResultTag icon="🪄" tone="accent">AI 生成图</ResultTag> : null}
+            </div>
             {item.summary ? <p>{displayText(item.summary)}</p> : null}
             {item.code ? <pre className="tool-card-code"><code>{item.code}</code></pre> : null}
             {item.metadata?.length ? (

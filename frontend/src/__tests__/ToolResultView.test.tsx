@@ -312,6 +312,7 @@ it('renders page metadata as a non-technical HTML evidence report', async () => 
         checks: [
           { key: 'title', label: 'Title', value: 'Example', length: 7, count: 1, status: 'good' },
           { key: 'keywords', label: 'Meta Keywords', value: 'seo', length: 3, count: 1, status: 'info', note: 'Google 不使用该标签进行索引或排名。' },
+          { key: 'h1', label: 'H1 主标题', value: 'Main heading', length: 12, count: 1, status: 'good' },
         ],
         headings: ['Main heading'],
         additional: { charset: 'utf-8' },
@@ -332,9 +333,16 @@ it('renders page metadata as a non-technical HTML evidence report', async () => 
   )
 
   expect(await screen.findByTestId('page-metadata-result')).toBeInTheDocument()
+  expect(screen.getByRole('heading', { name: '页面元信息检查' })).toBeInTheDocument()
+  expect(screen.getByText('页面源 HTML')).toBeInTheDocument()
+  expect(screen.getAllByText('已设置')[0].closest('.result-tag')).toHaveClass('is-positive')
+  expect(screen.getAllByRole('term').slice(0, 3).map((term) => term.textContent)).toEqual(['Title', 'H1 主标题', 'Meta Keywords'])
+  expect(screen.getByText('信息项').closest('.result-tag')).toHaveClass('is-neutral')
   expect(screen.getByText('Example')).toBeInTheDocument()
   expect(screen.getByText(/Google 不使用该标签/)).toBeInTheDocument()
-  expect(screen.getByText('H1 1：Main heading')).toBeInTheDocument()
+  const indexing = screen.getByText('索引控制与页面结构').closest('details')
+  expect(indexing).not.toHaveAttribute('open')
+  expect(indexing).toContainElement(screen.getByText('H1 1：Main heading'))
   expect(screen.getByText('基础 On-page 扫描已完成')).toBeInTheDocument()
   expect(screen.getByText('88')).toBeInTheDocument()
   expect(screen.getByText('图片缺少 alt')).toBeInTheDocument()

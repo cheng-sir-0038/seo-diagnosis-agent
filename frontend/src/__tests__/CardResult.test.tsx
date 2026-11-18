@@ -34,6 +34,7 @@ describe('CardResult', () => {
     expect(screen.getByRole('img', { name: 'SEO Update' })).toHaveAttribute('src', 'https://img.example/update.jpg')
     expect(screen.getByText('What changed')).toBeInTheDocument()
     expect(screen.getByText('SEO Daily')).toBeInTheDocument()
+    expect(screen.queryByText('AI 生成图')).not.toBeInTheDocument()
     expect(screen.queryByTestId('raw-tool-result')).not.toBeInTheDocument()
     expect(screen.getByTestId('card-result')).toHaveClass('news')
   })
@@ -62,6 +63,7 @@ describe('CardResult', () => {
     expect(screen.getByRole('img', { name: '手冲咖啡入门' }))
       .toHaveAttribute('src', `${import.meta.env.VITE_API_BASE ?? ''}${imagePath}`)
     expect(screen.getByText('从选豆到冲煮')).toBeInTheDocument()
+    expect(screen.getByText('AI 生成图')).toBeInTheDocument()
   })
 
   it('shows structured suggestions as copyable text without executing HTML', () => {

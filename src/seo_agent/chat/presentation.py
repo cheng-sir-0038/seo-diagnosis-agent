@@ -40,6 +40,10 @@ def can_render(hint: RenderHint | None, payload: Mapping[str, Any]) -> bool:
     if hint == "chart":
         return view_type == "chart" and (
             bool(payload.get("metrics"))
+            or (
+                payload.get("variant") == "page_metadata"
+                and isinstance(payload.get("checks"), list)
+            )
             or (bool(payload.get("labels")) and bool(payload.get("datasets")))
         )
     if hint == "table":

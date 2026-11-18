@@ -1,20 +1,15 @@
-import { DatabaseOutlined } from '@ant-design/icons'
+import { CodeOutlined, SearchOutlined } from '@ant-design/icons'
 
 import type { ToolRun } from '../types/agent'
+import { ResultTag } from './ResultTag'
 import { ToolResultView } from './ToolResultView'
 import {
+  isPageMetadataData,
   isPresentationBase,
   isSeoSearchOverviewResultData,
   resolveLocalizedText,
   unwrapToolResult,
 } from './renderers/contracts'
-
-function formatLatency(ms: number): string {
-  if (ms >= 1000) {
-    return `${(ms / 1000).toFixed(1)}s`
-  }
-  return `${Math.round(ms)}ms`
-}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -60,44 +55,44 @@ export function InlineToolResults({ tools }: { tools?: ToolRun[] }) {
   const onlyShareImages = visible.every(tool => tool.name === 'seo_share_image')
 
   return (
-    <section className="inline-tool-results" aria-label={onlyShareImages ? '生成的分享图' : '数据证据'}>
-      {!onlyShareImages ? (
-        <header className="inline-tool-results-title">
-          <span className="inline-tool-results-icon" aria-hidden="true"><DatabaseOutlined /></span>
-          <div>
-            <strong>数据证据</strong>
-            <span>页面事实和查询结果保留来源；优化建议是待人工确认的草稿。</span>
-          </div>
-        </header>
-      ) : null}
-      <div className="inline-tool-results-list">
-        {visible.map((tool) => {
-          const presentation = unwrapToolResult(tool.result)
-          const selfContained = tool.name === 'seo_share_image' || isSeoSearchOverviewResultData(presentation)
-          const title = isPresentationBase(presentation)
-            ? resolveLocalizedText(presentation.title, '查询结果')
-            : '查询结果'
-          const description = isPresentationBase(presentation)
-            ? resolveLocalizedText(presentation.description, '本次调查获得的结构化数据。')
-            : '本次调查获得的结构化数据。'
-          return (
-            <article className={`inline-tool-result-card${selfContained ? ' self-contained' : ''}`} key={tool.id}>
-              {!selfContained ? (
-                <header>
-                  <div>
-                    <h3>{title}</h3>
-                    <p>{description}</p>
+    <section className="inline-tool-results" aria-label={onlyShareImages ? '生成的分享图' : '本次结果'}>
+      {visible.map((tool) => {
+        const result = unwrapToolResult(tool.result)
+        const selfContained = tool.name === 'seo_share_image'
+          || (tool.render_hint === 'chart' && (isPageMetadataData(result) || isSeoSearchOverviewResultData(result)))
+        const presentation = isPresentationBase(result) ? result : null
+        const description = resolveLocalizedText(presentation?.description, '')
+        const provenance = presentation?.provenance
+        const source = tool.render_hint === 'cards' || tool.render_hint === 'tree'
+          ? provenance?.source_label ?? provenance?.source
+          : undefined
+        const hasDraft = presentation?.capability === 'page_suggestions'
+          && isRecord(result) && isRecord(result.proposal)
+        return (
+          <article className={`inline-tool-result-card${selfContained ? ' self-contained' : ''}`} key={tool.id}>
+            {!selfContained && presentation ? (
+              <header>
+                <div>
+                  <h3>{resolveLocalizedText(presentation.title, '查询结果')}</h3>
+                  {description ? <p>{description}</p> : null}
+                </div>
+                {source || hasDraft ? (
+                  <div className="inline-result-tags">
+                    {source ? (
+                      <ResultTag icon={provenance?.source === 'page_html' ? <CodeOutlined /> : <SearchOutlined />} tone="source">
+                        {source}{provenance?.country ? ` · ${provenance.country}` : ''}
+                      </ResultTag>
+                    ) : null}
+                    {source && provenance?.is_estimated ? <ResultTag icon="≈">估算数据</ResultTag> : null}
+                    {hasDraft ? <ResultTag icon="✦" tone="accent">建议草稿</ResultTag> : null}
                   </div>
-                  <span>
-                    已获取{tool.latencyMs != null ? ` · ${formatLatency(tool.latencyMs)}` : ''}
-                  </span>
-                </header>
-              ) : null}
-              <ToolResultView hint={tool.render_hint} data={tool.result} mode="chat" />
-            </article>
-          )
-        })}
-      </div>
+                ) : null}
+              </header>
+            ) : null}
+            <ToolResultView hint={tool.render_hint} data={tool.result} mode="chat" />
+          </article>
+        )
+      })}
     </section>
   )
 }

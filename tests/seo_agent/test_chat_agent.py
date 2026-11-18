@@ -389,6 +389,7 @@ async def test_page_metadata_tool_defaults_to_homepage_and_rejects_other_domains
     assert facade.calls[0]["capability"] == Capability.PAGE_METADATA
     assert facade.calls[0]["params"] == {"url": "https://example.com/"}
     assert result.data["variant"] == "page_metadata"
+    assert tool.resolve_render_hint(result.model_dump(mode="json")) == "chart"
     with pytest.raises(ValueError, match="当前站点"):
         await tool.execute({"url": "https://other.example/"})
 

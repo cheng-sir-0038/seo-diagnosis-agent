@@ -26,11 +26,11 @@ export function sanitizeAssistantContent(content: string): SanitizedAssistantCon
   if (convergence) {
     return {
       hadControlMarkup: true,
-      content: `${convergence}\n\n模型尝试继续调用工具，但内部工具控制内容已隐藏。请以下方已经获取的数据证据为准。`,
+      content: `${convergence}\n\n模型尝试继续调用工具，但内部工具控制内容已隐藏。请以本条回复的查询结果为准。`,
     }
   }
   return {
     hadControlMarkup: true,
-    content: cleaned || '内部工具控制内容已隐藏。请查看本消息下方已经获取的数据证据。',
+    content: cleaned || '内部工具控制内容已隐藏。请查看本条回复的查询结果。',
   }
 }

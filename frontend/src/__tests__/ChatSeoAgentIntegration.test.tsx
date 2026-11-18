@@ -93,10 +93,16 @@ describe('ChatPage SEO Agent integration', () => {
     resumeAgentRun.mockResolvedValue({ run_id: 'run_1', status: 'recovering' })
     streamAgentEvents.mockImplementation(async (_url, onEvent: (item: AgentEvent) => void) => {
       onEvent(event(1, 'run.started', { status: 'running' }))
-      onEvent(event(2, 'tool.completed', {
+      onEvent(event(2, 'tool.started', {
+        tool_call_id: 'call_1',
+        name: 'seo_organic_keywords',
+        arguments: { domain: 'example.com', limit: 5 },
+      }))
+      onEvent(event(3, 'tool.completed', {
         tool_call_id: 'call_1',
         name: 'seo_organic_keywords',
         render_hint: 'table',
+        latency_ms: 2500,
         result: {
           success: true,
           data: {
@@ -112,9 +118,9 @@ describe('ChatPage SEO Agent integration', () => {
           },
         },
       }))
-      onEvent(event(3, 'message.delta', { delta: '分析完成' }))
-      onEvent(event(4, 'message.completed', { content: '分析完成' }))
-      onEvent(event(5, 'run.completed', { status: 'completed' }))
+      onEvent(event(4, 'message.delta', { delta: '分析完成' }))
+      onEvent(event(5, 'message.completed', { content: '分析完成' }))
+      onEvent(event(6, 'run.completed', { status: 'completed' }))
     })
   })
 
@@ -196,7 +202,9 @@ describe('ChatPage SEO Agent integration', () => {
   it('fills a relevant starter without running a query until the user sends it', () => {
     render(<ChatPage />)
     fireEvent.click(screen.getByRole('button', { name: /给首页做个体检/ }))
-    expect((screen.getByLabelText('给 SEO 优化专员发送消息') as HTMLTextAreaElement).value).toContain('首页')
+    const prompt = (screen.getByLabelText('给 SEO 优化专员发送消息') as HTMLTextAreaElement).value
+    expect(prompt).toContain('让客户从搜索点进来后')
+    expect(prompt).toContain('最优先的修改建议和依据')
     expect(createAgentRun).not.toHaveBeenCalled()
     expect(screen.getByLabelText('发送消息')).toBeEnabled()
   })
@@ -210,7 +218,7 @@ describe('ChatPage SEO Agent integration', () => {
     fireEvent.click(screen.getByLabelText('发送消息'))
     expect(await screen.findByRole('status', { name: '分析进度' })).toHaveTextContent('正在理解你的问题')
     expect(screen.getByLabelText('停止生成')).toBeEnabled()
-    expect(screen.queryByRole('region', { name: '数据证据' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('region', { name: '本次结果' })).not.toBeInTheDocument()
   })
 
   it('sends the active site and renders structured evidence directly in the chat', async () => {
@@ -223,22 +231,19 @@ describe('ChatPage SEO Agent integration', () => {
 
     await waitFor(() => expect(createAgentRun).toHaveBeenCalled())
     expect(createAgentRun.mock.calls[0][1]).toMatchObject({ siteId: 'site_1' })
-    expect(await screen.findByText('Task 12345678 · Thread 12345678')).toBeInTheDocument()
-
-    const evidence = await screen.findByRole('region', { name: '数据证据' })
+    const answer = await screen.findByText('分析完成')
+    const reply = answer.closest('article')!
+    const evidence = within(reply).getByRole('region', { name: '本次结果' })
     expect(evidence).toBeInTheDocument()
     expect(within(evidence).getByRole('table')).toBeInTheDocument()
     expect(screen.getByText('关键词明细')).toBeInTheDocument()
     expect(within(evidence).getByText('seo agent')).toBeInTheDocument()
     const stored = JSON.parse(window.localStorage.getItem('agent-workspace-conversations-v1') ?? '[]')
     expect(stored[0].messages[1].toolResults[0].result.data.raw).toBeUndefined()
-    expect(screen.getByLabelText('Agent 执行详情')).toHaveAttribute('aria-hidden', 'true')
-
-    fireEvent.click(screen.getByRole('button', { name: '执行详情' }))
-    expect(screen.getByLabelText('Agent 执行详情')).toHaveAttribute('aria-hidden', 'false')
+    expect(screen.queryByText('Task 12345678 · Thread 12345678')).not.toBeInTheDocument()
+    expect(screen.queryByText('数据证据', { exact: true })).not.toBeInTheDocument()
+    expect(within(reply).getByText('执行详情').closest('details')).not.toHaveAttribute('open')
     expect(screen.getAllByRole('table')).toHaveLength(1)
-    fireEvent.click(screen.getByRole('button', { name: '展开工具详情 seo_organic_keywords' }))
-    expect(screen.getAllByRole('table')).toHaveLength(2)
   })
 
   it('renders PageSpeed performance evidence inside the assistant message', async () => {
@@ -299,7 +304,7 @@ describe('ChatPage SEO Agent integration', () => {
     })
     fireEvent.click(screen.getByLabelText('发送消息'))
 
-    const evidence = await screen.findByRole('region', { name: '数据证据' })
+    const evidence = await screen.findByRole('region', { name: '本次结果' })
     expect(await within(evidence).findByTestId('page-performance-result')).toBeInTheDocument()
     expect(within(evidence).getByText('页面速度诊断')).toBeInTheDocument()
     expect(within(evidence).getAllByText('Google PageSpeed Insights').length).toBeGreaterThan(0)
@@ -374,7 +379,7 @@ describe('ChatPage SEO Agent integration', () => {
     })
     fireEvent.click(screen.getByLabelText('发送消息'))
 
-    const evidence = await screen.findByRole('region', { name: '数据证据' })
+    const evidence = await screen.findByRole('region', { name: '本次结果' })
     expect(await within(evidence).findByTestId('page-metadata-result')).toBeInTheDocument()
     expect(within(evidence).getByText('Example Home')).toBeInTheDocument()
     expect(within(evidence).getByText('Example description')).toBeInTheDocument()
@@ -453,7 +458,7 @@ Top 4-10（第4-10名） ██ 21 个 → 增长
   })
 
 
-  it('hides the Agent task sidebar and keeps tool details collapsed by default', async () => {
+  it('keeps execution details collapsed inside the reply and opens raw data on demand', async () => {
     render(<ChatPage />)
     fireEvent.change(screen.getByLabelText('给 SEO 优化专员发送消息'), {
       target: { value: '分析自然流量下降' },
@@ -461,20 +466,30 @@ Top 4-10（第4-10名） ██ 21 个 → 增长
     fireEvent.click(screen.getByLabelText('发送消息'))
 
     await screen.findByText('分析完成')
-    expect(screen.queryByRole('region', { name: 'Agent 任务' })).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Agent 执行详情')).not.toBeInTheDocument()
+    const details = screen.getByText('执行详情').closest('details')!
+    expect(details).not.toHaveAttribute('open')
+    expect(screen.queryByTestId('raw-tool-result')).not.toBeInTheDocument()
 
-    fireEvent.click(screen.getByRole('button', { name: '执行详情' }))
-    const toggle = screen.getByRole('button', { name: '展开工具详情 seo_organic_keywords' })
-    expect(toggle).toHaveAttribute('aria-expanded', 'false')
-    const inspector = screen.getByLabelText('Agent 执行详情')
-    expect(within(inspector).queryByText('seo agent')).not.toBeInTheDocument()
+    details.open = true
+    fireEvent(details, new Event('toggle'))
+    expect(await within(details).findByText('关键词明细')).toBeInTheDocument()
+    expect(within(details).getByText('domain')).toBeInTheDocument()
+    expect(within(details).getByText('example.com')).toBeInTheDocument()
+    expect(within(details).getByText('2.5 秒')).toBeInTheDocument()
+    expect(within(details).queryByText('run.started')).not.toBeInTheDocument()
+    expect(within(details).queryByText('tool.completed')).not.toBeInTheDocument()
 
-    fireEvent.click(toggle)
-    expect(toggle).toHaveAttribute('aria-expanded', 'true')
-    expect(within(inspector).getByText('seo agent')).toBeInTheDocument()
+    const result = within(details).getByText('返回数据').closest('details')!
+    expect(result).not.toHaveAttribute('open')
+    result.open = true
+    fireEvent(result, new Event('toggle'))
+    expect(await within(result).findByTestId('raw-tool-result')).toHaveTextContent('seo agent')
+    expect(screen.getAllByRole('table')).toHaveLength(1)
 
-    fireEvent.click(toggle)
-    expect(toggle).toHaveAttribute('aria-expanded', 'false')
+    details.open = false
+    fireEvent(details, new Event('toggle'))
+    await waitFor(() => expect(screen.queryByTestId('raw-tool-result')).not.toBeInTheDocument())
   })
 
 })

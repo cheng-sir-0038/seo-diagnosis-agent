@@ -1,7 +1,5 @@
 import {
   BulbOutlined,
-  CloseOutlined,
-  DownOutlined,
   MenuOutlined,
   PlusOutlined,
   RightOutlined,
@@ -9,14 +7,13 @@ import {
   SearchOutlined,
   SendOutlined,
   StopOutlined,
-  ToolOutlined,
 } from '@ant-design/icons'
-import { Alert, Button, Empty, Input, Tag, Tooltip } from 'antd'
+import { Alert, Button, Input, Tag, Tooltip } from 'antd'
 import { useEffect, useMemo, useReducer, useRef, useState } from 'react'
 
+import { ChatRunDetails } from '../components/ChatRunDetails'
 import { InlineToolResults } from '../components/InlineToolResults'
 import { MarkdownMessage } from '../components/MarkdownMessage'
-import { ToolResultView } from '../components/ToolResultView'
 import {
   cancelAgentRun,
   createAgentRun,
@@ -40,10 +37,10 @@ const { TextArea } = Input
 const starters = [
   {
     title: '给首页做个体检',
-    detail: '从标题、H1 和页面基础信息开始。',
+    detail: '看看首页能否讲清业务，找出最该先改的地方。',
     icon: SearchOutlined,
     tone: 'blue',
-    prompt: '请给本站首页做一次 SEO 基础体检，读取页面源 HTML，不需要性能检查。',
+    prompt: '帮我给本站首页做一次 SEO 体检。我想让客户从搜索点进来后，一眼看懂我们提供什么。请根据当前页面，给出最优先的修改建议和依据。',
   },
   {
     title: '发现内容新机会',
@@ -60,17 +57,6 @@ const starters = [
     prompt: '请根据本站首页现在的内容，给我一份标题、描述、关键词、分享信息和结构化数据建议；缺的信息告诉我，只提建议，不修改网站。',
   },
 ]
-
-const stageLabels: Record<string, string> = {
-  idle: '等待输入',
-  waiting: '等待中',
-  calling_model: '正在调用模型',
-  completed: '已完成',
-  failed: '执行失败',
-  cancelled: '已停止',
-  recovering: '恢复中',
-  summarizing_budget: '正在基于现有证据总结',
-}
 
 const statusLabels: Record<string, string> = {
   waiting_for_input: '等待你补充',
@@ -90,6 +76,7 @@ const persistableToolResults = (tools: ToolRun[]): ToolRun[] => tools.map((tool)
   status: tool.status,
   render_hint: tool.render_hint,
   error: tool.error,
+  latencyMs: tool.latencyMs,
   result: removeRawEvidence(tool.result),
 }))
 
@@ -127,13 +114,7 @@ export function ChatPage() {
   const [input, setInput] = useState('')
   const [run, dispatch] = useReducer(reduceAgentEvent, initialRunState)
   const [cancelUrl, setCancelUrl] = useState<string>()
-  const [inspectorOpen, setInspectorOpen] = useState(false)
-  const [expandedToolIds, setExpandedToolIds] = useState<Set<string>>(() => new Set())
   const [conversationsOpen, setConversationsOpen] = useState(false)
-  const [activeTask, setActiveTask] = useState<{
-    taskId?: string
-    threadId?: string
-  }>({})
   const [connectionIssue, setConnectionIssue] = useState<ConnectionIssue>()
   const [reconnecting, setReconnecting] = useState(false)
   const abortRef = useRef<AbortController | undefined>(undefined)
@@ -143,6 +124,9 @@ export function ChatPage() {
   const active = conversations.find((item) => item.id === activeId) ?? conversations[0]
   const latestAssistant = [...active.messages].reverse().find((message) => message.role === 'assistant')
   const running = run.status === 'running' || run.status === 'pending' || run.status === 'recovering'
+  const currentReplyId = !running && run.runId && latestAssistant?.runId === run.runId
+    ? latestAssistant.id
+    : undefined
   const emptyConversation = active.messages.length === 0 && !run.assistantText && run.tools.length === 0
   const querying = run.tools.some((tool) => tool.status === 'running')
   const activity = querying
@@ -315,9 +299,7 @@ export function ChatPage() {
     setConversations((items) => [conversation, ...items])
     setActiveId(conversation.id)
     setConversationsOpen(false)
-    setActiveTask({})
     setConnectionIssue(undefined)
-    setExpandedToolIds(new Set())
     activeConnectionRef.current = undefined
     resetRun('idle')
   }
@@ -355,7 +337,6 @@ export function ChatPage() {
           siteId: productConfig.siteId,
           conversationId: active.id,
         })
-      setActiveTask({ taskId: created.task_id, threadId: created.thread_id })
       setCancelUrl(created.cancel_url)
       const connection: ActiveRunConnection = {
         runId: created.run_id,
@@ -414,19 +395,13 @@ export function ChatPage() {
     setActiveId(id)
     setConversationsOpen(false)
     setConnectionIssue(undefined)
-    setExpandedToolIds(new Set())
     activeConnectionRef.current = undefined
     resetRun('idle')
   }
 
-  const closePanels = () => {
-    setInspectorOpen(false)
-    setConversationsOpen(false)
-  }
-
   return (
-    <div className={`chat-workspace${inspectorOpen ? ' inspector-open' : ''}${conversationsOpen ? ' conversations-open' : ''}`}>
-      <button className="chat-panel-backdrop" aria-label="关闭侧边面板" onClick={closePanels} />
+    <div className={`chat-workspace${conversationsOpen ? ' conversations-open' : ''}`}>
+      <button className="chat-panel-backdrop" aria-label="关闭侧边面板" onClick={() => setConversationsOpen(false)} />
 
       <aside className="chat-conversations" aria-label="会话列表">
         <div className="chat-sidebar-head">
@@ -468,27 +443,10 @@ export function ChatPage() {
                 onClick={() => setConversationsOpen(true)}
               />
             </Tooltip>
-            <div>
-              <strong>{active.title}</strong>
-              <span>{stageLabels[run.stage] ?? run.stage}</span>
-              {activeTask.taskId ? (
-                <small className="agent-run-identity">
-                  Task {activeTask.taskId.slice(-8)}
-                  {activeTask.threadId ? ` · Thread ${activeTask.threadId.slice(-8)}` : ''}
-                </small>
-              ) : null}
-            </div>
+            <strong>{active.title}</strong>
           </div>
           <div className="chat-title-actions">
             <Tag color={statusColor}>{statusLabels[run.status] ?? run.status}</Tag>
-            <Button
-              aria-label="执行详情"
-              aria-pressed={inspectorOpen}
-              icon={<ToolOutlined />}
-              onClick={() => setInspectorOpen((value) => !value)}
-            >
-              执行详情
-            </Button>
           </div>
         </header>
 
@@ -529,9 +487,12 @@ export function ChatPage() {
               <div className="chat-message-content">
                 {item.role === 'assistant' ? (
                   <>
-                    <div className="assistant-name">SEO 优化专员 <span aria-hidden="true">✦</span></div>
-                    <MarkdownMessage content={item.content} />
-                    <InlineToolResults tools={item.toolResults} />
+                    <div className="assistant-name">SEO 优化专员</div>
+                    <ChatRunDetails tools={item.id === currentReplyId ? run.tools : item.toolResults} />
+                    <MarkdownMessage
+                      content={item.content}
+                      results={<InlineToolResults tools={item.toolResults} />}
+                    />
                   </>
                 ) : item.content}
               </div>
@@ -542,7 +503,7 @@ export function ChatPage() {
             <article className="chat-message assistant streaming">
               <div className="avatar agent-avatar" aria-hidden="true"><BulbOutlined /></div>
               <div className="chat-message-content">
-                <div className="assistant-name">SEO 优化专员 <span aria-hidden="true">✦</span></div>
+                <div className="assistant-name">SEO 优化专员</div>
                 {!run.assistantText || querying ? (
                   <div className="agent-activity" role="status" aria-label="分析进度" aria-live="polite">
                     <div className="agent-activity-title">
@@ -552,8 +513,13 @@ export function ChatPage() {
                     <span>{activity.detail}</span>
                   </div>
                 ) : null}
-                {run.assistantText ? <MarkdownMessage content={run.assistantText} /> : null}
-                <InlineToolResults tools={run.tools} />
+                <ChatRunDetails tools={run.tools} />
+                {run.assistantText ? (
+                  <MarkdownMessage
+                    content={run.assistantText}
+                    results={<InlineToolResults tools={run.tools} />}
+                  />
+                ) : <InlineToolResults tools={run.tools} />}
                 {run.assistantText ? <span className="cursor" /> : null}
               </div>
             </article>
@@ -587,6 +553,9 @@ export function ChatPage() {
                 </Button>
               ) : undefined}
             />
+          ) : null}
+          {run.status === 'failed' && !currentReplyId ? (
+            <ChatRunDetails tools={run.tools} />
           ) : null}
           <div className="chat-composer">
             <TextArea
@@ -632,75 +601,6 @@ export function ChatPage() {
         </div>
       </section>
 
-      <aside
-        className="chat-inspector"
-        aria-label="Agent 执行详情"
-        aria-hidden={!inspectorOpen}
-        inert={!inspectorOpen}
-      >
-        <div className="inspector-title">
-          <div><strong>执行详情</strong><span>阶段、工具与事件</span></div>
-          <Button aria-label="关闭执行详情" type="text" shape="circle" icon={<CloseOutlined />} onClick={() => setInspectorOpen(false)} />
-        </div>
-
-        <section className="inspector-section">
-          <label>当前阶段</label>
-          <div className="stage-card"><span className={running ? 'pulse' : 'dot'} />{stageLabels[run.stage] ?? run.stage}</div>
-        </section>
-
-        <section className="inspector-section">
-          <label>工具调用</label>
-          {run.tools.length === 0 ? (
-            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="尚未调用工具" />
-          ) : run.tools.map((tool) => {
-            const latencyText = tool.latencyMs != null
-              ? tool.latencyMs >= 1000
-                ? `${(tool.latencyMs / 1000).toFixed(1)}s`
-                : `${Math.round(tool.latencyMs)}ms`
-              : null
-            const expanded = expandedToolIds.has(tool.id)
-            const detailId = `tool-detail-${tool.id.replace(/[^a-zA-Z0-9_-]/g, '-')}`
-            return (
-              <article className="tool-card" key={tool.id}>
-                <button
-                  className="tool-card-toggle"
-                  type="button"
-                  aria-expanded={expanded}
-                  aria-controls={detailId}
-                  aria-label={`${expanded ? '收起' : '展开'}工具详情 ${tool.name}`}
-                  onClick={() => setExpandedToolIds((current) => {
-                    const next = new Set(current)
-                    if (next.has(tool.id)) next.delete(tool.id)
-                    else next.add(tool.id)
-                    return next
-                  })}
-                >
-                  {expanded ? <DownOutlined /> : <RightOutlined />}
-                  <strong>{tool.name}</strong>
-                  <Tag>{tool.status}</Tag>
-                  {latencyText ? <span className="tool-latency">{latencyText}</span> : null}
-                  <span className="tool-toggle-label">{expanded ? '收起' : '展开'}</span>
-                </button>
-                {expanded ? (
-                  <div className="tool-card-detail" id={detailId}>
-                    {tool.arguments ? <pre>{JSON.stringify(tool.arguments, null, 2)}</pre> : null}
-                    {tool.result ? <ToolResultView hint={tool.render_hint} data={tool.result} /> : null}
-                  </div>
-                ) : null}
-              </article>
-            )
-          })}
-        </section>
-
-        <section className="inspector-section">
-          <label>最近事件</label>
-          {run.events.length === 0 ? <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无运行事件" /> : (
-            <div className="event-list">
-              {run.events.slice(-12).map((event) => <div key={event.event_id}><span>{event.sequence}</span><p>{event.type}</p></div>)}
-            </div>
-          )}
-        </section>
-      </aside>
     </div>
   )
 }
