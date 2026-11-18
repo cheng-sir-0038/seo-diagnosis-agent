@@ -466,6 +466,38 @@ async def test_store_does_not_persist_streaming_token_deltas(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_concurrent_event_streams_receive_the_same_live_events(monkeypatch) -> None:
+    from src.api.routes import seo_agent_chat as route
+
+    manager = RunManager()
+    monkeypatch.setattr(route, "run_manager", manager)
+    run = manager.create_run([])
+    run.status = RunStatus.RUNNING
+    run.emit("run.started")
+    streams = [route._event_stream(run.id), route._event_stream(run.id)]
+    try:
+        for stream in streams:
+            assert "event: run.started" in await anext(stream)
+        readers = [asyncio.create_task(anext(stream)) for stream in streams]
+        await asyncio.sleep(0)
+        run.emit("message.delta", {"delta": "阶段证据"})
+        frames = await asyncio.wait_for(asyncio.gather(*readers), timeout=1)
+        assert frames[0] == frames[1]
+        assert "event: message.delta" in frames[0]
+        run.emit("message.completed", {"content": "阶段证据"})
+        run.status = RunStatus.COMPLETED
+        run.emit("run.completed")
+        for stream in streams:
+            async with asyncio.timeout(1):
+                frames = [frame async for frame in stream]
+            assert [frame.split("event: ")[1].splitlines()[0] for frame in frames] == [
+                "message.completed", "run.completed",
+            ]
+    finally:
+        await asyncio.gather(*(stream.aclose() for stream in streams))
+
+
+@pytest.mark.asyncio
 async def test_event_stream_reconnect_replays_only_stable_events_after_cursor() -> None:
     from datetime import UTC, datetime
 

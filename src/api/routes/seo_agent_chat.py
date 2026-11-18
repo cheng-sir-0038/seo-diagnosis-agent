@@ -258,39 +258,15 @@ async def _event_stream(
     if run is None:
         return
     cursor = max(0, after_sequence)
-    reconnecting = cursor > 0
     live_start_sequence = run.sequence
 
-    for event in list(run.events):
-        if event.type == "message.delta":
-            if reconnecting:
-                continue
-        elif event.sequence <= cursor:
-            continue
-        yield _encode(event)
-        if event.type != "message.delta":
-            cursor = max(cursor, event.sequence)
-
-    if run.terminal or run.status == RunStatus.WAITING_FOR_INPUT:
-        return
-
-    while True:
-        try:
-            event = await asyncio.wait_for(run.queue.get(), timeout=15)
-            if event.type == "message.delta":
-                if reconnecting and event.sequence <= live_start_sequence:
-                    continue
-            elif event.sequence <= cursor:
-                continue
-            yield _encode(event)
-            if event.type != "message.delta":
-                cursor = max(cursor, event.sequence)
-            if event.type in {
-                "run.completed", "run.failed", "run.cancelled", "run.waiting_for_input",
-            }:
-                return
-        except TimeoutError:
+    async for event in run.follow_events():
+        if event is None:
             yield "event: heartbeat\ndata: {}\n\n"
+        elif event.sequence > cursor and not (
+            cursor > 0 and event.type == "message.delta" and event.sequence <= live_start_sequence
+        ):
+            yield _encode(event)
 
 
 @router.get("/tasks")

@@ -35,6 +35,7 @@ const event = (sequence: number, type: AgentEvent['type'], payload: Record<strin
 describe('ChatPage SEO Agent integration', () => {
   beforeEach(() => {
     window.localStorage.clear()
+    window.sessionStorage.clear()
     Element.prototype.scrollIntoView = vi.fn()
     saveProductConfig({
       siteId: 'site_1',
@@ -129,7 +130,35 @@ describe('ChatPage SEO Agent integration', () => {
     vi.clearAllMocks()
   })
 
-  it('keeps a saved human-input request across reload and continues the same run', async () => {
+  it('reopens the original run and restores the reply after a reload during generation', async () => {
+    streamAgentEvents.mockImplementationOnce(async (_url, onEvent: (item: AgentEvent) => void) => {
+      onEvent(event(1, 'run.started', { status: 'running' }))
+      return new Promise(() => {})
+    })
+    const first = render(<ChatPage />)
+    fireEvent.change(screen.getByRole('textbox', { name: '给 SEO 优化专员发送消息' }), {
+      target: { value: '核对首页索引设置' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: '发送消息' }))
+    await screen.findByText('生成中')
+    const originalSignal = streamAgentEvents.mock.calls[0][2].signal
+    first.unmount()
+
+    const reloaded = render(<ChatPage />)
+    expect(await screen.findByText('分析完成')).toBeInTheDocument()
+    expect(originalSignal.aborted).toBe(true)
+    expect(createAgentRun).toHaveBeenCalledTimes(1)
+    expect(streamAgentEvents.mock.calls[1][0]).toBe('/api/v1/seo-agent/chat/runs/run_1/events')
+    expect(streamAgentEvents.mock.calls[1][2].afterEventId).toBe(0)
+    expect(await screen.findAllByText('关键词明细')).toHaveLength(1)
+
+    reloaded.unmount()
+    render(<ChatPage />)
+    expect(await screen.findByText('分析完成')).toBeInTheDocument()
+    expect(streamAgentEvents).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps the human-input request and its continuation cursor across reloads', async () => {
     streamAgentEvents.mockImplementationOnce(async (_url, onEvent: (item: AgentEvent) => void) => {
       onEvent(event(1, 'run.started', {}))
       onEvent(event(2, 'message.completed', { content: '这个页面主要提供什么内容？' }))
@@ -145,17 +174,26 @@ describe('ChatPage SEO Agent integration', () => {
       status: 'recovering', events_url: '/api/v1/seo-agent/chat/runs/run_1/events', cancel_url: '/cancel', after_sequence: 4 })
     streamAgentEvents.mockImplementationOnce(async (_url, onEvent: (item: AgentEvent) => void) => {
       onEvent(event(5, 'run.resumed', {}))
+      return new Promise(() => {})
+    })
+    streamAgentEvents.mockImplementationOnce(async (_url, onEvent: (item: AgentEvent) => void) => {
+      onEvent(event(5, 'run.resumed', {}))
       onEvent(event(6, 'message.completed', { content: '建议已整理，请人工确认。' }))
       onEvent(event(7, 'run.completed', {}))
       return { lastEventId: 7, terminal: true }
     })
-    render(<ChatPage />)
+    const continuation = render(<ChatPage />)
     expect(screen.getByText('进度已保存，补充后继续本次分析。')).toBeInTheDocument()
     fireEvent.change(screen.getByRole('textbox', { name: '给 SEO 优化专员发送消息' }), { target: { value: '这里汇总野外观察笔记' } })
     fireEvent.click(screen.getByRole('button', { name: '发送消息' }))
+    await screen.findByText('恢复中')
+    continuation.unmount()
+
+    render(<ChatPage />)
     expect(await screen.findByText('建议已整理，请人工确认。')).toBeInTheDocument()
     expect(screen.getByText('这个页面主要提供什么内容？')).toBeInTheDocument()
     expect(submitAgentInput).toHaveBeenCalledWith('run_1', 'input_1', '这里汇总野外观察笔记', 'answer')
+    expect(submitAgentInput).toHaveBeenCalledTimes(1)
     expect(createAgentRun).toHaveBeenCalledTimes(1)
     expect(streamAgentEvents.mock.calls.at(-1)?.[2].afterEventId).toBe(4)
   })

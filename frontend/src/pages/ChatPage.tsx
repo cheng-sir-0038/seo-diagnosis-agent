@@ -9,7 +9,7 @@ import {
   StopOutlined,
 } from '@ant-design/icons'
 import { Alert, Button, Input, Tag, Tooltip } from 'antd'
-import { lazy, Suspense, useEffect, useMemo, useReducer, useRef, useState } from 'react'
+import { lazy, Suspense, useEffect, useEffectEvent, useMemo, useReducer, useRef, useState } from 'react'
 
 import { ChatRunDetails } from '../components/ChatRunDetails'
 import { InlineToolResults } from '../components/InlineToolResults'
@@ -23,11 +23,18 @@ import {
 } from '../services/agentApi'
 import { loadProductConfig } from '../services/productApi'
 import { initialRunState, reduceAgentEvent } from '../state/agentState'
-import { createConversation, loadConversations, saveConversations } from '../state/conversations'
+import {
+  createConversation,
+  loadActiveConversationId,
+  loadConversations,
+  saveActiveConversationId,
+  saveConversations,
+} from '../state/conversations'
 import type {
   AgentEvent,
   ChatMessage,
   Conversation,
+  SavedAgentRun,
   ToolRun,
 } from '../types/agent'
 
@@ -99,10 +106,7 @@ const removeRawEvidence = (value: unknown): unknown => {
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
 
-interface ActiveRunConnection {
-  runId: string
-  eventsUrl: string
-  cancelUrl: string
+interface ActiveRunConnection extends SavedAgentRun {
   conversationId: string
   lastEventId: number
 }
@@ -114,7 +118,7 @@ interface ConnectionIssue {
 
 export function ChatPage() {
   const [conversations, setConversations] = useState<Conversation[]>(loadConversations)
-  const [activeId, setActiveId] = useState(conversations[0].id)
+  const [activeId, setActiveId] = useState(() => loadActiveConversationId(conversations))
   const [input, setInput] = useState('')
   const [run, dispatch] = useReducer(reduceAgentEvent, initialRunState)
   const [cancelUrl, setCancelUrl] = useState<string>()
@@ -124,6 +128,7 @@ export function ChatPage() {
   const abortRef = useRef<AbortController | undefined>(undefined)
   const endRef = useRef<HTMLDivElement>(null)
   const runRef = useRef(initialRunState)
+  const activeIdRef = useRef(activeId)
   const activeConnectionRef = useRef<ActiveRunConnection | undefined>(undefined)
   const active = conversations.find((item) => item.id === activeId) ?? conversations[0]
   const latestAssistant = [...active.messages].reverse().find((message) => message.role === 'assistant')
@@ -142,10 +147,6 @@ export function ChatPage() {
   useEffect(() => {
     saveConversations(conversations)
   }, [conversations])
-
-  useEffect(() => {
-    runRef.current = run
-  }, [run])
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -175,9 +176,13 @@ export function ChatPage() {
 
   const persistRunResult = (connection: ActiveRunConnection) => {
     const state = runRef.current
-    if (!state.assistantText && state.tools.length === 0) return
     setConversations((items) => items.map((conversation) => {
-      if (conversation.id !== connection.conversationId) return conversation
+      if (conversation.id !== connection.conversationId
+        || conversation.activeRun?.runId !== connection.runId
+        || conversation.activeRun.afterSequence !== connection.afterSequence) return conversation
+      const settled = ['completed', 'cancelled', 'waiting_for_input'].includes(state.status)
+      const activeRun = settled ? undefined : conversation.activeRun
+      if (!state.assistantText && state.tools.length === 0) return { ...conversation, activeRun }
       const lastUser = conversation.messages.map((message) => message.role).lastIndexOf('user')
       const existing = conversation.messages.findIndex((message, index) => index > lastUser && message.runId === connection.runId)
       const assistantMessage: ChatMessage = {
@@ -191,6 +196,7 @@ export function ChatPage() {
       }
       return {
         ...conversation,
+        activeRun,
         messages: existing < 0 ? [...conversation.messages, assistantMessage]
           : conversation.messages.map((message, index) => index === existing
             ? { ...assistantMessage, id: message.id, createdAt: message.createdAt } : message),
@@ -201,32 +207,40 @@ export function ChatPage() {
 
   const consumeConnection = async (connection: ActiveRunConnection): Promise<boolean> => {
     const controller = new AbortController()
+    abortRef.current?.abort()
     abortRef.current = controller
+    const isCurrent = () => activeConnectionRef.current === connection && !controller.signal.aborted
     setConnectionIssue(undefined)
     try {
       const result = await streamAgentEvents(
         connection.eventsUrl,
-        applyEvent,
+        (event) => {
+          if (isCurrent()) applyEvent(event)
+        },
         {
           signal: controller.signal,
           afterEventId: connection.lastEventId,
           onEventId: (eventId) => {
             connection.lastEventId = eventId
           },
-          onReconnect: () => setReconnecting(true),
+          onReconnect: () => {
+            if (isCurrent()) setReconnecting(true)
+          },
         },
       )
+      if (!isCurrent()) return false
       if (result) connection.lastEventId = result.lastEventId
       persistRunResult(connection)
       return true
     } catch (cause) {
-      if ((cause as Error).name === 'AbortError') return false
+      if (!isCurrent() || (cause as Error).name === 'AbortError') return false
       let detail: Awaited<ReturnType<typeof getAgentRun>> | undefined
       try {
         detail = await getAgentRun(connection.runId)
       } catch {
         // The API may still be restarting. Keep the same Run for manual reconnect.
       }
+      if (!isCurrent()) return false
       const status = String(detail?.status ?? detail?.task_status ?? '').toUpperCase()
       if (status === 'FAILED') {
         applyEvent({
@@ -248,6 +262,7 @@ export function ChatPage() {
           payload: { status: 'cancelled' },
         })
         setConnectionIssue({ message: '任务已经停止', canResume: false })
+        persistRunResult(connection)
       } else {
         setConnectionIssue({
           message: '连接已中断，任务可能仍在后台执行',
@@ -256,13 +271,40 @@ export function ChatPage() {
       }
       return false
     } finally {
-      if (abortRef.current === controller) abortRef.current = undefined
-      setReconnecting(false)
-      if (['completed', 'failed', 'cancelled'].includes(runRef.current.status)) {
-        setCancelUrl(undefined)
+      if (abortRef.current === controller) {
+        abortRef.current = undefined
+        setReconnecting(false)
+        if (['completed', 'failed', 'cancelled'].includes(runRef.current.status)) {
+          setCancelUrl(undefined)
+        }
       }
     }
   }
+
+  const attachRun = (saved: SavedAgentRun, conversationId: string) => {
+    const connection = { ...saved, conversationId, lastEventId: saved.afterSequence }
+    activeConnectionRef.current = connection
+    setCancelUrl(saved.cancelUrl)
+    return consumeConnection(connection)
+  }
+
+  const restoreActiveRun = useEffectEvent(() => {
+    const saved = active.activeRun
+    if (activeConnectionRef.current || !saved || saved.siteId !== loadProductConfig()?.siteId) return
+    resetRun('pending')
+    void attachRun(saved, active.id)
+  })
+
+  useEffect(() => {
+    saveActiveConversationId(activeId)
+    const restoreTimer = window.setTimeout(restoreActiveRun, 0)
+    return () => {
+      window.clearTimeout(restoreTimer)
+      abortRef.current?.abort()
+      abortRef.current = undefined
+      activeConnectionRef.current = undefined
+    }
+  }, [activeId])
 
   const reconnectActiveRun = async () => {
     const connection = activeConnectionRef.current
@@ -276,9 +318,11 @@ export function ChatPage() {
       } catch {
         // Reconnecting the event stream can still succeed after a short API restart.
       }
+      if (activeConnectionRef.current !== connection) return
       const status = String(detail?.status ?? detail?.task_status ?? '').toUpperCase()
       if (status === 'FAILED' || status === 'RECOVERY_BLOCKED') {
         await resumeAgentRun(connection.runId)
+        if (activeConnectionRef.current !== connection) return
         applyEvent({
           event_id: crypto.randomUUID(),
           run_id: connection.runId,
@@ -290,6 +334,7 @@ export function ChatPage() {
       }
       await consumeConnection(connection)
     } catch (cause) {
+      if (activeConnectionRef.current !== connection) return
       setConnectionIssue({
         message: (cause as Error).message || '重新连接失败',
         canResume: connectionIssue?.canResume ?? false,
@@ -301,11 +346,7 @@ export function ChatPage() {
   const newConversation = () => {
     const conversation = createConversation()
     setConversations((items) => [conversation, ...items])
-    setActiveId(conversation.id)
-    setConversationsOpen(false)
-    setConnectionIssue(undefined)
-    activeConnectionRef.current = undefined
-    resetRun('idle')
+    selectConversation(conversation.id)
   }
 
   const send = async (action: 'answer' | 'use_available' = 'answer') => {
@@ -341,17 +382,17 @@ export function ChatPage() {
           siteId: productConfig.siteId,
           conversationId: active.id,
         })
-      setCancelUrl(created.cancel_url)
-      const connection: ActiveRunConnection = {
+      const saved: SavedAgentRun = {
+        siteId: productConfig.siteId,
         runId: created.run_id,
         eventsUrl: created.events_url,
         cancelUrl: created.cancel_url,
-        conversationId: active.id,
-        lastEventId: created.after_sequence ?? 0,
+        afterSequence: created.after_sequence ?? 0,
       }
-      activeConnectionRef.current = connection
-      await consumeConnection(connection)
+      setActiveConversation((conversation) => ({ ...conversation, activeRun: saved }))
+      if (activeIdRef.current === active.id) await attachRun(saved, active.id)
     } catch (cause) {
+      if (activeIdRef.current !== active.id) return
       applyEvent({
         event_id: crypto.randomUUID(),
         run_id: '',
@@ -364,20 +405,29 @@ export function ChatPage() {
   }
 
   const stop = async () => {
+    const connection = activeConnectionRef.current
+    if (!connection || !cancelUrl) return
     try {
-      if (cancelUrl) await cancelAgentRun(cancelUrl)
-    } finally {
-      abortRef.current?.abort()
-      setConnectionIssue(undefined)
-      applyEvent({
-        event_id: crypto.randomUUID(),
-        run_id: runRef.current.runId ?? '',
-        type: 'run.cancelled',
-        sequence: runRef.current.lastSequence + 1,
-        created_at: new Date().toISOString(),
-        payload: { status: 'cancelled' },
-      })
+      await cancelAgentRun(cancelUrl)
+    } catch (cause) {
+      if (activeConnectionRef.current === connection) {
+        setConnectionIssue({ message: (cause as Error).message, canResume: false })
+      }
+      return
     }
+    if (activeConnectionRef.current !== connection) return
+    abortRef.current?.abort()
+    setCancelUrl(undefined)
+    setConnectionIssue(undefined)
+    applyEvent({
+      event_id: crypto.randomUUID(),
+      run_id: connection.runId,
+      type: 'run.cancelled',
+      sequence: runRef.current.lastSequence + 1,
+      created_at: new Date().toISOString(),
+      payload: { status: 'cancelled' },
+    })
+    persistRunResult(connection)
   }
 
   const statusColor = useMemo(
@@ -396,9 +446,14 @@ export function ChatPage() {
   )
 
   const selectConversation = (id: string) => {
-    setActiveId(id)
     setConversationsOpen(false)
+    if (activeIdRef.current === id) return
+    activeIdRef.current = id
+    abortRef.current?.abort()
+    setActiveId(id)
+    setCancelUrl(undefined)
     setConnectionIssue(undefined)
+    setReconnecting(false)
     activeConnectionRef.current = undefined
     resetRun('idle')
   }

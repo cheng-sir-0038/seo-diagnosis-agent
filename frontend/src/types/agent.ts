@@ -72,11 +72,20 @@ export interface ChatMessage {
   inputRequest?: HumanInputRequest
 }
 
+export interface SavedAgentRun {
+  siteId: string
+  runId: string
+  eventsUrl: string
+  cancelUrl: string
+  afterSequence: number
+}
+
 export interface Conversation {
   id: string
   title: string
   messages: ChatMessage[]
   updatedAt: string
+  activeRun?: SavedAgentRun
 }
 
 

@@ -1,6 +1,7 @@
 import type { Conversation } from '../types/agent'
 
 const STORAGE_KEY = 'agent-workspace-conversations-v1'
+const ACTIVE_CONVERSATION_KEY = 'agent-workspace-active-conversation-v1'
 
 export const createConversation = (): Conversation => ({
   id: crypto.randomUUID(),
@@ -20,4 +21,13 @@ export function loadConversations(): Conversation[] {
 
 export function saveConversations(conversations: Conversation[]): void {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(conversations))
+}
+
+export function loadActiveConversationId(conversations: Conversation[]): string {
+  const saved = sessionStorage.getItem(ACTIVE_CONVERSATION_KEY)
+  return conversations.find(({ id }) => id === saved)?.id ?? conversations[0].id
+}
+
+export function saveActiveConversationId(conversationId: string): void {
+  sessionStorage.setItem(ACTIVE_CONVERSATION_KEY, conversationId)
 }

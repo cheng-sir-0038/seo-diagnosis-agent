@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -19,6 +20,9 @@ class RunStatus(StrEnum):
     RECOVERING = "recovering"
     RECOVERY_BLOCKED = "recovery_blocked"
     WAITING_FOR_INPUT = "waiting_for_input"
+
+
+STREAM_END_EVENTS = {"run.completed", "run.failed", "run.cancelled", "run.waiting_for_input"}
 
 
 class HumanInputRequest(BaseModel):
@@ -68,7 +72,7 @@ class AgentRun:
     messages: list[dict[str, Any]]
     status: RunStatus = RunStatus.PENDING
     events: list[AgentEvent] = field(default_factory=list)
-    queue: asyncio.Queue[AgentEvent] = field(default_factory=asyncio.Queue)
+    _events_changed: asyncio.Event = field(default_factory=asyncio.Event, init=False, repr=False)
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     task: asyncio.Task[None] | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -102,8 +106,32 @@ class AgentRun:
             payload=payload or {},
         )
         self.events.append(event)
-        self.queue.put_nowait(event)
+        self._events_changed.set()
+        self._events_changed = asyncio.Event()
         return event
+
+    async def follow_events(self) -> AsyncIterator[AgentEvent | None]:
+        index = 0
+        while True:
+            if index < len(self.events):
+                event = self.events[index]
+                index += 1
+                yield event
+                continue
+            stopped = self.terminal or self.status in {
+                RunStatus.WAITING_FOR_INPUT, RunStatus.RECOVERY_BLOCKED,
+            }
+            # A running task can set its status before emitting the final event.
+            if stopped and (
+                self.task is None
+                or self.task.done()
+                or (self.events and self.events[-1].type in STREAM_END_EVENTS)
+            ):
+                return
+            try:
+                await asyncio.wait_for(self._events_changed.wait(), timeout=15)
+            except TimeoutError:
+                yield None
 
     def request_cancel(self) -> None:
         self.cancel_event.set()

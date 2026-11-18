@@ -99,22 +99,8 @@ async def _event_stream(run_id: str) -> AsyncIterator[str]:
     run = run_manager.get(run_id)
     if run is None:
         return
-    sent = 0
-    while True:
-        while sent < len(run.events):
-            event = run.events[sent]
-            sent += 1
-            yield _encode(event)
-        if run.terminal:
-            return
-        try:
-            event = await asyncio.wait_for(run.queue.get(), timeout=15)
-            if event.sequence <= sent:
-                continue
-            sent = event.sequence
-            yield _encode(event)
-        except TimeoutError:
-            yield "event: heartbeat\ndata: {}\n\n"
+    async for event in run.follow_events():
+        yield _encode(event) if event is not None else "event: heartbeat\ndata: {}\n\n"
 
 
 @router.get("/runs/{run_id}/events")
