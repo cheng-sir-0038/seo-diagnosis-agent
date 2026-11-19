@@ -82,12 +82,24 @@ class GeoQuestionSelection(GeoContract):
 
 
 class GeoContentEdit(GeoContract):
-    gap: str = Field(
+    gap: str | None = Field(
+        default=None,
         min_length=1,
         max_length=240,
-        description="描述本次正文摘录中可观察到的改稿机会。摘录之外的内容放入 needs_verification。",
+        description="旧版提示词兼容字段，当前忽略。",
     )
-    draft: str = Field(min_length=1, max_length=600)
+    focus: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=60,
+        description="从 page_quote 逐字摘取要前置的简短主题。",
+    )
+    draft: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=600,
+        description="旧版提示词兼容字段，前置建议直接使用已核对的 page_quote。",
+    )
     page_quote: str = Field(min_length=1, max_length=200)
     citation_id: int = Field(ge=1)
 

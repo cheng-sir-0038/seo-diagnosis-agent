@@ -2,7 +2,7 @@
 
 选一个网站，直接说你想查什么。DeepSeek 根据问题和取回的证据选择下一步工具，能查页面问题、研究关键词和排名页、拟定 SEO 建议。配置 Cloudflare Workers AI 后，也能在对话里生成页面分享图。
 
-**Breadtopia GEO 实跑**　Agent 从 Google 搜索样本中选出一题，通过 A2A 交给独立的引用 Agent。核对到 5 条外站引用后，结合页面证据给出 3 条改稿建议。 [完整对话](docs/screenshots/22-geo-breadtopia-conversation.png) · [Langfuse A2A 交接](docs/screenshots/23-geo-langfuse-a2a.png)
+**Breadtopia GEO 实跑**　Agent 从 Google 搜索样本中选出一题，通过 A2A 交给独立的引用 Agent。核对到 5 条外站引用后，从页面摘录中选出 3 段适合前置的已有说明。 [完整对话](docs/screenshots/22-geo-breadtopia-conversation.png) · [Langfuse A2A 交接](docs/screenshots/23-geo-langfuse-a2a.png)
 
 ## 真实对话
 
@@ -159,16 +159,16 @@ DeepSeek 根据页面内容和用户要求选取主体及构图。代码校验 J
 
 > 围绕 how to make sourdough starter，给 Breadtopia 的酸种酵头教程做一次 GEO 分析。从 Google 上实际出现的问题里选一个，核对 DeepSeek 这次引用了谁，再按页面正文给出改稿建议。
 
-本次选题保留 4 条 Google 相关问题和 1 条联想词，选中 **How do you start to make sourdough starter?**。DeepSeek 返回 5 条引用，均来自其他域名。内容编辑结合页面原文和引用证据给出 3 条改稿草稿。[目标页面](https://breadtopia.com/how-to-make-a-sourdough-starter/)
+本次选题保留 4 条 Google 相关问题和 1 条联想词，选中 **How do you start to make sourdough starter?**。DeepSeek 返回 5 条引用，均来自其他域名。内容编辑建议前置酵头定义、影响因素及文章涵盖的内容。[目标页面](https://breadtopia.com/how-to-make-a-sourdough-starter/)
 
 <details>
 <summary>查看 Breadtopia 实跑的完整对话和 A2A 交接</summary>
 
-对话图重放改稿证据范围调整前的一次 DeepSeek 实跑，保留同一个 Run 的原始提问、完整回复和证据卡片。该次演示用 `AGENT_CONTEXT_CHARACTER_LIMIT=80000` 保留完整取数结果。
+对话图重放同一次 DeepSeek 实跑的提问、证据卡片和总结。三张卡片直接展示在 3500 字符正文摘录中核对过的原文，总结逐条说明哪些已有内容适合前置。起始配比、喂养频率等细节留待核实。本次运行使用 `AGENT_CONTEXT_CHARACTER_LIMIT=80000`。
 
-![Breadtopia GEO 的原始提问、选题、引用结果与改稿建议](docs/screenshots/22-geo-breadtopia-conversation.png)
+![Breadtopia GEO 的完整提问、选题、引用结果与标明证据范围的改稿建议](docs/screenshots/22-geo-breadtopia-conversation.png)
 
-链路图上下展示两条实际的 Langfuse Trace。主 Agent 通过 HTTP 发送 JSON-RPC 请求，引用 Agent 用同一个消息 ID 接收任务，并返回可核对的 Task 回执。
+链路图上下展示本次运行的两条 Langfuse Trace。主 Agent 通过 HTTP 发送 JSON-RPC 请求，两边用同一个 `a2a_message_id` 对应交接，返回的 Task ID 对应本轮引用结果。
 
 ![Langfuse 多 Agent 链路及同一个 A2A 消息 ID 和 Task 回执](docs/screenshots/23-geo-langfuse-a2a.png)
 
@@ -190,7 +190,7 @@ sequenceDiagram
     E-->>S: 有依据的改稿和待核实项
 ```
 
-选题使用 Serper 的 Google 关联问题和联想词，每种各查一次。引用核验只采样一个问题，按模型回答中的 `url_citation` 匹配目标域名和子域。报告标明查询时间、模型和链接，分别呈现本次没有搜、搜索失败、没有返回引用，以及返回的引用未命中目标站。改稿以目标页最多 3500 字符的正文摘录和本轮引用为依据，每条草稿校验目标页原文和引用 ID。证据卡片与对话总结沿用同一摘录范围和通过校验的草稿，摘录之外的内容待核实。
+选题使用 Serper 的 Google 关联问题和联想词，每种各查一次。引用核验只采样一个问题，按模型回答中的 `url_citation` 匹配目标域名和子域。报告标明查询时间、模型和链接，分别呈现本次没有搜、搜索失败、没有返回引用，以及返回的引用未命中目标站。改稿从目标页最多 3500 字符的正文摘录选出适合前置的原文，逐条校验原文和引用 ID。卡片与总结使用同一批前置建议。外部引用用于回答引用核验结果，无法从摘录确认的细节留待核实。
 
 默认引用来源是 DeepSeek，使用 `DEEPSEEK_API_KEY` 调官方 `deepseek-flash` 和 `deepseek_web_search`。可选填 `OPENAI_API_KEY`，并在对话中明确要求用 OpenAI API 核验，使用 Responses `web_search`。`GEO_OPENAI_MODEL` 默认 `gpt-6.2-astra`。选题、主对话和改稿沿用已有 DeepSeek 配置。每次结论限定在指定模型的 API 样本。 [DeepSeek 文档](https://api-docs.deepseek.com/guides/web_tools/) · [OpenAI 文档](https://developers.openai.com/api/docs/guides/tools-web-search)
 

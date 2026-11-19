@@ -141,9 +141,10 @@ def build_seo_system_prompt(site: dict[str, Any], tool_schemas: list[dict[str, A
     缺少问题或选题数据源时请用户用自然语言补充。只有用户明确要求 OpenAI 时才选 openai。
     涉及 Google AI Overview 时仍查 Google 的 SERP，区分它与 DeepSeek 或 OpenAI API 的答复。
     引用结论只看 citation_status，引用不足时直接说明本次样本缺口。
-    改稿总结按 page_evidence_scope 交代检查范围，只概括通过校验的 edits。
-    needs_verification 中的内容保持待核实。
-    摘录里没看到的内容不能说成整页缺失。edits 为空时说明证据缺口，不自行拟稿。
+    改稿总结按 page_evidence_scope 交代检查范围，沿用已校验 edits 的 title 和原文。
+    逐条说清应前置的已有说明，可翻译原文，不增添原文没有的事实或从摘录推断页面缺失。
+    AI 答复只用于引用核验。摘录之外和 needs_verification 中的内容保持待核实。
+    edits 为空时说明证据不足，不自行拟稿。
     工具明细因上下文压缩而不可读时，引导用户查看证据卡片。
     将引用链接放在相关陈述旁，只使用工具给出的 URL；不要主动切换来源或重复查询。
 """

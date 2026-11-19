@@ -438,7 +438,7 @@ class GeoContentWorkflow(AgentTool):
             items.extend(citations["items"])
             if citations["citation_status"] in {"cited", "not_cited"}:
                 report = citations["evidence"]["sample"]["report"]
-        edits = []
+        edits: list[dict[str, Any]] = []
         needs_verification = []
         if page_info and report:
             sources = [
@@ -458,27 +458,36 @@ class GeoContentWorkflow(AgentTool):
                 {"question": question, "page": page_info, "citation_evidence": sources},
             )
             if draft:
-                edits = [
+                verified_edits = [
                     edit
                     for edit in draft.edits
                     if edit.page_quote in page_info["excerpt"] and edit.citation_id <= len(sources)
                 ]
-                if len(edits) != len(draft.edits):
+                if len(verified_edits) != len(draft.edits):
                     steps.coverage["content_editor"].update(
                         status="partial",
                         error_code="GEO_INVALID_EVIDENCE",
                     )
-                for index, edit in enumerate(edits, start=1):
+                for index, edit in enumerate(verified_edits, start=1):
                     source = sources[edit.citation_id - 1]
+                    title = "建议前置已有说明"
+                    if edit.focus and edit.focus in edit.page_quote:
+                        title = f"建议前置 · {edit.focus}"
+                    proposal = {
+                        "title": title,
+                        "draft": edit.page_quote,
+                        "page_quote": edit.page_quote,
+                        "citation_id": edit.citation_id,
+                    }
+                    edits.append(proposal)
                     items.append(
                         {
                             "key": f"draft-{index}",
-                            "title": edit.gap,
-                            "summary": edit.draft,
+                            "title": proposal["title"],
+                            "summary": proposal["draft"],
                             "url": source["url"],
                             "metadata": [
                                 scope_row,
-                                {"label": "目标页原文", "value": edit.page_quote},
                                 {"label": "AI 答案参考链接", "value": source["title"]},
                             ],
                         }
@@ -508,12 +517,12 @@ class GeoContentWorkflow(AgentTool):
             )
         return steps.finish(
             "geo_content",
-            "GEO 内容缺口与改稿",
+            "GEO 改稿建议",
             items,
             [scope, "引用结论只适用于本次 AI 联网回答，改稿供人工审阅。"],
             question=question or None,
             target_url=page_info["url"] if page_info else None,
             page_evidence_scope=scope,
-            edits=[edit.model_dump(mode="json") for edit in edits],
+            edits=edits,
             needs_verification=needs_verification,
         )

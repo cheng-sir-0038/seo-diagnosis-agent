@@ -28,6 +28,8 @@ SITE = {"id": "site-1", "domain": "example.com", "default_country": "US", "defau
 QUESTION = "How do I store roasted coffee?"
 EXCERPT = "Our coffee is packed in a resealable bag."
 VERIFY = "Confirm how long the coffee keeps after opening."
+LEGACY_GAP = "The page does not say whether the bag can be resealed."
+LEGACY_DRAFT = "The unopened bag stays fresh for a year."
 ANSWER = "Keep roasted coffee in a sealed container."
 CITATION = {
     "url": "https://learn.example.com/guide",
@@ -249,9 +251,10 @@ class EvidenceSource:
 
 
 class ModelAnswers:
-    def __init__(self, question_id=1, invalid_edit=False):
+    def __init__(self, question_id=1, invalid_edit=False, focus="resealable bag"):
         self.calls: list[tuple[type, dict]] = []
         self.question_id, self.invalid_edit = question_id, invalid_edit
+        self.focus = focus
 
     def with_structured_output(self, schema, **kwargs):
         async def invoke(messages):
@@ -259,22 +262,27 @@ class ModelAnswers:
             if schema is GeoQuestionSelection:
                 return {"question_id": self.question_id, "reason": "Readers need storing advice."}
             assert schema is GeoContentDraft
-            return {
-                "edits": [
-                    {
-                        "gap": "Make the storage benefit of the resealable bag easier to find.",
-                        "citation_id": 1,
-                        "page_quote": "fabricated quote" if self.invalid_edit else EXCERPT,
-                        "draft": "The package is resealable.",
-                    }
-                ],
-                "needs_verification": [VERIFY],
+            edit = {
+                "gap": LEGACY_GAP,
+                "citation_id": 1,
+                "page_quote": "fabricated quote" if self.invalid_edit else EXCERPT,
+                "draft": LEGACY_DRAFT,
             }
+            if self.focus is not None:
+                edit["focus"] = self.focus
+            return {"edits": [edit], "needs_verification": [VERIFY]}
 
         return type("Runnable", (), {"ainvoke": staticmethod(invoke)})()
 
 
-async def test_geo_chain_hands_off_evidence_and_records_the_real_a2a_task(tmp_path):
+@pytest.mark.parametrize(("focus", "expected_title"), [
+    ("resealable bag", "建议前置 · resealable bag"),
+    (None, "建议前置已有说明"),
+    ("opaque packaging", "建议前置已有说明"),
+])
+async def test_geo_chain_hands_off_evidence_and_records_the_real_a2a_task(
+    tmp_path, focus, expected_title,
+):
     database = ObservabilityDatabase(tmp_path / "obs.db")
     exported = InMemorySpanExporter()
     observer = ObservabilityClient(
@@ -290,8 +298,8 @@ async def test_geo_chain_hands_off_evidence_and_records_the_real_a2a_task(tmp_pa
         ],
     )
     part_reviewed = (EXCERPT + " Coffee notes." * 300)[:3500]
-    outside_review = "The unopened bag stays fresh for a year."
-    replies = ModelAnswers()
+    outside_review = "Coffee also comes in a single-serve format."
+    replies = ModelAnswers(focus=focus)
     source = EvidenceSource(content_excerpt=f"{part_reviewed} {outside_review}")
     runner = StructuredModelRunner(model_factory=lambda: replies, observability=observer)
     transport = httpx.MockTransport(lambda _: httpx.Response(200, json=deepseek_body()))
@@ -356,7 +364,11 @@ async def test_geo_chain_hands_off_evidence_and_records_the_real_a2a_task(tmp_pa
         assert summary_data["edits"] == data["edits"]
         assert summary_data["needs_verification"] == [VERIFY]
         draft_card = next(item for item in data["items"] if item["key"] == "draft-1")
-        assert draft_card["summary"] == summary_data["edits"][0]["draft"]
+        assert draft_card["title"] == summary_data["edits"][0]["title"] == expected_title
+        assert LEGACY_GAP not in summary_input
+        assert LEGACY_DRAFT not in summary_input
+        assert "opaque packaging" not in summary_input
+        assert draft_card["summary"] == summary_data["edits"][0]["draft"] == EXCERPT
         assert {
             "label": "证据范围", "value": summary_data["page_evidence_scope"],
         } in draft_card["metadata"]
