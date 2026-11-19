@@ -1,6 +1,6 @@
 # 对话截图
 
-对话截图在前端重放已保存的运行记录。结果图保留用户提问、Agent 回复和对应证据，入口图展示如何发起问题。搜索现状和排名页优化使用 `python.org`，Semrush 使用演示站 `trailguide.example`，GEO 使用 MDN 域名介绍页，其余案例使用测试站 `test0922.guxiguxi.com`。
+对话截图在前端重放已保存的运行记录。结果图保留用户提问、Agent 回复和对应证据，入口图展示如何发起问题。搜索现状和排名页优化使用 `python.org`，Semrush 使用演示站 `trailguide.example`，GEO 使用 Breadtopia 的酸种酵头教程，其余案例使用测试站 `test0922.guxiguxi.com`。
 
 搜索查询采用美国市场。测试站点及部分主题词缺少的数据保留为未知。页面建议待人工确认。对话图遮住内部运行标识，Langfuse 图保留用于核对 A2A 交接的消息 ID 和 Task ID。
 
@@ -11,7 +11,7 @@
 | 首页体检 | [首页最值得先改的地方](19-homepage-priority.png)、[加做移动端性能检查](02-page-audit.png) | [site_audit.py](../../src/seo_agent/workflows/site_audit.py) |
 | 搜索现状 | [排名关键词与对应页面](03-search-diagnosis.png) | [search_diagnosis.py](../../src/seo_agent/workflows/search_diagnosis.py) |
 | Semrush 月度竞品分析 | [完整对话](20-semrush-competition.png)、[执行详情](21-semrush-workflow-details.png) | [semrush_competition.py](../../src/seo_agent/workflows/semrush_competition.py) |
-| GEO 选题、引用核验与改稿 | [MDN 完整对话](22-geo-mdn-conversation.png)、[Langfuse 的 A2A 交接](23-geo-langfuse-a2a.png) | [geo.py](../../src/seo_agent/workflows/geo.py) |
+| GEO 选题、引用核验与改稿 | [Breadtopia 完整对话](22-geo-breadtopia-conversation.png)、[Langfuse 的 A2A 交接](23-geo-langfuse-a2a.png) | [geo.py](../../src/seo_agent/workflows/geo.py) |
 | 关键词机会 | [候选词与未知指标](04-keyword-opportunities.png) | [keyword_opportunity.py](../../src/seo_agent/workflows/keyword_opportunity.py) |
 | 已有排名页优化 | [排名样本与页面核验](05-ranking-pages.png) | [ranking_page_optimization.py](../../src/seo_agent/workflows/ranking_page_optimization.py) |
 | 综合诊断 | [汇总证据与覆盖范围](06-site-diagnosis.png) | [site_diagnosis.py](../../src/seo_agent/workflows/site_diagnosis.py) |
