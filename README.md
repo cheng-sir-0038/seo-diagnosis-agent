@@ -392,4 +392,8 @@ npm run dev
 
 报告记录选中的工具、证据来源、需逐字核对的字段、终态、耗时和对话模型 Token。评测需要的工具未注册，或必需工具因上游失败拿不到证据时，记为 `BLOCKED`。加 `--case tdk` 可单独复跑一题。
 
+## 开源许可与致谢
+
 本项目采用 [MIT 许可证](LICENSE)。
+
+感谢 Seth Black 和贡献者开源 `python-seo-analyzer`。本项目的可选 HTML 基础扫描复用了它的词数统计、标题层级、内链和图片检查。[上游项目](https://github.com/sethblack/python-seo-analyzer)
