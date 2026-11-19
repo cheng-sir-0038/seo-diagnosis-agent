@@ -94,3 +94,24 @@ async def test_provider_rejects_blank_keyword_and_unmappable_nonempty_results() 
     provider.client.search = AsyncMock(return_value={"organic": [{"title": "No link"}]})
     with pytest.raises(InternalProviderResponseError, match="无法映射"):
         await provider.get_serp_overview(keyword="seo", country="us")
+
+
+@pytest.mark.asyncio
+async def test_provider_maps_visible_related_questions_only_on_request() -> None:
+    client = SerperClient(SerperConfig(api_key="test-key"))
+    client.search = AsyncMock(return_value={
+        "organic": [{"title": "Organic page", "link": "https://example.com/coffee"}],
+        "peopleAlsoAsk": [
+            {"question": "How should I store coffee?", "link": "https://example.com/storage"},
+            {"title": "Missing question"},
+        ],
+    })
+    provider = SerperProvider(client)
+    related = await provider.get_serp_overview(
+        "coffee storage", "sg", language="en", result_types=["people_also_ask"],
+    )
+    assert [(row.type, row.title, row.url) for row in related] == [
+        ("people_also_ask", "How should I store coffee?", "https://example.com/storage"),
+    ]
+    organic = await provider.get_serp_overview("coffee storage", "sg", language="en")
+    assert [row.title for row in organic] == ["Organic page"]

@@ -24,6 +24,7 @@ from src.facade.data_facade import facade
 from src.observability.runtime import observability_client, observability_database
 from src.seo_agent.chat.runtime import build_seo_system_prompt
 from src.seo_agent.chat.tools import build_seo_agent_registry
+from src.seo_agent.geo_a2a import configured_citation_client
 from src.seo_agent.runtime import (
     seo_agent_system_service,
     seo_chat_harness_store,
@@ -111,6 +112,9 @@ async def _schedule_restored_run(run: AgentRun) -> None:
         snapshots=cache_manager,
         model_runner=structured_model_automation.model_runner,
         image_generator=cloudflare_share_images,
+        geo_citation_client=configured_citation_client(
+            observability_client if observability_database.started else None
+        ),
         user_messages=[str(message.get("content", "")) for message in run.messages
                        if message.get("role") == "user"],
     )
@@ -143,6 +147,9 @@ async def create_run(body: CreateSeoAgentRunRequest) -> CreateSeoAgentRunRespons
         snapshots=cache_manager,
         model_runner=structured_model_automation.model_runner,
         image_generator=cloudflare_share_images,
+        geo_citation_client=configured_citation_client(
+            observability_client if observability_database.started else None
+        ),
         user_messages=[message.content for message in body.messages if message.role == "user"],
     )
     if not registry.schemas():

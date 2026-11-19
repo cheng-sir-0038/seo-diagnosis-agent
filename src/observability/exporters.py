@@ -19,7 +19,7 @@ from opentelemetry.sdk.trace.export import (
 )
 from opentelemetry.trace import Link, NonRecordingSpan, Status, StatusCode, set_span_in_context
 
-from src.observability.models import ExportEnvelope
+from src.observability.models import ExportEnvelope, SpanKind
 from src.observability.otel_ids import ExplicitIdGenerator, span_context_from_hex
 from src.observability.storage import ObservabilityDatabase
 
@@ -159,11 +159,16 @@ class OpenTelemetryExporter:
             )
         else:
             metadata = self._json_object(payload.get("metadata_json"))
-            attributes["langfuse.observation.type"] = (
-                "tool"
-                if envelope.entity_type == "tool_call" or metadata.get("tool_execution") is True
-                else "span"
-            )
+            observation_type = "span"
+            if payload.get("kind") == SpanKind.AGENT:
+                observation_type = "agent"
+            elif envelope.entity_type == "tool_call" or metadata.get("tool_execution") is True:
+                observation_type = "tool"
+            attributes["langfuse.observation.type"] = observation_type
+            for key in ("a2a_message_id", "a2a_task_id", "protocol", "transport"):
+                value = metadata.get(key)
+                if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_./-]{1,100}", value):
+                    attributes[f"langfuse.observation.metadata.{key}"] = value
             if envelope.entity_type == "tool_call":
                 attributes.update(self._tool_metadata(payload))
                 attributes.update(

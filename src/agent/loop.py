@@ -598,6 +598,7 @@ class AgentLoop:
             {"tool_call_id": call.id, "name": call.name, "arguments": call.arguments},
         )
         started = time.perf_counter()
+        timeout = getattr(tool, "timeout_seconds", None) or self.tool_timeout
         tool_span = (
             self.observer.span(
                 call.name if tool is not None else "unknown_tool",
@@ -633,7 +634,7 @@ class AgentLoop:
                             and run.human_input.tool_name == call.name else {},
                         ),
                     ),
-                    timeout=self.tool_timeout,
+                    timeout=timeout,
                 )
                 payload = result.model_dump(mode="json")
                 if not result.success:
@@ -664,7 +665,7 @@ class AgentLoop:
                     arguments=call.arguments,
                     result_summary=result_payload,
                     status=status,
-                    timeout_seconds=self.tool_timeout,
+                    timeout_seconds=timeout,
                     latency_ms=latency_ms,
                     error_code=error_code,
                     error_message=error_message,

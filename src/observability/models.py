@@ -15,6 +15,7 @@ class Status(StrEnum):
 
 
 class SpanKind(StrEnum):
+    AGENT = "AGENT"
     INTERNAL = "INTERNAL"
     MODEL = "MODEL"
     TOOL = "TOOL"

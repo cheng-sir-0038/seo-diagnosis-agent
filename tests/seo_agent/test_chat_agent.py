@@ -263,6 +263,7 @@ async def test_seo_chat_api_rejects_when_no_live_tools(monkeypatch) -> None:
         return SITE
 
     monkeypatch.setattr(route.seo_agent_system_service, "get_site", get_site)
+    monkeypatch.setattr(route, "configured_citation_client", lambda *_: None)
     monkeypatch.setattr(
         route,
         "build_seo_agent_registry",

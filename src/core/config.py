@@ -129,6 +129,9 @@ class Settings(BaseSettings):
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-v4-flash"
     deepseek_request_timeout: float = 60.0
+    geo_a2a_url: str = ""
+    openai_api_key: SecretStr = SecretStr("")
+    geo_openai_model: str = "gpt-6.2-astra"
     cloudflare_account_id: str = ""
     cloudflare_api_token: SecretStr = SecretStr("")
     agent_max_iterations: int = 8

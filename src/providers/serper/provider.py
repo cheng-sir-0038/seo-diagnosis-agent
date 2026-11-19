@@ -99,7 +99,6 @@ class SerperProvider(BaseProvider):
         autocorrect: bool = True,
         **kwargs: Any,
     ) -> list[SerpResult]:
-        del kwargs
         query = keyword.strip()
         if not query:
             raise ValueError("Serper keyword 不能为空")
@@ -118,6 +117,24 @@ class SerperProvider(BaseProvider):
             page=selected_page,
             autocorrect=bool(autocorrect),
         )
+        if kwargs.get("result_types") == ["people_also_ask"]:
+            questions = raw.get("peopleAlsoAsk", [])
+            if not isinstance(questions, list):
+                raise InternalProviderResponseError(
+                    "Serper 响应 peopleAlsoAsk 字段格式错误", provider="serper",
+                )
+            fetched_at = datetime.now(UTC)
+            return [
+                SerpResult(
+                    source=DataSource.SERPER, fetched_at=fetched_at,
+                    data_date=fetched_at.date(), is_estimated=False,
+                    # Ordinal in the question block, distinct from organic rank.
+                    rank=index, type="people_also_ask", title=question,
+                    url=_text(item.get("link")),
+                )
+                for index, item in enumerate(questions[:selected_limit], start=1)
+                if isinstance(item, Mapping) and (question := _text(item.get("question")))
+            ]
         organic = raw.get("organic", [])
         if not isinstance(organic, list):
             raise InternalProviderResponseError(

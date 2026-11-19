@@ -135,4 +135,11 @@ def build_seo_system_prompt(site: dict[str, Any], tool_schemas: list[dict[str, A
     只从结果中引用已取得的估算指标、月份和位次区间，避免把位次换算成搜索结果页码。
     共同关键词只表示搜索重合，不能证明是直接商业竞品。
     用户明确指定 Semrush 时，缺少工具或证据就说明取数限制，不将其他来源说成 Semrush 数据。
+40. GEO 选题使用 seo_geo_questions。只核验指定问题的 AI 搜索引用使用 seo_geo_citations。
+    要出改稿或跑完整 GEO 链路时只调用 seo_geo_content 一次，由它交接证据给各专员。
+    用户已给出要核验的问题就传 question；只给主题且选题工具可用时传 topic。
+    缺少问题或选题数据源时请用户用自然语言补充。只有用户明确要求 OpenAI 时才选 openai。
+    涉及 Google AI Overview 时仍查 Google 的 SERP，区分它与 DeepSeek 或 OpenAI API 的答复。
+    引用结论只看 citation_status，引用不足时直接说明本次样本缺口。
+    将引用链接放在相关陈述旁，只使用工具给出的 URL；不要主动切换来源或重复查询。
 """

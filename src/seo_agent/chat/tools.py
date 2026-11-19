@@ -12,7 +12,13 @@ from src.core.config import settings
 from src.models.common import Capability
 from src.observability.client import ObservabilityClient
 from src.seo_agent.chat.presentation import build_presentation, can_render
+from src.seo_agent.geo_a2a import GeoCitationClient
 from src.seo_agent.workflows.cloudflare_images import CloudflareShareImages
+from src.seo_agent.workflows.geo import (
+    GeoCitationWorkflow,
+    GeoContentWorkflow,
+    GeoQuestionWorkflow,
+)
 from src.seo_agent.workflows.keyword_opportunity import KeywordOpportunityWorkflow
 from src.seo_agent.workflows.page_change_review import PageChangeReviewWorkflow
 from src.seo_agent.workflows.page_suggestions import PageSuggestionsWorkflow
@@ -522,6 +528,7 @@ def build_seo_agent_registry(
     model_runner: StructuredModelRunner | None = None,
     user_messages: list[str] | None = None,
     image_generator: CloudflareShareImages | None = None,
+    geo_citation_client: GeoCitationClient | None = None,
 ) -> ToolRegistry:
     live_capabilities = facade.live_capabilities()
     if (
@@ -561,6 +568,22 @@ def build_seo_agent_registry(
                 observability=observability, user_messages=user_messages,
             ))
     tools = {tool.name: tool for tool in registry.values()}
+    geo_timeout = max(settings.agent_tool_timeout, settings.deepseek_request_timeout)
+    if model_runner is not None and {
+        Capability.AUTOCOMPLETE, Capability.SERP_OVERVIEW, Capability.PAGE_METADATA,
+    } <= live_capabilities:
+        researcher = GeoQuestionWorkflow(tools, model_runner, geo_timeout, observability)
+        registry.register(researcher)
+        tools = {**tools, researcher.name: researcher}
+    if geo_citation_client is not None:
+        verifier = GeoCitationWorkflow(
+            geo_citation_client, _hostname(str(site["domain"])), geo_timeout,
+        )
+        registry.register(verifier)
+        if model_runner is not None and Capability.PAGE_METADATA in live_capabilities:
+            registry.register(GeoContentWorkflow(
+                {**tools, verifier.name: verifier}, model_runner, geo_timeout, observability,
+            ))
     if {
         Capability.ORGANIC_KEYWORDS, Capability.PAGE_METADATA, Capability.SERP_OVERVIEW,
     } <= live_capabilities:

@@ -314,6 +314,7 @@ async def test_durable_chat_api_exposes_task_and_run_status(tmp_path: Path, monk
     store = AgentChatHarnessStore(database)
     monkeypatch.setattr(route, "seo_agent_system_service", system)
     monkeypatch.setattr(route, "seo_chat_harness_store", store)
+    monkeypatch.setattr(route, "configured_citation_client", lambda *_: None)
     monkeypatch.setattr(route, "build_seo_model_provider", lambda: FakeModelProvider.text("完成"))
 
     class LiveFacade:

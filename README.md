@@ -57,6 +57,7 @@ flowchart TB
 | 页面分享图：“按这页内容帮我生成一张分享图。” | `seo_share_image` → 读取页面、校验主体依据、调用 Cloudflare Workers AI | 配置生图服务后在对话中直接显示图片 |
 | 搜索现状：“看看本站的自然流量估算、排名分布和代表关键词。” | `seo_search_diagnosis` → `seo_search_metrics` + `seo_organic_keywords` | 站点指标、有限排名样本和对应页面；只查排名词时使用关键词查询，样本为空时说明数据缺口 |
 | 关键词机会：“围绕手冲咖啡，有哪些关键词值得研究？” | `seo_keyword_opportunity` → 联想词、批量关键词指标、输入主题的 SERP | 去重后的候选词和可用指标；已封装为工作流，缺失指标保持未知 |
+| GEO 研究：“客户会问哪些问题？查一题在 AI 搜索里引用了谁，再给当前页一段改稿。” | `seo_geo_questions`、`seo_geo_citations`、`seo_geo_content` | 原始问题及来源、带任务回执的引用样本、可核对的改稿 |
 | 机会生成与入池：显式提交一次机会发现请求 | `OpportunityDiscoveryWorkflow` → 关键词研究、冻结快照、模型候选、证据校验、既有入池服务 | 生成至多 3 个机会并沿用原有评分和审批策略；独立业务接口触发，不是只读 Chat 工具 |
 | 已有排名页优化：“哪些已有排名的页面值得进一步检查？” | `seo_ranking_page_optimization` → 排名样本、少量站内 HTML、每页一个代表词 SERP | 默认调查第 4–20 名样本中的 2 个站内页面，输出实际标签、搜索证据和待核实项；不修改页面 |
 | 页面变更复检：“按之前的快照，检查 Title、H1 和 Canonical 是否符合目标。” | `seo_page_change_review` → 本站基线、重新读取页面、冻结新快照、逐项比较 | 输出变更明细和验收结论；先显式建立基线，缺少目标值或完整证据时不判定通过 |
@@ -91,6 +92,7 @@ flowchart TB
 | [`search_diagnosis.py`](src/seo_agent/workflows/search_diagnosis.py) | `seo_search_diagnosis` | 汇总站点指标与排名关键词，保留当前快照和来源 |
 | [`semrush_competition.py`](src/seo_agent/workflows/semrush_competition.py) | `seo_semrush_competition` | 使用 Semrush v4 查询同一市场的站点概览、自然排名与搜索竞品，保留各步证据 |
 | [`keyword_opportunity.py`](src/seo_agent/workflows/keyword_opportunity.py) | `seo_keyword_opportunity` | 围绕用户主题，组合联想词、候选词指标与主题 SERP |
+| [`geo.py`](src/seo_agent/workflows/geo.py) | `seo_geo_questions`、`seo_geo_citations`、`seo_geo_content` | 分别完成选题、引用核验及改稿，支持将三段串起来运行 |
 | [`ranking_page_optimization.py`](src/seo_agent/workflows/ranking_page_optimization.py) | `seo_ranking_page_optimization` | 从排名样本选少量站内页面，核对 HTML、代表词 SERP 和可选性能证据 |
 | [`page_change_review.py`](src/seo_agent/workflows/page_change_review.py) | `seo_page_change_review` | 为本站页面建立基线，重新读取同一页面并核对明确的验收值 |
 | [`site_diagnosis.py`](src/seo_agent/workflows/site_diagnosis.py) | `seo_site_diagnosis` | 汇总代表页面、robots.txt、站点地图和可用搜索证据 |
@@ -150,6 +152,38 @@ seo_site_diagnosis
 在对话中说「按这页内容帮我生成一张分享图」即可，省略地址时取当前站点首页。工作流从页面的 `og:title`、Title、H1 中依次选取标题，描述取 `og:description` 或 Meta Description。标题都缺失时，同一次运行等待用户输入，恢复后复用页面证据。
 
 DeepSeek 根据页面内容和用户要求选取主体及构图。代码校验 JSON Schema 和引用原文，缺少主体依据时请用户补充。Cloudflare Workers AI 生成 1216 × 640 的图片，图片保存在 SEO 业务 SQLite 文件旁的 `*.share-images` 目录，并在对话中与页面文案一起展示。绘图提示词可在运行的模型调用记录中查看。上游失败时保留已取得的页面证据。[对话截图](docs/screenshots/18-share-image-brief.png) · [工作流](src/seo_agent/workflows/share_image.py) · [Cloudflare 接入](src/seo_agent/workflows/cloudflare_images.py) · [业务测试](tests/seo_agent/test_share_image.py)
+
+### GEO 多 Agent
+
+> 围绕 domain name，给 MDN 的域名介绍页做一次 GEO 分析。先找 Google 上实际出现的问题，选一个，查 DeepSeek 这次引用了谁，再给有依据的改稿建议。
+
+选题和改稿各有一份模型提示词与 JSON Schema。引用核验是独立的 A2A Agent，可在同一进程运行，也可经 HTTP 跨进程调用。给出主题时用一条链完成三段。已给出具体问题时直接核验引用并审阅页面。
+
+```mermaid
+sequenceDiagram
+    participant S as 主 SEO Agent
+    participant Q as 选题研究员
+    participant V as 引用核验 Agent
+    participant E as 内容编辑
+    S->>Q: 主题和目标页
+    Q-->>S: 原始问题、来源、选题理由及页面证据
+    S->>V: A2A Agent Card + SendMessage
+    V-->>S: 目标域名匹配结论、引用链接和任务回执
+    S->>E: 已选问题、页面原文与引用片段
+    E-->>S: 有依据的改稿和待核实项
+```
+
+选题使用 Serper 的 Google 关联问题和联想词，每种各查一次。引用核验只采样一个问题，按模型回答中的 `url_citation` 匹配目标域名和子域。报告标明查询时间、模型和链接，分别呈现本次没有搜、搜索失败、没有返回引用，以及返回的引用未命中目标站。改稿复用已取到的页面，只在有可读正文及引用时交付草稿。每条草稿校验目标页原文和引用 ID。
+
+默认引用来源是 DeepSeek，使用 `DEEPSEEK_API_KEY` 调官方 `deepseek-flash` 和 `deepseek_web_search`。可选填 `OPENAI_API_KEY`，并在对话中明确要求用 OpenAI API 核验，使用 Responses `web_search`。`GEO_OPENAI_MODEL` 默认 `gpt-6.2-astra`。选题、主对话和改稿沿用已有 DeepSeek 配置。每次结论限定在指定模型的 API 样本。 [DeepSeek 文档](https://api-docs.deepseek.com/guides/web_tools/) · [OpenAI 文档](https://developers.openai.com/api/docs/guides/tools-web-search)
+
+独立启动引用 Agent 时，在主服务的 `.env.local` 设置 `GEO_A2A_URL=http://127.0.0.1:8011`，重启主服务并在同一仓库另开终端运行。
+
+```bash
+.venv/bin/python -m uvicorn src.seo_agent.geo_a2a:create_app --factory --host 127.0.0.1 --port 8011
+```
+
+引用服务在 `/.well-known/agent-card.json` 提供 Agent Card，在 `/a2a` 接受 A2A 1.0 JSON-RPC `SendMessage`，回传带 `geo-citation-report` 的 Task。演示服务将 Task 存在内存。配置 Langfuse 时可查看专员接收的证据、选题和改稿的模型生成及引用请求。跨进程用 `a2a_message_id` 关联两边的记录，Task ID 对应核验报告。 [A2A 代码](src/seo_agent/geo_a2a.py) · [引用适配器](src/seo_agent/geo_search.py) · [业务测试](tests/seo_agent/test_geo.py) · [A2A 协议](https://a2a-protocol.org/latest/specification/)
 
 ### 机会生成与入池
 
@@ -255,7 +289,8 @@ SEO Chat 可调用 `seo_page_change_review`；需要 live 页面 HTML 能力和�
 | --- | --- | --- | --- |
 | DeepSeek | 对话中的工具选择、结论整理、页面信息建议、机会候选生成，以及 PRD 生成和交付审核 | `DEEPSEEK_API_KEY`；可选 `DEEPSEEK_BASE_URL`、`DEEPSEEK_MODEL` | 需要 API 账号、有效 Key 和所选模型的可用调用额度；缺失 Key 时模型请求不可用 |
 | 页面 HTML | 读取当前站点页面的源 HTML 和元信息 | 不需要第三方 Key | 当前运行环境能够访问目标公网页面，URL 属于当前站点；不执行 JavaScript |
-| Serper | Google SERP、联想词、新闻、图片、视频搜索 | `SERPER_API_KEY` | 需要 Serper API 账号、有效 Key 和相应调用额度 |
+| OpenAI（可选） | GEO 引用核验，采样 OpenAI Responses 联网回答 | `OPENAI_API_KEY`；可选 `GEO_OPENAI_MODEL` | 需要 API 项目访问权限和额度。默认 GEO 引用采样使用 DeepSeek。[GEO 配置](#geo-多-agent) |
+| Serper | Google SERP、联想词、关联问题、新闻、图片、视频搜索 | `SERPER_API_KEY` | 需要 Serper API 账号、有效 Key 和相应调用额度 |
 | DataForSEO | 关键词指标、自然排名、竞品、外链及 SERP | `DATAFORSEO_LOGIN`、`DATAFORSEO_API_KEY` | 分别填写 API Access 提供的 login 和 API password（API 专用密码）；还需相应端点权限及可用余额或额度 |
 | Semrush（可选） | 站点月度概览、自然排名与搜索竞品 | `SEMRUSH_API_KEY` | 需 v4 Key、SEO API 的 Domain Analytics 权限及可用 API units |
 | PageSpeed | 单页面 Lighthouse 实验室检查 | `PAGESPEED_API_KEY` | 本项目要求配置 PageSpeed API Key，且请求需满足对应 Google API 项目的权限、限制和配额 |
