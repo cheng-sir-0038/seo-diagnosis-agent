@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -26,6 +27,7 @@ from src.seo_agent.workflows.structured_model import StructuredModelRunner
 SITE = {"id": "site-1", "domain": "example.com", "default_country": "US", "default_language": "en"}
 QUESTION = "How do I store roasted coffee?"
 EXCERPT = "Our coffee is packed in a resealable bag."
+VERIFY = "Confirm how long the coffee keeps after opening."
 ANSWER = "Keep roasted coffee in a sealed container."
 CITATION = {
     "url": "https://learn.example.com/guide",
@@ -206,8 +208,9 @@ async def test_unconfigured_provider_does_not_silently_fallback():
 
 
 class EvidenceSource:
-    def __init__(self, with_search=True):
+    def __init__(self, with_search=True, content_excerpt=EXCERPT):
         self.with_search = with_search
+        self.content_excerpt = content_excerpt
         self.calls: list[Capability] = []
 
     def live_capabilities(self) -> set[Capability]:
@@ -229,7 +232,7 @@ class EvidenceSource:
                 "final_url": params["url"],
                 "title": "Coffee",
                 "content_length_bytes": 200,
-                "content_excerpt": EXCERPT,
+                "content_excerpt": self.content_excerpt,
             }
         elif capability == Capability.SERP_OVERVIEW:
             assert params["result_types"] == ["people_also_ask"]
@@ -259,13 +262,13 @@ class ModelAnswers:
             return {
                 "edits": [
                     {
-                        "gap": "The page does not explain the packaging.",
+                        "gap": "Make the storage benefit of the resealable bag easier to find.",
                         "citation_id": 1,
                         "page_quote": "fabricated quote" if self.invalid_edit else EXCERPT,
                         "draft": "The package is resealable.",
                     }
                 ],
-                "needs_verification": [],
+                "needs_verification": [VERIFY],
             }
 
         return type("Runnable", (), {"ainvoke": staticmethod(invoke)})()
@@ -286,7 +289,10 @@ async def test_geo_chain_hands_off_evidence_and_records_the_real_a2a_task(tmp_pa
             ),
         ],
     )
-    replies, source = ModelAnswers(), EvidenceSource()
+    part_reviewed = (EXCERPT + " Coffee notes." * 300)[:3500]
+    outside_review = "The unopened bag stays fresh for a year."
+    replies = ModelAnswers()
+    source = EvidenceSource(content_excerpt=f"{part_reviewed} {outside_review}")
     runner = StructuredModelRunner(model_factory=lambda: replies, observability=observer)
     transport = httpx.MockTransport(lambda _: httpx.Response(200, json=deepseek_body()))
     peer = GeoCitationClient(
@@ -330,16 +336,31 @@ async def test_geo_chain_hands_off_evidence_and_records_the_real_a2a_task(tmp_pa
     )
     run = RunManager().create_run([{"role": "user", "content": "Investigate coffee storage."}])
     try:
-        await AgentLoop(
-            provider,
-            registry,
-            observer=AgentRunObserver(observer, operation_name="seo_agent.chat"),
-        ).run(run)
+        with patch.object(provider, "stream", wraps=provider.stream) as stream:
+            await AgentLoop(
+                provider,
+                registry,
+                observer=AgentRunObserver(observer, operation_name="seo_agent.chat"),
+            ).run(run)
         assert run.status == RunStatus.COMPLETED
         (event,) = [event for event in run.events if event.type == "tool.completed"]
         data = event.payload["result"]["data"]
         assert data["workflow_status"] == "complete"
         assert data["question"] == QUESTION and len(data["edits"]) == 1
+        (summary_input,) = [
+            message["content"] for message in stream.call_args.args[0]
+            if message["role"] == "tool"
+        ]
+        assert outside_review not in summary_input
+        summary_data = json.loads(summary_input)["data"]
+        assert summary_data["edits"] == data["edits"]
+        assert summary_data["needs_verification"] == [VERIFY]
+        draft_card = next(item for item in data["items"] if item["key"] == "draft-1")
+        assert draft_card["summary"] == summary_data["edits"][0]["draft"]
+        assert {
+            "label": "证据范围", "value": summary_data["page_evidence_scope"],
+        } in draft_card["metadata"]
+        assert "3500 字符" in summary_data["page_evidence_scope"]
         assert data["evidence"]["research"]["questions"] == [
             {
                 "id": 1,
@@ -350,7 +371,10 @@ async def test_geo_chain_hands_off_evidence_and_records_the_real_a2a_task(tmp_pa
         assert source.calls.count(Capability.PAGE_METADATA) == 1
         assert [schema for schema, _ in replies.calls] == [GeoQuestionSelection, GeoContentDraft]
         _, edit_input = replies.calls[-1]
-        assert edit_input["question"] == QUESTION and edit_input["page"]["excerpt"] == EXCERPT
+        assert edit_input["question"] == QUESTION and edit_input["page"]["excerpt"] == part_reviewed
+        page_evidence = summary_data["evidence"]["research"]["evidence"]["page"]
+        assert page_evidence["excerpt"] == edit_input["page"]["excerpt"]
+        assert page_evidence["excerpt_truncated"] is True
         assert edit_input["citation_evidence"] == [
             {
                 "id": 1,
@@ -363,6 +387,7 @@ async def test_geo_chain_hands_off_evidence_and_records_the_real_a2a_task(tmp_pa
             row["operation_name"]: row
             for row in await database.fetch_all("SELECT * FROM obs_spans")
         }
+        assert outside_review in spans["seo_page_metadata"]["output_json"]
         task_id = data["evidence"]["citations"]["a2a_task_id"]
         assert task_id in spans["geo_a2a_handoff"]["output_json"]
         for child, parent in (
@@ -442,6 +467,8 @@ async def test_geo_keeps_prior_evidence_when_handoff_cannot_justify_content(fail
             "error_code"
         ] == ("GEO_UNOBSERVED_QUESTION")
     else:
+        assert result.data["evidence"]["page"]["excerpt"] == EXCERPT
+        assert "正文摘录" in result.data["page_evidence_scope"]
         assert result.data["evidence"]["citations"]["citation_status"] == (
             "no_citations" if failure == "no_citations" else "cited"
         )

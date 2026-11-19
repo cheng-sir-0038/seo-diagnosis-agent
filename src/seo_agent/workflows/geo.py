@@ -83,11 +83,15 @@ def _page_context(payload: dict[str, Any] | None) -> dict[str, Any] | None:
         or not page.content_excerpt
     ):
         return None
+    excerpt = page.content_excerpt[:3500]
     return {
         "url": page.final_url,
         "title": page.title,
         "h1": page.h1s[:5],
-        "excerpt": page.content_excerpt[:3500],
+        "excerpt": excerpt,
+        "excerpt_truncated": (
+            page.content_excerpt_truncated or len(excerpt) < len(page.content_excerpt)
+        ),
     }
 
 
@@ -380,6 +384,7 @@ class GeoContentWorkflow(AgentTool):
         steps = WorkflowSteps(self.tools, self.timeout_seconds, self.observability, runtime)
         question = (options.question or "").strip()
         items: list[dict[str, Any]] = []
+        research = None
         if options.topic and options.topic.strip():
             research = await steps.run(
                 "research",
@@ -399,6 +404,23 @@ class GeoContentWorkflow(AgentTool):
         page_info = _page_context(page)
         if page is not None and page_info is None and "page" in steps.coverage:
             steps.coverage["page"].update(status="partial", error_code="INCOMPLETE_PAGE_HTML")
+        if page is not None:
+            # The nested page tool's span retains the full result for inspection.
+            page_evidence = {**(page_info or {}), "provenance": page.get("provenance", {})}
+            if research is not None:
+                steps.evidence["research"] = {
+                    **research,
+                    "evidence": {**research["evidence"], "page": page_evidence},
+                }
+            else:
+                steps.evidence["page"] = page_evidence
+        if page_info:
+            scope = f"本次依据目标页正文摘录（{len(page_info['excerpt'])} 字符）。"
+            if page_info["excerpt_truncated"]:
+                scope += "摘录之外的内容待核实。"
+        else:
+            scope = "本次缺少可用于改稿的正文摘录。"
+        scope_row = {"label": "证据范围", "value": scope}
         citations = (
             await steps.run(
                 "citations",
@@ -417,6 +439,7 @@ class GeoContentWorkflow(AgentTool):
             if citations["citation_status"] in {"cited", "not_cited"}:
                 report = citations["evidence"]["sample"]["report"]
         edits = []
+        needs_verification = []
         if page_info and report:
             sources = [
                 {
@@ -454,17 +477,19 @@ class GeoContentWorkflow(AgentTool):
                             "summary": edit.draft,
                             "url": source["url"],
                             "metadata": [
+                                scope_row,
                                 {"label": "目标页原文", "value": edit.page_quote},
                                 {"label": "AI 答案参考链接", "value": source["title"]},
                             ],
                         }
                     )
-                if draft.needs_verification:
+                needs_verification = draft.needs_verification
+                if needs_verification:
                     items.append(
                         {
                             "key": "verification",
                             "title": "建议人工核实",
-                            "summary": "\n".join(draft.needs_verification),
+                            "summary": "\n".join(needs_verification),
                         }
                     )
         else:
@@ -478,14 +503,17 @@ class GeoContentWorkflow(AgentTool):
                     "key": "no-draft",
                     "title": "本次没有形成有依据的改稿",
                     "summary": "改稿需要一个明确问题、可读的目标页正文和带引用的联网答案。",
+                    "metadata": [scope_row],
                 }
             )
         return steps.finish(
             "geo_content",
             "GEO 内容缺口与改稿",
             items,
-            ["缺口判断来自本次读取的目标页正文摘要和带引用的 AI 答案，改稿供人工审阅。"],
+            [scope, "引用结论只适用于本次 AI 联网回答，改稿供人工审阅。"],
             question=question or None,
             target_url=page_info["url"] if page_info else None,
+            page_evidence_scope=scope,
             edits=[edit.model_dump(mode="json") for edit in edits],
+            needs_verification=needs_verification,
         )

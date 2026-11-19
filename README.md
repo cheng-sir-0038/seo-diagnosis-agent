@@ -2,6 +2,8 @@
 
 选一个网站，直接说你想查什么。DeepSeek 根据问题和取回的证据选择下一步工具，能查页面问题、研究关键词和排名页、拟定 SEO 建议。配置 Cloudflare Workers AI 后，也能在对话里生成页面分享图。
 
+**Breadtopia GEO 实跑**　Agent 从 Google 搜索样本中选出一题，通过 A2A 交给独立的引用 Agent。核对到 5 条外站引用后，结合页面证据给出 3 条改稿建议。 [完整对话](docs/screenshots/22-geo-breadtopia-conversation.png) · [Langfuse A2A 交接](docs/screenshots/23-geo-langfuse-a2a.png)
+
 ## 真实对话
 
 用户准备更新首页在搜索结果和分享链接上的文案，希望先拿到一份可评审的草稿。DeepSeek 根据这句需求选择页面建议流程。读到页面后，Agent 发现站点主体和配图需要确认，于是保留证据，等待用户决定。用户选择「先用现有信息生成」，同一次运行继续，交付标题、摘要、分享信息和 JSON-LD 草稿，并标出待确认事项。[完整对话](docs/screenshots/07-page-suggestions.png) · [执行详情](docs/screenshots/11-execution-details.png)
@@ -162,7 +164,7 @@ DeepSeek 根据页面内容和用户要求选取主体及构图。代码校验 J
 <details>
 <summary>查看 Breadtopia 实跑的完整对话和 A2A 交接</summary>
 
-对话图从同一个 Run 重放，保留原始提问、完整回复和证据卡片。本次演示用 `AGENT_CONTEXT_CHARACTER_LIMIT=80000`，让主 Agent 整理结论时保留完整取数结果。
+对话图重放改稿证据范围调整前的一次 DeepSeek 实跑，保留同一个 Run 的原始提问、完整回复和证据卡片。该次演示用 `AGENT_CONTEXT_CHARACTER_LIMIT=80000` 保留完整取数结果。
 
 ![Breadtopia GEO 的原始提问、选题、引用结果与改稿建议](docs/screenshots/22-geo-breadtopia-conversation.png)
 
@@ -188,7 +190,7 @@ sequenceDiagram
     E-->>S: 有依据的改稿和待核实项
 ```
 
-选题使用 Serper 的 Google 关联问题和联想词，每种各查一次。引用核验只采样一个问题，按模型回答中的 `url_citation` 匹配目标域名和子域。报告标明查询时间、模型和链接，分别呈现本次没有搜、搜索失败、没有返回引用，以及返回的引用未命中目标站。改稿复用已取到的页面，只在有可读正文及引用时交付草稿。每条草稿校验目标页原文和引用 ID。
+选题使用 Serper 的 Google 关联问题和联想词，每种各查一次。引用核验只采样一个问题，按模型回答中的 `url_citation` 匹配目标域名和子域。报告标明查询时间、模型和链接，分别呈现本次没有搜、搜索失败、没有返回引用，以及返回的引用未命中目标站。改稿以目标页最多 3500 字符的正文摘录和本轮引用为依据，每条草稿校验目标页原文和引用 ID。证据卡片与对话总结沿用同一摘录范围和通过校验的草稿，摘录之外的内容待核实。
 
 默认引用来源是 DeepSeek，使用 `DEEPSEEK_API_KEY` 调官方 `deepseek-flash` 和 `deepseek_web_search`。可选填 `OPENAI_API_KEY`，并在对话中明确要求用 OpenAI API 核验，使用 Responses `web_search`。`GEO_OPENAI_MODEL` 默认 `gpt-6.2-astra`。选题、主对话和改稿沿用已有 DeepSeek 配置。每次结论限定在指定模型的 API 样本。 [DeepSeek 文档](https://api-docs.deepseek.com/guides/web_tools/) · [OpenAI 文档](https://developers.openai.com/api/docs/guides/tools-web-search)
 
@@ -199,6 +201,12 @@ sequenceDiagram
 ```
 
 引用服务在 `/.well-known/agent-card.json` 提供 Agent Card，在 `/a2a` 接受 A2A 1.0 JSON-RPC `SendMessage`，回传带 `geo-citation-report` 的 Task。演示服务将 Task 存在内存。配置 Langfuse 时可查看专员接收的证据、选题和改稿的模型生成及引用请求。跨进程用 `a2a_message_id` 关联两边的记录，Task ID 对应核验报告。 [A2A 代码](src/seo_agent/geo_a2a.py) · [引用适配器](src/seo_agent/geo_search.py) · [业务测试](tests/seo_agent/test_geo.py) · [A2A 协议](https://a2a-protocol.org/latest/specification/)
+
+本地回归运行实际工作流和进程内 A2A，以模拟上游响应验证 DeepSeek 和 OpenAI 适配器、引用缺失及改稿证据校验，无需第三方 API Key。
+
+```bash
+.venv/bin/python -m pytest -q tests/seo_agent/test_geo.py
+```
 
 ### 机会生成与入池
 
@@ -418,6 +426,7 @@ npm run dev
 ```bash
 .venv/bin/python -m pytest \
   tests/agent tests/agent_evals \
+  tests/seo_agent/test_geo.py \
   tests/seo_agent/test_site_audit_workflow.py \
   tests/seo_agent/test_business_workflows.py \
   tests/seo_agent/test_opportunity_discovery_workflow.py \
