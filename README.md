@@ -355,7 +355,7 @@ npm run dev
 ## 目前的边界
 
 - 综合诊断覆盖代表单页、站点文件和有限搜索样本。Google 实际收录、完整搜索历史和整站抓取仍不在检查范围内。机会入池通过独立接口显式触发，完整“诊断 → 机会审批 → 执行 → 复检”仍需真实端到端验收。
-- 这是单机 MVP，SQLite 不适合多实例生产部署。[seo-audit-plugin](https://github.com/cheng-sir-0038/seo-audit-plugin) 是独立项目，本仓库尚未接入其 MCP，也不支持 GSC 或 GA4 数据源。
+- 这是单机 MVP，SQLite 不适合多实例生产部署。当前尚未接入 GSC 或 GA4 数据源。
 
 ## 测试
 
