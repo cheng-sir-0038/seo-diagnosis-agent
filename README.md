@@ -2,7 +2,11 @@
 
 选一个网站，直接说你想查什么。DeepSeek 根据问题和取回的证据选择下一步工具，能查页面问题、研究关键词和排名页、拟定 SEO 建议。配置 Cloudflare Workers AI 后，也能在对话里生成页面分享图。
 
-**Breadtopia GEO 实跑**　Agent 从 Google 搜索样本中选出一题，通过 A2A 交给独立的引用 Agent。核对到 5 条外站引用后，从页面摘录中选出 3 段适合前置的已有说明。 [完整对话](docs/screenshots/22-geo-breadtopia-conversation.png) · [Langfuse A2A 交接](docs/screenshots/23-geo-langfuse-a2a.png)
+**Breadtopia GEO 实跑**　Agent 从 Google 搜索样本中选出一题，核验 DeepSeek 的 5 条外站引用，并找到 3 段适合前置的页面原文。 [完整对话](docs/screenshots/22-geo-breadtopia-conversation.png)
+
+- **跨进程交接**　主 Agent 通过 A2A 把问题发给独立的引用 Agent。两边用同一个消息 ID 对上交接，Task 回执对应本次引用结果。 [Langfuse A2A 交接](docs/screenshots/23-geo-langfuse-a2a.png) · [交接代码](src/seo_agent/geo_a2a.py)
+- **改稿证据校验**　实跑时曾把原文已有的内容写成缺失。修复后，卡片和总结共用核对过的原文，把已有内容写成前置建议。 [修复提交](https://github.com/cheng-sir-0038/seo-diagnosis-agent/commit/832f772b638943bf0664965d592325ad88fa19a2) · [回归用例](tests/seo_agent/test_geo.py)
+- **人工补充与恢复**　页面信息不足时先保存取到的证据并暂停，用户补充或选择继续后接回同一个 Run。 [等待补充截图](docs/screenshots/08-human-input.png) · [恢复代码](src/agent/harness/)
 
 ## 真实对话
 
