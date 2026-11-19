@@ -16,7 +16,7 @@ flowchart TD
     Read --> Pause --> Choice --> Resume --> Draft
 ```
 
-[首页体检](docs/screenshots/19-homepage-priority.png) · [关键词机会](docs/screenshots/04-keyword-opportunities.png) · [已有排名页优化](docs/screenshots/05-ranking-pages.png) · [Semrush 竞品分析演示](docs/screenshots/20-semrush-competition.png) · [完整对话截图](docs/screenshots/README.md) · [本地启动](#本地启动)
+[首页体检](docs/screenshots/19-homepage-priority.png) · [关键词机会](docs/screenshots/04-keyword-opportunities.png) · [已有排名页优化](docs/screenshots/05-ranking-pages.png) · [Semrush 竞品分析演示](docs/screenshots/20-semrush-competition.png) · [MDN GEO 实跑](#geo-多-agent) · [完整对话截图](docs/screenshots/README.md) · [本地启动](#本地启动)
 
 ## Agent 如何运行
 
@@ -156,6 +156,21 @@ DeepSeek 根据页面内容和用户要求选取主体及构图。代码校验 J
 ### GEO 多 Agent
 
 > 围绕 domain name，给 MDN 的域名介绍页做一次 GEO 分析。先找 Google 上实际出现的问题，选一个，查 DeepSeek 这次引用了谁，再给有依据的改稿建议。
+
+这次在 MDN 的域名介绍页查到 4 条 Google 相关问题，选出 **What is a domain name and example?** 核验。DeepSeek 这次返回的 2 条引用均来自 Microsoft Learn。内容编辑结合页面摘要和引用证据给出 2 条改稿建议。
+
+<details>
+<summary>查看 MDN 实跑的完整对话和 A2A 交接</summary>
+
+对话图从同一个 Run 重放，保留原始提问、完整回复和证据卡片。
+
+![MDN GEO 的原始提问、问题词、引用结果与改稿建议](docs/screenshots/22-geo-mdn-conversation.png)
+
+链路图上下展示两条实际的 Langfuse Trace。主 Agent 通过 HTTP 发送 JSON-RPC 请求，引用 Agent 用同一个消息 ID 接收任务，并返回可核对的 Task 回执。
+
+![Langfuse 多 Agent 链路及同一个 A2A 消息 ID 和 Task 回执](docs/screenshots/23-geo-langfuse-a2a.png)
+
+</details>
 
 选题和改稿各有一份模型提示词与 JSON Schema。引用核验是独立的 A2A Agent，可在同一进程运行，也可经 HTTP 跨进程调用。给出主题时用一条链完成三段。已给出具体问题时直接核验引用并审阅页面。
 
