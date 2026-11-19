@@ -16,7 +16,7 @@ flowchart TD
     Read --> Pause --> Choice --> Resume --> Draft
 ```
 
-[首页体检](docs/screenshots/19-homepage-priority.png) · [关键词机会](docs/screenshots/04-keyword-opportunities.png) · [已有排名页优化](docs/screenshots/05-ranking-pages.png) · [完整对话截图](docs/screenshots/README.md) · [本地启动](#本地启动)
+[首页体检](docs/screenshots/19-homepage-priority.png) · [关键词机会](docs/screenshots/04-keyword-opportunities.png) · [已有排名页优化](docs/screenshots/05-ranking-pages.png) · [Semrush 竞品分析演示](docs/screenshots/20-semrush-competition.png) · [完整对话截图](docs/screenshots/README.md) · [本地启动](#本地启动)
 
 ## Agent 如何运行
 

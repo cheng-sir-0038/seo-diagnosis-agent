@@ -1,8 +1,8 @@
 # 对话截图
 
-这些截图用已保存的实际运行记录在前端重放。结果图保留用户提问、Agent 回复和对应证据，入口图展示如何发起问题。搜索现状和排名页优化使用 `python.org`，其他案例使用测试站 `test0922.guxiguxi.com`。
+这些截图在前端重放已保存的运行记录。结果图保留用户提问、Agent 回复和对应证据，入口图展示如何发起问题。搜索现状和排名页优化使用 `python.org`，Semrush 使用演示站 `trailguide.example`，其余案例使用测试站 `test0922.guxiguxi.com`。
 
-搜索查询采用美国市场，指标和排名样本来自第三方数据源。测试站点及部分主题词缺少的数据保留为未知。页面建议待人工确认，截图已遮住内部运行标识。
+搜索查询采用美国市场。测试站点及部分主题词缺少的数据保留为未知。页面建议待人工确认，截图已遮住内部运行标识。
 
 ## 工作流截图
 
@@ -10,6 +10,7 @@
 | --- | --- | --- |
 | 首页体检 | [首页最值得先改的地方](19-homepage-priority.png)、[加做移动端性能检查](02-page-audit.png) | [site_audit.py](../../src/seo_agent/workflows/site_audit.py) |
 | 搜索现状 | [排名关键词与对应页面](03-search-diagnosis.png) | [search_diagnosis.py](../../src/seo_agent/workflows/search_diagnosis.py) |
+| Semrush 月度竞品分析 | [完整对话](20-semrush-competition.png)、[执行详情](21-semrush-workflow-details.png) | [semrush_competition.py](../../src/seo_agent/workflows/semrush_competition.py) |
 | 关键词机会 | [候选词与未知指标](04-keyword-opportunities.png) | [keyword_opportunity.py](../../src/seo_agent/workflows/keyword_opportunity.py) |
 | 已有排名页优化 | [排名样本与页面核验](05-ranking-pages.png) | [ranking_page_optimization.py](../../src/seo_agent/workflows/ranking_page_optimization.py) |
 | 综合诊断 | [汇总证据与覆盖范围](06-site-diagnosis.png) | [site_diagnosis.py](../../src/seo_agent/workflows/site_diagnosis.py) |
@@ -41,6 +42,17 @@
 本次查询返回 Python 官网的站点指标和 5 条美国市场排名样本。图中展示关键词、位次和对应页面，流量指标为 DataForSEO 的估算值。
 
 ![自然搜索现状、关键词和对应页面](03-search-diagnosis.png)
+
+</details>
+
+<details>
+<summary>Semrush 月度竞品分析</summary>
+
+这次对话使用 Semrush v4 月度报告样例。Agent 按同一市场和月份整理站点概览、三条排名词和三家竞品。第二张图展开执行详情，可核对三份报告的完成状态。
+
+![Semrush 的完整提问、回复和竞品数据](20-semrush-competition.png)
+
+![同一次 Semrush 对话与三份报告的执行详情](21-semrush-workflow-details.png)
 
 </details>
 
