@@ -91,6 +91,9 @@ class Settings(BaseSettings):
     dataforseo_rate_limit: int = 30  # DataForSEO 默认 30 req/min
     dataforseo_default_limit: int = 2  # 真实验收默认只取少量记录
 
+    # ---- Semrush SEO API v4 ----
+    semrush_api_key: SecretStr = SecretStr("")
+
     # ---- Google PageSpeed Insights API v5 ----
     pagespeed_api_base_url: str = "https://pagespeedonline.googleapis.com/pagespeedonline/v5"
     pagespeed_api_key: str = ""  # 正式 live 模式必填，从 .env.local 注入

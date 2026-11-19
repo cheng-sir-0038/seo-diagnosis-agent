@@ -37,7 +37,7 @@ class DataSource(enum.StrEnum):
     GSC = "google_search_console"    # 自有站点搜索表现
     BING = "bing_webmaster_tools"     # 预留
     GA4 = "google_analytics_4"        # 站内行为+转化
-    SEMRUSH = "semrush"               # 预留
+    SEMRUSH = "semrush"               # 月度自然搜索数据
     PAGESPEED = "pagespeed"             # Lighthouse 实验室页面性能
     PAGE_HTML = "page_html"               # 站点页面源 HTML 元信息
 

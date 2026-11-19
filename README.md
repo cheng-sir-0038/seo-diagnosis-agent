@@ -34,7 +34,7 @@ flowchart TB
     WF --> TOOL
     WF --> CF["Cloudflare Workers AI（分享图）"]
     TOOL --> DATA["Data Facade + Provider Router"]
-    DATA --> EXT["页面 HTML / Serper / DataForSEO / PageSpeed"]
+    DATA --> EXT["页面 HTML / Serper / DataForSEO / Semrush / PageSpeed"]
     LOOP <--> HARNESS["Harness：事件、检查点、恢复"]
     HARNESS --> RUNDB[("运行与业务 SQLite")]
     LOOP --> OBS["Observability：模型、工具与子步骤"]
@@ -61,6 +61,7 @@ flowchart TB
 | 已有排名页优化：“哪些已有排名的页面值得进一步检查？” | `seo_ranking_page_optimization` → 排名样本、少量站内 HTML、每页一个代表词 SERP | 默认调查第 4–20 名样本中的 2 个站内页面，输出实际标签、搜索证据和待核实项；不修改页面 |
 | 页面变更复检：“按之前的快照，检查 Title、H1 和 Canonical 是否符合目标。” | `seo_page_change_review` → 本站基线、重新读取页面、冻结新快照、逐项比较 | 输出变更明细和验收结论；先显式建立基线，缺少目标值或完整证据时不判定通过 |
 | 竞品分析：“谁在和本站竞争这些搜索词？” | `seo_site_diagnosis` 的可选竞品步骤，或 `seo_organic_competitors`、`seo_serp_overview` | 自然搜索竞品、交集指标及指定关键词的搜索结果，不代表完整关键词差距 |
+| 月度自然搜索竞品：“用 Semrush 看看本站在美国的流量价值和主要搜索竞品。” | `seo_semrush_competition` → 站点概览、排名词、自然搜索竞品 | 流量价值估算、最多三条排名词的位次变化，以及最多三家竞品的共同关键词与竞争度 |
 | 站点综合诊断：“检查本站页面、抓取规则和站点地图。” | `seo_site_diagnosis` → 页面体检、robots.txt、sitemap，可补查询搜索表现和关键词机会 | 页面问题证据、站点文件和已完成的检查范围 |
 | 已批准机会任务规划：显式提交已批准机会与负责人 | `TaskPlanningWorkflow` → 校验最新审批、生成 PRD 内容、原子写入任务和文档记录 | 创建草稿任务、PRD 和本地 Markdown/PDF；支持幂等重试，不自动派发或发布 |
 | 交付审核：提交交付后，按对应 PRD 检查 | [`review_delivery`](src/seo_agent/workflows/task_delivery.py) | 模型生成通过项、失败项和修改意见，再由服务校验并记录审核；通过后仍需走发布规则 |
@@ -69,7 +70,7 @@ flowchart TB
 
 ## 工具与业务工作流
 
-[`src/seo_agent/chat/tools.py`](src/seo_agent/chat/tools.py) 定义了 16 个基础数据工具，并按依赖注册最多 8 个对话工作流。实际可用工具取决于当前数据源和配置。
+[`src/seo_agent/chat/tools.py`](src/seo_agent/chat/tools.py) 定义基础数据工具，并按依赖注册对话工作流。实际可用工具取决于当前数据源和配置。
 
 | 分组 | 工具 | 数据来源 |
 | --- | --- | --- |
@@ -88,6 +89,7 @@ flowchart TB
 | [`page_suggestions.py`](src/seo_agent/workflows/page_suggestions.py) | `seo_page_suggestions` | 依据页面和用户补充拟定 SEO 信息，校验引用，追问必要缺项并继续生成建议 |
 | [`share_image.py`](src/seo_agent/workflows/share_image.py) | `seo_share_image` | 根据页面证据生成绘图指令和分享图，缺标题时等待补充 |
 | [`search_diagnosis.py`](src/seo_agent/workflows/search_diagnosis.py) | `seo_search_diagnosis` | 汇总站点指标与排名关键词，保留当前快照和来源 |
+| [`semrush_competition.py`](src/seo_agent/workflows/semrush_competition.py) | `seo_semrush_competition` | 使用 Semrush v4 查询同一市场的站点概览、自然排名与搜索竞品，保留各步证据 |
 | [`keyword_opportunity.py`](src/seo_agent/workflows/keyword_opportunity.py) | `seo_keyword_opportunity` | 围绕用户主题，组合联想词、候选词指标与主题 SERP |
 | [`ranking_page_optimization.py`](src/seo_agent/workflows/ranking_page_optimization.py) | `seo_ranking_page_optimization` | 从排名样本选少量站内页面，核对 HTML、代表词 SERP 和可选性能证据 |
 | [`page_change_review.py`](src/seo_agent/workflows/page_change_review.py) | `seo_page_change_review` | 为本站页面建立基线，重新读取同一页面并核对明确的验收值 |
@@ -255,6 +257,7 @@ SEO Chat 可调用 `seo_page_change_review`；需要 live 页面 HTML 能力和�
 | 页面 HTML | 读取当前站点页面的源 HTML 和元信息 | 不需要第三方 Key | 当前运行环境能够访问目标公网页面，URL 属于当前站点；不执行 JavaScript |
 | Serper | Google SERP、联想词、新闻、图片、视频搜索 | `SERPER_API_KEY` | 需要 Serper API 账号、有效 Key 和相应调用额度 |
 | DataForSEO | 关键词指标、自然排名、竞品、外链及 SERP | `DATAFORSEO_LOGIN`、`DATAFORSEO_API_KEY` | 分别填写 API Access 提供的 login 和 API password（API 专用密码）；还需相应端点权限及可用余额或额度 |
+| Semrush（可选） | 站点月度概览、自然排名与搜索竞品 | `SEMRUSH_API_KEY` | 需 v4 Key、SEO API 的 Domain Analytics 权限及可用 API units |
 | PageSpeed | 单页面 Lighthouse 实验室检查 | `PAGESPEED_API_KEY` | 本项目要求配置 PageSpeed API Key，且请求需满足对应 Google API 项目的权限、限制和配额 |
 | Cloudflare Workers AI（可选） | 用 FLUX.2 klein 4B 生成页面分享图 | `CLOUDFLARE_ACCOUNT_ID`、`CLOUDFLARE_API_TOKEN` | 同时需配置 DeepSeek。[配置步骤](#cloudflare-workers-ai-生图) |
 | Langfuse Cloud（可选） | 将模型和工具运行记录上传到项目 | `LANGFUSE_HOST`、`LANGFUSE_PUBLIC_KEY`、`LANGFUSE_SECRET_KEY` | 需要 Langfuse 项目及有写入权限的项目密钥，Host 与项目区域一致；不配置时保留本地记录 |
@@ -262,6 +265,8 @@ SEO Chat 可调用 `seo_page_change_review`；需要 live 页面 HTML 能力和�
 DataForSEO 的关键词和站点指标分别使用 [Keyword Overview](https://docs.dataforseo.com/v3/dataforseo_labs-google-keyword_overview-live/) 和 [Domain Rank Overview](https://docs.dataforseo.com/v3/dataforseo_labs-google-domain_rank_overview-live/)；可按官方文档核对端点权限与返回字段。
 
 自然排名、站点指标、关键词指标和竞品查询会根据 [DataForSEO Labs 市场和语言目录](https://docs.dataforseo.com/v3/dataforseo_labs/locations_and_languages/) 校验查询范围。支持的组合使用目录中的市场编号和语言代码。不支持的组合会在发起付费查询前提示覆盖范围，工作流保留其余证据。有效组合返回空样本时，结论限定在本次查询的数据范围内。
+
+Semrush 竞品工作流按根域、地区和桌面数据库查询月度结果。指定地区时使用两位国家代码，例如 `US` 或 `GB`，省略则使用站点市场。配置密钥后才会注册该工作流。通过统一数据接口单独查询时，在 `params` 指定 `preferred_provider: "semrush"` 和 `country` 即可。数据按地区统计，语言筛选适用于支持该条件的其他数据源。[Semrush v4 Domain Analytics](https://developer.semrush.com/api/v4/seo/domain-analytics/)
 
 业务通知与发布还有各自的配置前提：
 

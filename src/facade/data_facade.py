@@ -56,6 +56,7 @@ from src.providers.base import BaseProvider
 from src.providers.dataforseo import DataForSEOProvider
 from src.providers.page_metadata import PageMetadataProvider
 from src.providers.pagespeed import PageSpeedProvider
+from src.providers.semrush import SemrushProvider
 from src.providers.serper import SerperProvider
 from src.routing.contracts import (
     ProviderDecision,
@@ -98,6 +99,11 @@ class DataFacade:
         dataforseo = DataForSEOProvider()
         await dataforseo.startup()
         self._providers["dataforseo"] = dataforseo
+
+        semrush = SemrushProvider()
+        await semrush.startup()
+        if semrush.runtime_mode == "live":
+            self._providers["semrush"] = semrush
 
         serper = SerperProvider()
         await serper.startup()
@@ -179,12 +185,20 @@ class DataFacade:
         )
 
     def live_capabilities(self) -> set[Capability]:
-        """返回当前进程中至少有一个真实 Provider 支持的能力。"""
+        """返回当前进程中可自动选择真实 Provider 的能力。"""
         return {
             capability
             for capability, providers in self._capability_map.items()
-            if any(provider.runtime_mode == "live" for provider in providers)
+            if any(
+                provider.runtime_mode == "live" and provider.source != DataSource.SEMRUSH
+                for provider in providers
+            )
         }
+
+    @property
+    def semrush_available(self) -> bool:
+        provider = self._providers.get("semrush")
+        return provider is not None and provider.runtime_mode == "live"
 
     async def _query(
         self,
@@ -294,7 +308,12 @@ class DataFacade:
             )
 
     def _resolve_route(self, intent: QueryIntent, *, live_only: bool) -> ProviderRoute:
-        candidates = self._capability_map.get(intent.capability, [])
+        use_semrush = intent.preferred_provider == "semrush"
+        # Semrush's desktop market reports do not accept a language filter.
+        candidates = [
+            provider for provider in self._capability_map.get(intent.capability, [])
+            if (provider.source == DataSource.SEMRUSH) == use_semrush
+        ]
         if live_only and not any(provider.runtime_mode == "live" for provider in candidates):
             raise InternalDataNotAvailableError(
                 f"没有真实 Provider 支持 {intent.capability.value}",
@@ -426,7 +445,7 @@ class DataFacade:
         keywords = params.pop("keywords", [])
         keyword = params.pop("keyword", None)
         query = params.pop("query", None)
-        language = params.pop("language", "en")
+        language = params.pop("language", None if provider.source == DataSource.SEMRUSH else "en")
         severity = params.pop("severity", None)
         url = params.pop("url", None)
         targets = params.pop("targets", [])

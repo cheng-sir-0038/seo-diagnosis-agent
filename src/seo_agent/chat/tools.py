@@ -18,6 +18,7 @@ from src.seo_agent.workflows.page_change_review import PageChangeReviewWorkflow
 from src.seo_agent.workflows.page_suggestions import PageSuggestionsWorkflow
 from src.seo_agent.workflows.ranking_page_optimization import RankingPageOptimizationWorkflow
 from src.seo_agent.workflows.search_diagnosis import SearchDiagnosisWorkflow
+from src.seo_agent.workflows.semrush_competition import SemrushCompetitionWorkflow
 from src.seo_agent.workflows.share_image import ShareImageWorkflow
 from src.seo_agent.workflows.site_audit import SiteAuditWorkflow
 from src.seo_agent.workflows.site_diagnosis import SiteDiagnosisWorkflow
@@ -375,11 +376,13 @@ SEO_TOOL_DEFINITIONS = (
 
 class SeoFacadeTool(AgentTool):
     def __init__(
-        self, facade: FacadeProtocol, site: dict[str, Any], definition: SeoToolDefinition
+        self, facade: FacadeProtocol, site: dict[str, Any], definition: SeoToolDefinition,
+        *, use_semrush: bool = False,
     ) -> None:
         self.facade = facade
         self.site = dict(site)
         self.definition = definition
+        self.use_semrush = use_semrush
         self.name = definition.name
         self.description = definition.description
         self.parameters_schema = definition.parameters
@@ -431,7 +434,11 @@ class SeoFacadeTool(AgentTool):
             params.setdefault("language", str(self.site.get("default_language") or "en"))
 
         params.setdefault("country", str(self.site.get("default_country") or "US").lower())
-        if self.definition.capability in {
+        if self.use_semrush:
+            params.update(preferred_provider="semrush", allow_fallback=False)
+            if arguments.get("month"):
+                params["month"] = arguments["month"]
+        elif self.definition.capability in {
             Capability.SEARCH_METRICS, Capability.ORGANIC_KEYWORDS,
             Capability.KEYWORD_OVERVIEW, Capability.ORGANIC_COMPETITORS,
         }:
@@ -563,6 +570,18 @@ def build_seo_agent_registry(
     if {Capability.SEARCH_METRICS, Capability.ORGANIC_KEYWORDS} <= live_capabilities:
         registry.register(SearchDiagnosisWorkflow(
             dict(tools), settings.agent_tool_timeout, observability=observability,
+        ))
+    if getattr(facade, "semrush_available", False):
+        semrush_tools = {
+            definition.name: SeoFacadeTool(facade, site, definition, use_semrush=True)
+            for definition in SEO_TOOL_DEFINITIONS if definition.capability in {
+                Capability.SEARCH_METRICS, Capability.ORGANIC_KEYWORDS,
+                Capability.ORGANIC_COMPETITORS,
+            }
+        }
+        registry.register(SemrushCompetitionWorkflow(
+            semrush_tools, settings.agent_tool_timeout, observability=observability,
+            default_country=str(site.get("default_country") or "US"),
         ))
     if Capability.SERP_OVERVIEW in live_capabilities and live_capabilities & {
         Capability.AUTOCOMPLETE, Capability.KEYWORD_OVERVIEW,
