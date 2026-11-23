@@ -21,6 +21,8 @@ from src.followup_agent.workflow import DOMAIN as FOLLOWUP_DOMAIN
 from src.followup_agent.workflow import FOLLOWUP_SKILL
 from src.healthcare_agent.skills import HealthcareSkill
 from src.providers.page_metadata.client import normalize_site_url
+from src.travel_agent.intake import TRAVEL_DOMAIN, TRAVEL_INTAKE_PROMPT, TravelIntake
+from src.travel_agent.tools import TRAVEL_SKILL
 
 
 class Specialist(StrEnum):
@@ -29,6 +31,7 @@ class Specialist(StrEnum):
     LEARNING = LEARNING_DOMAIN
     EXAM_PREP = EXAM_PREP_DOMAIN
     FOLLOWUP = FOLLOWUP_DOMAIN
+    TRAVEL = TRAVEL_DOMAIN
 
 
 class Route(StrEnum):
@@ -37,11 +40,12 @@ class Route(StrEnum):
     LEARNING = Specialist.LEARNING
     EXAM_PREP = Specialist.EXAM_PREP
     FOLLOWUP = Specialist.FOLLOWUP
+    TRAVEL = Specialist.TRAVEL
     COURSE_REVIEW = "course_review"
     CLARIFY = "clarify"
 
 
-ROUTE_PROMPT_KEY = "workspace.route.v4"
+ROUTE_PROMPT_KEY = "workspace.route.v5"
 SKILL_LOADED_EVENT = "skill.loaded"
 SUPERVISOR_NODE = "supervisor"
 ASK_PAGE = "请发要检查的公开网页链接或域名。"
@@ -59,6 +63,7 @@ class RouteDecision(BaseModel):
     math_practice: MathPracticeQuery | None = None
     resources: ResourceQuery | None = None
     teacher_exam: TeacherExamQuery | None = None
+    travel: TravelIntake | None = None
     target_index: int | None = Field(default=None, ge=1, description="候选页面从 1 开始的序号")
     question: str | None = Field(default=None, max_length=300, description="意图不清时的追问")
 
@@ -88,7 +93,10 @@ ROUTING_PROMPT = (
     "没有明确的业务意图或超出这些业务就选 clarify，给一个自然、简短的追问。"
 ) + "\n" + "\n".join(
     EDUCATION_SKILLS.get(name).prompt_fragment for name in EDUCATION_SKILLS.names()
-) + "\n" + FOLLOWUP_SKILL.prompt_fragment
+) + "\n" + FOLLOWUP_SKILL.prompt_fragment + "\n" + TRAVEL_SKILL.prompt_fragment + (
+    "\n选择 travel 后填写 travel 字段，不需要网页。"
+    "报价只能摘自最后一条用户消息。"
+) + TRAVEL_INTAKE_PROMPT
 
 
 def explicit_healthcare_skill(question: str) -> HealthcareSkill | None:

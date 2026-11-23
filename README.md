@@ -1,6 +1,6 @@
 # SEO Diagnosis Agent
 
-在工作台提问后，LangGraph 主 Agent 分派给 SEO/GEO、医药、学习陪练、报考备考或随访与复诊准备专员。常规请求用 DeepSeek 判断业务，明确的复诊资料请求直接进入资料整理流程。对话显示专员进度和 Skill，展开「执行详情」可核对工具回执。
+在工作台提问后，LangGraph 主 Agent 分派给 SEO/GEO、医药、学习陪练、报考备考、随访与复诊准备或商旅行程专员。常规请求用 DeepSeek 判断业务，明确的复诊资料请求直接进入资料整理流程。对话显示专员进度和 Skill，展开「执行详情」可核对工具回执。
 
 ![多 Agent 工作台首页，含考研、医药和网站业务入口](docs/screenshots/01-chat-overview.png)
 
@@ -24,6 +24,7 @@
 | “9 岁学分数，有什么官方练习？” | 按年龄和主题推荐 Oxford Owl 或 Cambridge NRICH 的原站练习，做完可在本对话登记。 |
 | “2026 年下半年湖北初中数学教资笔试怎么准备？” | 报考备考核对公告和科目，给出报名清单、备考顺序与 304 大纲链接。 |
 | “用合成资料演示一次复诊准备，帮我对照两次报告。” | 随访与复诊准备专员先追问缺的报告，补齐后按记录条件对照，展示来源并等你确认保存资料包和待办。 |
+| “我去杭州出差。” | 先给目的地近期天气和出行建议。补上日期后按实际行程更新天气，其他条件齐全后可继续比较交通、住宿和接驳。 |
 
 医考工具使用带年份和出处的官方公告摘录，网页核对直接读取指定的公开页面。[专员编排](src/agent/workspace/supervisor.py) · [医药 Skill](src/healthcare_agent/skills.py)
 
@@ -67,16 +68,19 @@ flowchart TB
     MAIN --> LEARN["学习陪练 / 方程练习与资源"]
     MAIN --> EXAM["报考备考 / 教资笔试"]
     MAIN --> VISIT["随访与复诊准备 / 本次提供的资料"]
+    MAIN --> TRAVEL["商旅行程 / 查候选、接驳和天气"]
     MED -->|公开考纲依据| SEO
     SEO --> EXEC["Agent 执行器"]
     MED --> EXEC
     LEARN --> EXEC
     EXAM --> EXEC
     VISIT --> EXEC
+    TRAVEL --> EXEC
     EXEC --> HEALTH["医考公告 / 考研检索 / 医保目录 / PubMed"]
     HEALTH --> RUNDB
     EXEC --> FOLLOWUP["资料读取回执 / 对照 / 确认保存"]
     FOLLOWUP --> RUNDB
+    EXEC --> TRIP["飞猪 / 百度地图 / Open-Meteo / 行程草稿"]
     EXEC --> WF["业务工作流：页面 / 搜索 / 关键词 / 草稿"]
     EXEC --> TOOL["只读 SEO 工具"]
     WF --> TOOL
@@ -108,6 +112,16 @@ flowchart TB
 手动导入时使用匿名对象编号。首版支持 UTF-8 CSV、记录数组 JSON 和同字段模板的文字 PDF。PDF 每页首行是列名，字段用 `|` 分隔。必填字段是 `subject_id`、`kind` 和 `item`，日期使用 `YYYY-MM-DD`。样例展示了报告、已有安排、用户自述和用药资料的字段。[合成资料模板](src/followup_agent/examples/initial.csv) · [合成补充报告](src/followup_agent/examples/supplement.csv) · [FHIR R4 Observation 字段参考](https://hl7.org/fhir/R4/observation.html)
 
 资料内容保存在当前服务的独立资料表。模型对话和执行日志只使用步骤及数量回执。报告对照仅核对原值与来源，临床解释由医生或药师负责。使用合成或已去标识的记录即可演示。
+
+### 商旅行程
+
+从首页点「比较出差方案」，可试一次国内单目的地往返。Agent 确认日期、会场、人数和住宿房间数后，展示飞猪的火车、航班和酒店候选。百度驾车估算和用户要求的到场缓冲分别处理。[行程工作流](src/travel_agent/workflow.py) · [方案核算](src/travel_agent/plan.py)
+
+知道目的地就能查天气。日期未定时先给从今天起三天的近期参考，知道出发日后查当天，知道返程日后覆盖行程日期。出行建议按返回的温度、降水概率和风速给出。天气卡保留实际预报日期与来源，超出预报范围会提醒临近出发再查。[Open-Meteo 文档](https://open-meteo.com/en/docs)
+
+候选卡保留来源、查询时间和平台入口。房型、报价单位或币种缺失时，会显示待核对项。已知费用按币种列出，平台参考价和未取得的接驳费不计入可比总价。平台缺少结果时，也可以粘贴自己查到的候选和报价，页面会标为「用户提供」。
+
+在原对话里修改会议截止时间会沿用已有查询，改返程日期会重查返程及受影响的酒店和天气。交通接口暂时异常时，可回复「重查交通」。回复「保存方案 1」一类的确认后，所选版本随运行检查点写入 PostgreSQL。预订入口用于去平台复核，项目只保存行程草稿。
 
 ## 业务场景与现有入口
 
@@ -393,6 +407,11 @@ SEO Chat 可调用 `seo_page_change_review`；需要 live 页面 HTML 能力和�
 | PageSpeed | 单页面 Lighthouse 实验室检查 | `PAGESPEED_API_KEY` | 本项目要求配置 PageSpeed API Key，且请求需满足对应 Google API 项目的权限、限制和配额 |
 | Cloudflare Workers AI（可选） | 用 FLUX.2 klein 4B 生成页面分享图 | `CLOUDFLARE_ACCOUNT_ID`、`CLOUDFLARE_API_TOKEN` | 同时需配置 DeepSeek。[配置步骤](#cloudflare-workers-ai-生图) |
 | Langfuse Cloud（可选） | 将模型和工具运行记录上传到项目 | `LANGFUSE_HOST`、`LANGFUSE_PUBLIC_KEY`、`LANGFUSE_SECRET_KEY` | 需要 Langfuse 项目及有写入权限的项目密钥，Host 与项目区域一致；不配置时保留本地记录 |
+| 飞猪 FlyAI（商旅） | 查询火车、航班及酒店候选 | `FLYAI_API_KEY`、可选 `FLYAI_EXECUTABLE` | 从飞猪控制台获取可用 Key，并在运行后端的机器或容器中安装官方 CLI。[飞猪快速开始](https://flyai.open.fliggy.com/docs/quickstart) |
+| 百度地图（商旅） | 将地点解析成坐标，查询驾车距离和耗时 | `BAIDU_MAPS_AK` | 需 Web 服务 AK，并开通地理编码、地点检索和轻量级驾车路线等所需权限。[百度地图 Web API](https://lbsyun.baidu.com/docs/webapi) |
+| Open-Meteo（商旅） | 查城市与逐日天气预报 | 无 Key | 当前用非商业免费端点，预报最多覆盖未来 16 天。[额度及许可](https://open-meteo.com/en/pricing) |
+
+飞猪适配已验证官方 CLI `1.0.16`。本机可运行 `npm install -g @fly-ai/flyai-cli@1.0.16`，或者将 `FLYAI_EXECUTABLE` 指向已安装的 `flyai` 完整路径。商旅仍使用已有 DeepSeek 配置。缺飞猪或百度凭据时，来源卡会展示配置状态，天气仍可单独查询。[FlyAI 源码和许可证](https://github.com/alibaba-flyai/flyai-skill)
 
 DataForSEO 的关键词和站点指标分别使用 [Keyword Overview](https://docs.dataforseo.com/v3/dataforseo_labs-google-keyword_overview-live/) 和 [Domain Rank Overview](https://docs.dataforseo.com/v3/dataforseo_labs-google-domain_rank_overview-live/)；可按官方文档核对端点权限与返回字段。
 
@@ -405,7 +424,7 @@ Semrush 竞品工作流按根域、地区和桌面数据库查询月度结果。
 - [邮件通知](src/seo_agent/notifications/email.py)需要 `SMTP_HOST`、`SMTP_PORT`、`SMTP_SECURITY`、`SMTP_USERNAME`、`SMTP_AUTH_CODE` 和 `EMAIL_FROM_ADDRESS`；邮箱需开通 SMTP 并取得授权码，端口和加密方式应与邮箱服务匹配。
 - [本地 HTML 发布](src/seo_agent/publishing/html_site.py)使用 `HTML_SITE_ROOT_PATH`、`HTML_SITE_BASE_URL` 和可选的 `HTML_SITE_CONTENT_SUBDIR`，不需要第三方 Key。发布目录须可写，并由用户配置的站点服务通过对应 Base URL 提供访问；文件落盘不等于线上地址已经可达。
 
-未配置的数据源不进入正式对话的 live 工具列表。DataForSEO 的兼容 pseudo 数据也不会进入正式诊断；页面体检要求性能检查但 PageSpeed 未配置时，会保留页面证据并返回部分完成。
+未配置的 SEO 数据源不进入正式对话的 live 工具列表。DataForSEO 的兼容 pseudo 数据也不会进入正式诊断；页面体检要求性能检查但 PageSpeed 未配置时，会保留页面证据并返回部分完成。
 
 组合工作流可能连续请求多个外部接口；关键词研究按可用数据源安排一次批量指标查询和一次主题 SERP 查询，HTTP 重试还可能增加请求。请按所需流程配置数据源并查看服务方实际用量，`AGENT_MAX_TOOL_CALLS` 不限制工作流内部的接口请求总数。
 
@@ -499,6 +518,12 @@ npm run dev
 docker compose --env-file .env.local exec db createdb -U seo_agent seo_agent_test
 export TEST_DATABASE_URL='postgresql://seo_agent:your-local-password@127.0.0.1:55432/seo_agent_test'
 .venv/bin/python -m pytest -q tests/agent/test_workspace_chat.py tests/healthcare_agent tests/seo_agent/test_conversation_storage.py
+```
+
+商旅增量用例覆盖候选缺价、路线、天气、局部重查和同一运行的草稿确认。测试用例不消耗第三方额度。
+
+```bash
+.venv/bin/python -m pytest -q tests/agent/test_travel_{flyai,context,plan}.py tests/agent/test_workspace_scenarios.py
 ```
 
 运行考研检索评测并导出逐题回执：

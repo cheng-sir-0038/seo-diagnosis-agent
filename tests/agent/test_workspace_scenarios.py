@@ -7,12 +7,14 @@ import json
 from collections import deque
 from contextlib import asynccontextmanager
 from copy import deepcopy
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from pydantic import SecretStr
 
 from src.agent.harness.store import AgentChatHarnessStore
 from src.agent.providers.base import ModelChunk, ModelProvider, ToolCall
@@ -36,6 +38,10 @@ from src.providers.page_metadata.pyseo_client import (
 )
 from src.seo_agent.db.database import SeoAgentDatabase
 from src.seo_agent.services.system import SeoAgentSystemService
+from src.travel_agent import context as travel_context
+from src.travel_agent import flyai
+from src.travel_agent.intake import TravelIntake
+from src.travel_agent.tools import COMPARE, SAVE, TRANSPORT, WEATHER
 
 GUIDE = "https://alpha.example/guides/start"
 NEW_PAGE = "https://alpha.example/courses/next"
@@ -57,7 +63,9 @@ class Models(ModelProvider):
     async def invoke(self, *, schema, context, **_):
         self.planner_inputs.append(deepcopy(context))
         planned = self.decisions.popleft()
-        if isinstance(planned, dict):
+        if schema is TravelIntake:
+            decision = schema.model_validate(planned)
+        elif isinstance(planned, dict):
             decision = schema.model_validate({"needs_page": False, **planned})
         else:
             route, index = planned
@@ -170,6 +178,166 @@ async def answer_waiting(api, receipt, events, answer):
     resumed = response.json()
     assert resumed["run_id"] == receipt["run_id"]
     return await read_events(api, resumed), path, body
+
+
+def travel_result(events, name):
+    return next(
+        payload["result"]["data"]
+        for payload in reversed(payloads(events, "tool.completed")) if payload["name"] == name
+    )
+
+
+@pytest.mark.asyncio
+async def test_trip_weather_is_available_before_the_other_trip_details(workspace, monkeypatch):
+    calls = []
+    monkeypatch.setattr("src.travel_agent.workflow.china_today", lambda: date(2026, 11, 23))
+
+    async def forecast(city, start, end):
+        calls.append((city, start.isoformat(), end.isoformat()))
+        return {"status": "ok", "source": "open_meteo", "items": [{"date": start.isoformat()}]}
+
+    monkeypatch.setattr(travel_context, "trip_weather", forecast)
+    workspace.models.decisions.extend([
+        {"route": "travel", "travel": {"request": {"destination": "杭州"}}},
+        {"request": {"depart_on": "2026-11-26"}},
+        {"request": {"origin": "上海"}},
+        {"request": {"return_on": "2026-11-28"}},
+    ])
+    async with workspace.serve() as api:
+        receipt, first = await ask(api, "我去杭州出差。")
+        assert first[-1]["type"] == "run.waiting_for_input"
+        assert any("日期" in question for question in first[-1]["payload"]["questions"])
+        assert travel_result(first, WEATHER)["scope"] == "near_term"
+        assert calls == [("杭州", "2026-11-23", "2026-11-25")]
+
+        dated, _, _ = await answer_waiting(api, receipt, first, "11月26日出发。")
+        assert travel_result(dated, WEATHER)["scope"] == "itinerary"
+        assert calls[-1] == ("杭州", "2026-11-26", "2026-11-26")
+
+        with_origin, _, _ = await answer_waiting(api, receipt, dated, "从上海出发。")
+        assert len(calls) == 2
+
+        resized, _, _ = await answer_waiting(api, receipt, with_origin, "11月28日返回。")
+        assert resized[-1]["type"] == "run.waiting_for_input"
+        assert calls[-1] == ("杭州", "2026-11-26", "2026-11-28")
+        assert len(calls) == 3
+        assert {tool["name"] for tool in payloads(resized, "tool.completed")} == {WEATHER}
+
+
+@pytest.mark.asyncio
+async def test_trip_collects_conditions_rechecks_time_and_saves_once(workspace, monkeypatch):
+    calls = []
+    monkeypatch.setattr("src.travel_agent.workflow.china_today", lambda: date(2026, 11, 23))
+    monkeypatch.setattr(chat.settings, "baidu_maps_ak", SecretStr("test"))
+
+    async def transport(origin, destination, travel_date, **_):
+        calls.append(("transport", origin, destination, travel_date))
+        if travel_date.day == 28:
+            return {"status": "error", "source": "flyai", "items": [], "message": "飞猪暂不可用"}
+        return {
+            "status": "ok", "source": "flyai",
+            "items": [{
+                "id": "ticket", "name": "直达火车", "mode": "rail", "source": "flyai",
+                "departs_at": f"{travel_date}T09:00:00+08:00",
+                "arrives_at": f"{travel_date}T12:00:00+08:00",
+                "to_stop": "上海虹桥站", "booking_url": "https://www.fliggy.com/",
+            }],
+        }
+
+    async def hotels(destination, check_in, check_out, **_):
+        calls.append(("hotel", destination, check_in, check_out))
+        return {"status": "no_results", "source": "flyai", "items": []}
+
+    async def weather(city, start, end):
+        calls.append(("weather", city, start, end))
+        return {"status": "ok", "source": "open_meteo", "items": [{"date": start.isoformat()}]}
+
+    async def commute(origin, destination, city, **_):
+        calls.append(("commute", origin, destination, city))
+        return {"status": "ok", "items": [{"mode": "driving", "duration_minutes": 40}]}
+
+    monkeypatch.setattr(flyai, "search_transport", transport)
+    monkeypatch.setattr(flyai, "search_hotels", hotels)
+    monkeypatch.setattr(travel_context, "trip_weather", weather)
+    monkeypatch.setattr(travel_context, "estimate_commute", commute)
+    quote = "测试宾馆 2026-11-26 入住、2026-11-28 退房，大床房每晚 400元 含税费"
+    workspace.models.decisions.extend([
+        {"route": "travel", "travel": {
+            "request": {"origin": "武汉", "travelers": 1, "rooms": 1},
+        }},
+        {"request": {
+            "destination": "上海",
+            "depart_on": "2026-11-26", "return_on": "2026-11-28", "venue": "上海世博展览馆",
+            "arrive_by": "2026-11-26T14:00:00+08:00", "buffer_minutes": 15, "budget_cny": 1500,
+        }, "supplied_offers": [{
+            "kind": "hotel", "name": "测试宾馆", "quote": quote, "amount": 400,
+            "check_in": "2026-11-26", "check_out": "2026-11-28", "room_type": "大床房",
+            "price_basis": "night", "full_price": True,
+        }, {
+            "kind": "hotel", "name": "模型自造宾馆", "quote": "模型自造宾馆每晚 20元", "amount": 20,
+        }]},
+        {"request": {"arrive_by": "2026-11-26T12:30:00+08:00"}},
+        {"request": {"return_on": "2026-11-29"}},
+    ])
+    async with workspace.serve() as api:
+        receipt, first = await ask(api, "从武汉去外地出差，1个人1间房。")
+        assert first[-1]["type"] == "run.waiting_for_input"
+        assert any("日期" in question for question in first[-1]["payload"]["questions"])
+        agent_run_id = payloads(first, "agent.dispatched")[0]["agent_run_id"]
+        assert payloads(first, "skill.loaded")[0]["skill"] == "business-trip-planning"
+        assert not calls
+
+        first_plan, _, _ = await answer_waiting(
+            api, receipt, first,
+            "去上海，2026-11-26 出发，2026-11-28 返回。14:00 前到上海世博展览馆，"
+            "预留15分钟，预算1500元。" + quote,
+        )
+        comparison = travel_result(first_plan, COMPARE)
+        assert comparison["revision"] == 1
+        assert len(calls) == 5
+        assert comparison["plans"][0]["known_costs"] == {"CNY": "800"}
+        assert comparison["plans"][0]["arrival_status"] == "met"
+        assert not comparison["plans"][0]["complete_price"]
+        assert comparison["weather"]["source"] == "open_meteo"
+        assert any(source["status"] == "error" for source in comparison["providers"])
+        assert {offer["source"] for offer in comparison["offers"]} == {"flyai", "user"}
+        assert all("模型自造" not in offer["name"] for offer in comparison["offers"])
+        assert {tool["agent_run_id"] for tool in payloads(first_plan, "tool.completed")} == {
+            agent_run_id,
+        }
+
+        changed, _, _ = await answer_waiting(api, receipt, first_plan, "当天 12:30 就要到会场。")
+        revised = travel_result(changed, COMPARE)
+        assert len(calls) == 5
+        assert revised["revision"] == 2
+        assert revised["plans"][0]["arrival_status"] == "late"
+        assert revised["request"]["venue"] == comparison["request"]["venue"]
+
+        retried, _, _ = await answer_waiting(api, receipt, changed, "重查交通")
+        assert [call[0] for call in calls[5:]] == ["transport", "transport"]
+        assert "重查交通" in payloads(first_plan, "message.completed")[-1]["content"]
+        assert len({
+            tool["tool_call_id"] for tool in payloads(retried, "tool.completed")
+            if tool["name"] == TRANSPORT
+        }) == 2
+
+        date_changed, _, _ = await answer_waiting(api, receipt, retried, "返程改成2026-11-29")
+        assert [call[0] for call in calls[7:]] == ["transport", "hotel", "weather"]
+        assert calls[7][1:3] == ("上海", "武汉")
+        assert travel_result(date_changed, TRANSPORT).keys() == {"return"}
+        third = travel_result(date_changed, COMPARE)
+        assert third["revision"] == 3
+        assert all(offer["source"] != "user" for offer in third["offers"])
+        assert third["request"]["arrive_by"] == revised["request"]["arrive_by"]
+
+        done, path, body = await answer_waiting(api, receipt, date_changed, "保存方案 1")
+        selected = travel_result(done, SAVE)
+        assert selected["selected_plan_id"] == third["plans"][0]["id"]
+        assert done[-1]["type"] == "run.completed"
+        assert (await api.post(path, json=body)).json()["replayed"] is True
+        stored = (await chat.seo_chat_harness_store.latest_dispatch_state("conversation"))["travel"]
+        assert [revision["revision"] for revision in stored["versions"]] == [1, 2, 3]
+        assert stored["snapshot"]["selected_plan_id"] == selected["selected_plan_id"]
 
 
 @pytest.mark.asyncio

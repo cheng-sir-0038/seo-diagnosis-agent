@@ -1,4 +1,4 @@
-import { BookOutlined, CalculatorOutlined, FormOutlined, ProfileOutlined, SearchOutlined } from '@ant-design/icons'
+import { BookOutlined, CalculatorOutlined, FormOutlined, ProfileOutlined, SearchOutlined, SolutionOutlined } from '@ant-design/icons'
 
 export const specialists = {
   healthcare: { name: '医药业务', icon: BookOutlined, tone: 'rose' },
@@ -6,6 +6,7 @@ export const specialists = {
   learning: { name: '学习陪练', icon: CalculatorOutlined, tone: 'indigo' },
   exam_prep: { name: '报考备考', icon: FormOutlined, tone: 'amber' },
   followup: { name: '随访与复诊准备', icon: ProfileOutlined, tone: 'indigo' },
+  travel: { name: '商旅行程', icon: SolutionOutlined, tone: 'lavender' },
 } as const
 
 export type Specialist = keyof typeof specialists

@@ -14,6 +14,7 @@ import {
   RightOutlined,
   SearchOutlined,
   SendOutlined,
+  SolutionOutlined,
   StopOutlined,
 } from '@ant-design/icons'
 import { Alert, Button, Input, Tag, Tooltip } from 'antd'
@@ -22,6 +23,7 @@ import { type ComponentRef, lazy, Suspense, useEffect, useEffectEvent, useMemo, 
 import { AssistantRunStatus } from '../components/AssistantRunStatus'
 import { ChatRunDetails } from '../components/ChatRunDetails'
 import { InlineToolResults } from '../components/InlineToolResults'
+import { TravelReceipt } from '../components/TravelReceipt'
 import {
   cancelAgentRun,
   createAgentRun,
@@ -57,6 +59,7 @@ const MarkdownMessage = lazy(async () => {
 })
 const replyLoading = <div className="agent-activity" role="status">正在加载回复…</div>
 const mathPracticeToolName = 'tal_math_practice'
+const travelReceiptTools = new Set(['travel_weather', 'travel_compare_plans', 'travel_save_plan'])
 
 const starterGroups = [
   {
@@ -137,6 +140,16 @@ const starterGroups = [
       },
     ],
   },
+  {
+    title: '商旅行程',
+    tone: 'travel',
+    examples: [{
+      title: '比较出差方案',
+      detail: '上海到武汉，查交通、住宿与会场通勤',
+      icon: SolutionOutlined,
+      prompt: '下周二从上海到武汉出差，周四返回。两人住一间房，预算 3500 元，周二下午 3 点前到武汉国际博览中心，预留 30 分钟。帮我比较高铁、飞机和酒店。',
+    }],
+  },
 ]
 
 function ExampleGroup({ group, onChoose }: {
@@ -196,8 +209,17 @@ const removeRawEvidence = (value: unknown): unknown => {
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
 
-function ReplyContent({ content, tools }: { content: string, tools?: ToolRun[] }) {
-  const results = <InlineToolResults tools={tools} />
+function ReplyContent({ content, tools, onChooseTravel }: {
+  content: string
+  tools?: ToolRun[]
+  onChooseTravel?: (number: number) => void
+}) {
+  const results = (
+    <>
+      <InlineToolResults tools={tools?.filter(tool => !travelReceiptTools.has(tool.name))} />
+      <TravelReceipt tools={tools?.filter(tool => travelReceiptTools.has(tool.name))} onChoose={onChooseTravel} />
+    </>
+  )
   const admissionsReceipt = tools?.some(tool => (
     tool.name === 'postgraduate_admissions_search' && tool.status === 'completed'
     && tool.render_hint === 'cards' && isRecord(tool.result)
@@ -714,7 +736,7 @@ export function ChatPage() {
               <div className="welcome-hero">
                 <div className="welcome-intro">
                   <h1>今天想查什么？</h1>
-                  <p>检查网页、查公开资料、练数学，或整理复诊记录。</p>
+                  <p>检查网页、查公开资料、练数学、整理复诊记录或安排出差。</p>
                 </div>
                 <img
                   className="welcome-illustration"
@@ -754,7 +776,16 @@ export function ChatPage() {
                       tools={item.id === currentReplyId ? run.tools : item.toolResults}
                       agentRuns={item.agentRuns}
                     />
-                    <ReplyContent content={item.content} tools={item.toolResults} />
+                    <ReplyContent
+                      content={item.content}
+                      tools={item.toolResults}
+                      onChooseTravel={item.id === latestAssistant?.id && item.inputRequest && !running
+                        ? number => {
+                          setInput(`保存方案 ${number}`)
+                          composerRef.current?.focus({ cursor: 'end' })
+                        }
+                        : undefined}
+                    />
                     {item.runId && item.followupKey && followupPanels.get(item.runId) === item.id && (
                       <Suspense fallback={replyLoading}>
                         <FollowupPanel

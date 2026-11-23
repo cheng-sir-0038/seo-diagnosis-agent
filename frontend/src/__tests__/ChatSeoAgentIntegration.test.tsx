@@ -251,6 +251,153 @@ describe('ChatPage SEO Agent integration', () => {
     expect(submitAgentInput).toHaveBeenCalledWith('run_1', 'choice_1', 'B', 'answer')
   })
 
+  it('shows destination weather and preparation tips before a trip has dates', async () => {
+    const specialist = { agent: 'travel', agent_run_id: 'trip' }
+    streamAgentEvents.mockImplementationOnce(async (_url, onEvent: (item: AgentEvent) => void) => {
+      onEvent(event(1, 'run.started', {}))
+      onEvent(event(2, 'agent.dispatched', specialist))
+      onEvent(event(3, 'tool.completed', {
+        ...specialist, tool_call_id: 'hangzhou_forecast', name: 'travel_weather',
+        result: { success: true, data: {
+          source: 'open_meteo', status: 'ok', scope: 'near_term', location: '杭州',
+          items: [{ date: '2026-11-23', precipitation_probability_max_pct: 70 }],
+          advice: ['2026-11-23 降水概率最高 70%，建议带伞。'],
+        } },
+      }))
+      onEvent(event(4, 'message.completed', { content: '你准备哪天出发和返程？' }))
+      onEvent(event(5, 'run.waiting_for_input', {
+        ...specialist, request_id: 'trip_dates', questions: ['你准备哪天出发和返程？'],
+      }))
+      return { lastEventId: 5, terminal: true }
+    })
+    render(<ChatPage />)
+    const composer = screen.getByRole('textbox', { name: '给业务助理发送消息' })
+    fireEvent.change(composer, { target: { value: '我去杭州出差。' } })
+    fireEvent.click(screen.getByRole('button', { name: '发送消息' }))
+
+    const forecast = within(await screen.findByRole('region', { name: '近期天气参考' }))
+    expect(forecast.getByRole('heading', { name: '近期天气参考 · 杭州' })).toBeVisible()
+    expect(forecast.getByText('70% 降水概率')).toBeVisible()
+    expect(forecast.getByRole('list', { name: '出行建议' })).toHaveTextContent('建议带伞')
+    expect(forecast.getByRole('link', { name: 'Open-Meteo' })).toBeInTheDocument()
+    expect(screen.queryByRole('region', { name: '出差方案比较' })).toBeNull()
+  })
+
+  it('uses the latest travel comparison and waits for the user to send the selection', async () => {
+    const specialist = { agent: 'travel', agent_run_id: 'trip' }
+    const bookingUrl = 'https://example.com/offer?ref=original&ticket=1'
+    const queriedAt = '2026-11-23T08:00:00+08:00'
+    const data = {
+      request: {
+        origin: '上海', destination: '武汉', depart_on: '2026-12-01', return_on: '2026-12-03',
+        venue: '武汉国际博览中心', arrive_by: '15:00', budget_cny: 3500, rooms: 1, travelers: 2, buffer_minutes: 30,
+      },
+      revision: 2,
+      plans: [{
+        id: 'plan_hash', label: '高铁与会场附近住宿', transport: 'train-1', return_transport: null, hotel: 'hotel-1',
+        known_cost: '1200.00', currency: 'CNY', complete_price: false, hotel_commute_minutes: 22,
+        arrival_commute_minutes: 35, arrival_status: 'met',
+        missing: ['返程价格未返回'], warnings: ['房价按每晚显示，尚未取得含税总价'],
+      }],
+      offers: [
+        {
+          id: 'train-1', kind: 'transport', mode: 'rail', name: 'G123 次列车', source: 'flyai', from_stop: '上海虹桥',
+          to_stop: '武汉站', departs_at: '2026-12-01T08:15:00+08:00', arrives_at: '2026-12-01T12:20:00+08:00',
+          amount: '600.00', currency: 'CNY', price_basis: 'person', booking_url: bookingUrl, queried_at: queriedAt,
+        },
+        { id: 'hotel-1', kind: 'hotel', name: '会场附近酒店', source: 'flyai', booking_url: 'javascript:alert(1)' },
+      ],
+      issues: ['跨平台报价尚未核对'],
+      providers: [{ source: 'ctrip', status: 'unconfigured', message: '未配置授权' }],
+      weather: { source: 'open_meteo', status: 'ok', location: '武汉', timezone: 'Asia/Shanghai', queried_at: queriedAt,
+        items: [{ date: '2026-12-01', temperature_min_c: 5, temperature_max_c: 12, precipitation_probability_max_pct: 65 }],
+        advice: ['低温出行，建议带外套。'],
+      },
+    }
+    streamAgentEvents.mockImplementationOnce(async (_url, onEvent: (item: AgentEvent) => void) => {
+      onEvent(event(1, 'run.started', {}))
+      onEvent(event(2, 'agent.dispatched', specialist))
+      onEvent(event(3, 'tool.completed', {
+        ...specialist, tool_call_id: 'first_comparison', name: 'travel_compare_plans', render_hint: 'cards',
+        result: { success: true, data: { ...data, revision: 1, plans: [], issues: ['旧报价结果'] } },
+      }))
+      onEvent(event(4, 'tool.completed', {
+        ...specialist, tool_call_id: 'comparison', name: 'travel_compare_plans', render_hint: 'cards',
+        result: { success: true, data },
+      }))
+      onEvent(event(5, 'message.completed', { content: '已对照交通和住宿。选一个方案，或告诉我新的会议时间。' }))
+      onEvent(event(6, 'run.waiting_for_input', { ...specialist, request_id: 'choose_plan', questions: ['要保留哪个方案？'] }))
+      return { lastEventId: 6, terminal: true }
+    })
+    submitAgentInput.mockResolvedValue({
+      run_id: 'run_1', status: 'recovering', events_url: '/events', cancel_url: '/cancel', after_sequence: 6,
+    })
+    streamAgentEvents.mockImplementationOnce(async (_url, onEvent: (item: AgentEvent) => void) => {
+      onEvent(event(7, 'run.resumed', {}))
+      onEvent(event(8, 'tool.completed', {
+        ...specialist, tool_call_id: 'saved_plan', name: 'travel_save_plan', render_hint: 'cards',
+        result: { success: true, data: { ...data, selected_plan_id: 'plan_hash' } },
+      }))
+      onEvent(event(9, 'agent.completed', specialist))
+      onEvent(event(10, 'run.completed', {}))
+      return { lastEventId: 10, terminal: true }
+    })
+
+    render(<ChatPage />)
+    fireEvent.click(screen.getByRole('button', { name: /比较出差方案/ }))
+    const composer = screen.getByRole('textbox', { name: '给业务助理发送消息' })
+    expect((composer as HTMLTextAreaElement).value).toContain('上海到武汉')
+    expect(createAgentRun).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: '发送消息' }))
+
+    const result = within(await screen.findByRole('region', { name: '出差方案比较' }))
+    expect(result.getByText('返程价格未返回')).toBeInTheDocument()
+    expect(result.getByText('跨平台报价尚未核对')).toBeInTheDocument()
+    expect(result.getByText('房价按每晚显示，尚未取得含税总价')).toBeInTheDocument()
+    expect(result.getByText('65% 降水概率', { exact: false })).toBeInTheDocument()
+    expect(result.getByRole('list', { name: '出行建议' })).toHaveTextContent('带外套')
+    expect(result.getByText('已知费用')).toBeInTheDocument()
+    expect(result.getByText('酒店到会场约 22 分钟')).toBeInTheDocument()
+    expect(result.getByText('抵达后到会场约 35 分钟')).toBeInTheDocument()
+    fireEvent.click(result.getByText('候选与来源'))
+    expect(result.getByRole('link', { name: /G123 次列车/ })).toHaveAttribute('href', bookingUrl)
+    expect(result.queryByRole('link', { name: /会场附近酒店/ })).toBeNull()
+    expect(screen.queryByText('旧报价结果')).toBeNull()
+    expect(screen.getByRole('list', { name: '专员进度' })).toHaveTextContent('商旅行程待补充')
+
+    fireEvent.click(result.getByRole('button', { name: '选择方案 1' }))
+    expect(screen.getByRole('textbox', { name: '给业务助理发送消息' })).toHaveValue('保存方案 1')
+    expect(submitAgentInput).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: '发送消息' }))
+    expect(await screen.findByText('已保存为行程草稿')).toBeInTheDocument()
+    expect(submitAgentInput).toHaveBeenCalledWith('run_1', 'choose_plan', '保存方案 1', 'answer')
+    expect(createAgentRun).toHaveBeenCalledTimes(1)
+    expect(screen.queryByRole('button', { name: '选择方案 1' })).toBeNull()
+  })
+
+  it('exposes the travel source gap when no plan can be built', async () => {
+    streamAgentEvents.mockImplementationOnce(async (_url, onEvent: (item: AgentEvent) => void) => {
+      onEvent(event(1, 'run.started', {}))
+      onEvent(event(2, 'tool.completed', {
+        agent: 'travel', tool_call_id: 'empty_comparison', name: 'travel_compare_plans',
+        result: { success: true, data: {
+          request: { origin: '上海', destination: '武汉' },
+          plans: [], issues: ['未取得交通候选'],
+          providers: [{ source: 'flyai', status: 'unconfigured', message: '尚未配置飞猪查询。' }],
+        } },
+      }))
+      onEvent(event(3, 'run.waiting_for_input', { request_id: 'travel_quotes', questions: ['请补充交通报价。'] }))
+      return { lastEventId: 3, terminal: true }
+    })
+    render(<ChatPage />)
+    fireEvent.click(screen.getByRole('button', { name: /比较出差方案/ }))
+    fireEvent.click(screen.getByRole('button', { name: '发送消息' }))
+    const result = within(await screen.findByRole('region', { name: '出差方案比较' }))
+    expect(result.getByText('未取得交通候选')).toBeInTheDocument()
+    expect(result.getByText('尚未配置飞猪查询。', { exact: false })).toBeVisible()
+    expect(result.queryByRole('button', { name: /选择方案/ })).toBeNull()
+  })
+
   it('lets the user explicitly finish with available facts', async () => {
     streamAgentEvents.mockImplementationOnce(async (_url, onEvent: (item: AgentEvent) => void) => {
       onEvent(event(1, 'message.completed', { content: '请提供分享图片地址。' }))

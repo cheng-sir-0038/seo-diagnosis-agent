@@ -123,6 +123,11 @@ class Settings(BaseSettings):
     ga4_property_id: str = ""
     ga4_credentials_file: str = ""
 
+    # ---- 商旅只读数据源 ----
+    flyai_api_key: SecretStr = SecretStr("")
+    flyai_executable: str = "flyai"
+    baidu_maps_ak: SecretStr = SecretStr("")
+
     # ---- Agent 模型 ----
     deepseek_api_key: str = ""
     deepseek_base_url: str = "https://api.deepseek.com"

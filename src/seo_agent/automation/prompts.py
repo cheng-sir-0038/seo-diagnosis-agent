@@ -11,6 +11,7 @@ from src.promptops.registry import PromptRegistry
 from src.seo_agent.automation.models import DeliveryReviewOutput
 from src.seo_agent.opportunities.models import OpportunityDiscoveryOutput
 from src.seo_agent.tasks.models import TaskPrdContent
+from src.travel_agent.intake import TRAVEL_INTAKE_PROMPT, TRAVEL_INTAKE_PROMPT_KEY, TravelIntake
 
 SEO_PROMPT_DEFINITIONS: dict[str, dict[str, Any]] = {
     ROUTE_PROMPT_KEY: {
@@ -19,6 +20,13 @@ SEO_PROMPT_DEFINITIONS: dict[str, dict[str, Any]] = {
         "system_template": ROUTING_PROMPT,
         "user_template": "{{input}}",
         "output_schema": RouteDecision.model_json_schema(),
+    },
+    TRAVEL_INTAKE_PROMPT_KEY: {
+        "name": "商旅条件与报价整理",
+        "purpose": "在同一次行程规划中更新条件和用户提供的报价",
+        "system_template": TRAVEL_INTAKE_PROMPT,
+        "user_template": "{{input}}",
+        "output_schema": TravelIntake.model_json_schema(),
     },
     "seo.geo.question_researcher": {
         "name": "GEO 选题研究员",

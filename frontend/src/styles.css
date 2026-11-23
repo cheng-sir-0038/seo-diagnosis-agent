@@ -1734,6 +1734,15 @@ a:focus-visible,
   --example-hover: #fcf6ec;
 }
 
+.example-travel {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  padding-block: 3px;
+}
+
 .example-group h2 {
   margin: 0 6px 6px;
   color: var(--example-ink);
@@ -1789,6 +1798,8 @@ a:focus-visible,
 .suggestion-copy small { color: #5a5272; font-size: 11px; line-height: 1.5; }
 .suggestion-arrow { color: #75698e; font-size: 10px; }
 .example-group button:hover .suggestion-arrow { color: var(--example-ink); }
+.example-travel h2 { margin: 0 6px; }
+.example-travel button { min-height: 46px; }
 
 .assistant-name {
   display: flex;

@@ -46,6 +46,9 @@ from src.observability.instrumentation import observed_operation
 from src.observability.models import SpanKind
 from src.seo_agent.workflows.course_review import course_editor_input
 from src.seo_agent.workflows.structured_model import StructuredModelRunner
+from src.travel_agent.intake import TravelIntake, china_today
+from src.travel_agent.tools import TRAVEL_SKILL, travel_tools
+from src.travel_agent.workflow import run_travel
 
 SeoSpecialist = Callable[[str | None, list[str]], Awaitable[tuple[str, ToolRegistry]]]
 _SUPERVISOR_INPUT = "workspace_clarification"
@@ -84,11 +87,13 @@ class WorkspaceSupervisor:
         load_dialog: Callable[[str, str, str], Awaitable[list[dict[str, str]]]],
         load_tool_data: Callable[[str, tuple[str, ...]], Awaitable[list[dict[str, Any]]]] | None,
         followup_store: FollowupCaseStore | None = None,
+        travel_registry: Callable[[], ToolRegistry] = travel_tools,
     ) -> None:
         self.executor, self.planner, self.seo = executor, planner, seo
         self.medical_tools, self.load_dialog = medical_tools, load_dialog
         self.load_tool_data = load_tool_data
         self.followup_store = followup_store
+        self.travel_registry = travel_registry
         self.client = executor.observer.client if executor.observer else None
         graph = StateGraph(GraphState)
         graph.add_node(SUPERVISOR_NODE, self.plan)
@@ -98,6 +103,7 @@ class WorkspaceSupervisor:
             Specialist.LEARNING: self.education,
             Specialist.EXAM_PREP: self.education,
             Specialist.FOLLOWUP: self.followup,
+            Specialist.TRAVEL: self.travel,
         }
         for agent, node in specialists.items():
             graph.add_node(agent, node)
@@ -140,6 +146,7 @@ class WorkspaceSupervisor:
                     result = await self.planner.invoke(
                         prompt_key=ROUTE_PROMPT_KEY, schema=RouteDecision, method="json_mode",
                         context={
+                            "current_date": china_today().isoformat(),
                             "conversation": [
                                 {**m, "content": m["content"][-2000:]} for m in dialog[-6:]
                             ],
@@ -161,7 +168,9 @@ class WorkspaceSupervisor:
                         run.token_usage[key] = run.token_usage.get(key, 0) + count
                 question = decision.question if decision.route == Route.CLARIFY else None
                 if decision.route == Route.CLARIFY:
-                    question = question or "你想检查网页、查资料、练题，还是整理复诊记录？"
+                    question = question or (
+                        "你想检查网页、查资料、练题、整理复诊记录，还是规划出差？"
+                    )
                 if decision.route in {Route.SEO, Route.COURSE_REVIEW}:
                     saved["target_url"], question = select_page(
                         saved.get("target_url"), targets, invalid, decision,
@@ -194,6 +203,10 @@ class WorkspaceSupervisor:
                     saved["teacher_exam"] = query.model_dump(mode="json", exclude_none=True)
                 elif decision.route == Route.FOLLOWUP:
                     saved.pop("target_url", None)
+                elif decision.route == Route.TRAVEL:
+                    saved.pop("target_url", None)
+                    intake = decision.travel or TravelIntake()
+                    saved["travel_intake"] = intake.model_dump(mode="json")
                 saved.update(
                     route=decision.route, question=question, awaiting_page=wait_for_target,
                     pending_targets=targets if wait_for_target else [],
@@ -329,6 +342,23 @@ class WorkspaceSupervisor:
             await self._record_skill(run, agent_run_id, FOLLOWUP_SKILL, prompt_hash)
             run.dispatch_state["active_agent"] = agent
             await run_followup(self.executor, run, self.followup_store)
+            if span:
+                span.output_data = {"status": run.status.value}
+        return {}
+
+    async def travel(self, state: GraphState) -> dict:
+        run = state["run"]
+        async with observed_operation(
+            self.client, "workspace.travel", kind=SpanKind.AGENT,
+            input_data={"skill": TRAVEL_SKILL.name},
+        ) as span, self.executor.specialist(
+            run, Specialist.TRAVEL, sender=SUPERVISOR_NODE,
+        ) as agent_run_id:
+            self.executor.tools = self.travel_registry()
+            prompt_hash = hashlib.sha256(TRAVEL_SKILL.prompt_fragment.encode()).hexdigest()
+            await self._record_skill(run, agent_run_id, TRAVEL_SKILL, prompt_hash)
+            run.dispatch_state["active_agent"] = Specialist.TRAVEL
+            await run_travel(self.executor, run, self.planner)
             if span:
                 span.output_data = {"status": run.status.value}
         return {}

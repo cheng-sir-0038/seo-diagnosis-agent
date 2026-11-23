@@ -50,6 +50,7 @@ from src.seo_agent.runtime import (
     structured_model_automation,
 )
 from src.seo_agent.workflows.cloudflare_images import cloudflare_share_images
+from src.travel_agent.tools import TRAVEL_SKILL, travel_tools
 
 site_chat_router = APIRouter(prefix="/seo-agent/chat", tags=["SEO Agent Chat"])
 router = APIRouter(prefix="/chat", tags=["Conversations"])
@@ -125,6 +126,14 @@ def _durable_enabled() -> bool:
     return seo_chat_harness_store.database.started
 
 
+def _travel_registry() -> ToolRegistry:
+    return travel_tools(
+        flyai_api_key=settings.flyai_api_key.get_secret_value(),
+        flyai_executable=settings.flyai_executable,
+        baidu_maps_ak=settings.baidu_maps_ak.get_secret_value(),
+    )
+
+
 async def _execute(
     run_id: str,
     provider: ModelProvider,
@@ -166,6 +175,7 @@ async def _execute(
             seo_chat_harness_store.completed_dialog,
             seo_chat_harness_store.completed_tool_data if _durable_enabled() else None,
             FollowupCaseStore(seo_chat_harness_store.database) if _durable_enabled() else None,
+            travel_registry=_travel_registry,
         )
         await executor.run(run, workflow=supervisor.execute)
 
@@ -238,6 +248,7 @@ async def list_workspace_tools(
         skill = EDUCATION_SKILLS.get(name)
         skills_by_agent.setdefault(Specialist(skill.domain), []).append(skill)
     skills_by_agent[Specialist.FOLLOWUP] = [FOLLOWUP_SKILL]
+    skills_by_agent[Specialist.TRAVEL] = [TRAVEL_SKILL]
     return ToolDirectory(specialists=[
         SpecialistTools(
             agent=agent, note=description,
@@ -253,6 +264,7 @@ async def list_workspace_tools(
         for agent, registry, description in (
             (Specialist.HEALTHCARE, healthcare, None), (Specialist.SEO, seo, note), *education,
             (Specialist.FOLLOWUP, followup_tools(), "使用本次提供的资料整理随访与复诊准备清单。"),
+            (Specialist.TRAVEL, _travel_registry(), "核对国内出差的交通、住宿、路线和天气。"),
         )
     ])
 
