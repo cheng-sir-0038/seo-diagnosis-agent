@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import secrets
 from collections.abc import AsyncIterator
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -11,6 +12,7 @@ from uuid import UUID
 from fastapi import APIRouter, Header, HTTPException, Query, status
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from sqlalchemy.exc import SQLAlchemyError
 
 from src.agent.harness.persistence import StoreRunPersistence
 from src.agent.models import AgentEvent, AgentRun, HumanInputAnswer, RunStatus
@@ -20,11 +22,21 @@ from src.agent.providers.deepseek import DeepSeekProvider
 from src.agent.run_manager import run_manager
 from src.agent.runtime.executor import AgentExecutor
 from src.agent.tools.registry import ToolRegistry
-from src.agent.workspace.routing import ROUTING_PROMPT, Specialist
+from src.agent.workspace.routing import ROUTING_PROMPT, Route, Specialist
 from src.agent.workspace.supervisor import WorkspaceSupervisor, conversation_context
+from src.api.routes.workspace.followup import router as followup_router
 from src.core.cache import cache_manager
 from src.core.config import settings
+from src.education_agent.skills import EDUCATION_SKILLS, education_tools
 from src.facade.data_facade import facade
+from src.followup_agent.store import FollowupCaseStore, access_hash
+from src.followup_agent.workflow import (
+    FOLLOWUP_SKILL,
+    SAFE_INTENT,
+    FollowupCommand,
+    explicit_followup,
+    followup_tools,
+)
 from src.healthcare_agent import build_healthcare_registry
 from src.healthcare_agent.skills import available_healthcare_skills
 from src.observability.runtime import observability_client, observability_database
@@ -41,6 +53,7 @@ from src.seo_agent.workflows.cloudflare_images import cloudflare_share_images
 
 site_chat_router = APIRouter(prefix="/seo-agent/chat", tags=["SEO Agent Chat"])
 router = APIRouter(prefix="/chat", tags=["Conversations"])
+router.include_router(followup_router)
 
 
 class ConversationMessage(BaseModel):
@@ -74,6 +87,7 @@ class ConversationRunResponse(BaseModel):
     status: str
     events_url: str
     cancel_url: str
+    followup_key: str | None = None
 
 
 class DirectoryTool(BaseModel):
@@ -150,6 +164,8 @@ async def _execute(
             executor, structured_model_automation.model_runner, _workspace_seo,
             lambda: build_healthcare_registry(database=seo_chat_harness_store.database),
             seo_chat_harness_store.completed_dialog,
+            seo_chat_harness_store.completed_tool_data if _durable_enabled() else None,
+            FollowupCaseStore(seo_chat_harness_store.database) if _durable_enabled() else None,
         )
         await executor.run(run, workflow=supervisor.execute)
 
@@ -213,20 +229,30 @@ async def list_workspace_tools(
     else:
         seo = _seo_registry(site, [])
     healthcare = build_healthcare_registry(database=seo_chat_harness_store.database)
+    education = [
+        (agent, education_tools(agent), None)
+        for agent in (Specialist.LEARNING, Specialist.EXAM_PREP)
+    ]
+    skills_by_agent = {Specialist.HEALTHCARE: available_healthcare_skills(healthcare)}
+    for name in EDUCATION_SKILLS.names():
+        skill = EDUCATION_SKILLS.get(name)
+        skills_by_agent.setdefault(Specialist(skill.domain), []).append(skill)
+    skills_by_agent[Specialist.FOLLOWUP] = [FOLLOWUP_SKILL]
     return ToolDirectory(specialists=[
         SpecialistTools(
             agent=agent, note=description,
             skills=[
                 DirectorySkill(name=skill.name, label=skill.description, tools=skill.tools)
-                for skill in available_healthcare_skills(registry)
-            ] if agent == Specialist.HEALTHCARE else [],
+                for skill in skills_by_agent.get(agent, [])
+            ],
             tools=[
                 DirectoryTool(name=tool.name, description=tool.description)
                 for tool in registry.values()
             ],
         )
         for agent, registry, description in (
-            (Specialist.HEALTHCARE, healthcare, None), (Specialist.SEO, seo, note),
+            (Specialist.HEALTHCARE, healthcare, None), (Specialist.SEO, seo, note), *education,
+            (Specialist.FOLLOWUP, followup_tools(), "使用本次提供的资料整理随访与复诊准备清单。"),
         )
     ])
 
@@ -289,10 +315,24 @@ async def create_run(body: CreateConversationRunRequest) -> ConversationRunRespo
         previous = await seo_chat_harness_store.latest_dispatch_state(
             body.conversation_id, include_dialog=False,
         )
-    return await _start_run(
-        body, site_id=None, registry=None, system_prompt=ROUTING_PROMPT,
-        dispatch_state=conversation_context(previous),
+    state = conversation_context(previous)
+    latest = body.messages[-1].content
+    if explicit_followup(latest):
+        state = {
+            "route": Route.FOLLOWUP, "intent": SAFE_INTENT,
+            "followup_demo": "合成" in latest and "演示" in latest,
+        }
+        # The attachments and clinical notes belong in the case, outside model messages.
+        body = body.model_copy(update={"messages": [ConversationMessage(
+            role="user", content=SAFE_INTENT,
+        )]})
+    key = secrets.token_urlsafe(32) if _durable_enabled() else None
+    if key:
+        state["followup_key_hash"] = access_hash(key)
+    response = await _start_run(
+        body, site_id=None, registry=None, system_prompt=ROUTING_PROMPT, dispatch_state=state,
     )
+    return response.model_copy(update={"followup_key": key})
 
 
 async def _start_run(
@@ -488,9 +528,23 @@ async def resume_run(run_id: str) -> dict[str, str]:
 
 @router.post("/runs/{run_id}/input")
 @site_chat_router.post("/runs/{run_id}/input")
-async def submit_run_input(run_id: str, body: HumanInputAnswer) -> dict[str, Any]:
+async def submit_run_input(
+    run_id: str, body: HumanInputAnswer,
+    followup_key: str | None = Header(default=None, alias="X-Followup-Key", max_length=128),
+) -> dict[str, Any]:
     if not _durable_enabled():
         raise HTTPException(status_code=503, detail="Agent 运行 Harness 未启动")
+    try:
+        followup = await FollowupCaseStore(seo_chat_harness_store.database).check_input_access(
+            run_id, followup_key,
+        )
+    except KeyError:
+        raise HTTPException(404, "复诊任务不存在。") from None
+    except SQLAlchemyError:
+        raise HTTPException(503, "暂时无法确认资料访问权限。") from None
+    commands = {item.value for item in FollowupCommand}
+    if followup and (body.action != "answer" or body.answer not in commands):
+        raise HTTPException(422, "请通过本次复诊资料区提交操作。")
     existing = run_manager.get(run_id)
     if (
         existing is not None and existing.task is not None and not existing.task.done()

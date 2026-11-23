@@ -19,7 +19,11 @@ from src.agent.providers.base import ModelChunk, ModelProvider, ToolCall
 from src.agent.run_manager import RunManager
 from src.api.routes.workspace import conversations as chat
 from src.core.cache import CacheManager
+from src.education_agent.practice import MathPractice, question_bank
+from src.education_agent.resources import LearningResources
+from src.education_agent.teacher_exam import TeacherWrittenExam
 from src.facade.data_facade import DataFacade
+from src.followup_agent.workflow import FollowupCommand
 from src.healthcare_agent.postgraduate import POSTGRADUATE_TOOL, seed_postgraduate_corpus
 from src.models.common import Capability
 from src.observability.client import ObservabilityClient
@@ -52,8 +56,12 @@ class Models(ModelProvider):
 
     async def invoke(self, *, schema, context, **_):
         self.planner_inputs.append(deepcopy(context))
-        route, index = self.decisions.popleft()
-        decision = schema(route=route, needs_page=route != "healthcare", target_index=index)
+        planned = self.decisions.popleft()
+        if isinstance(planned, dict):
+            decision = schema.model_validate({"needs_page": False, **planned})
+        else:
+            route, index = planned
+            decision = schema(route=route, needs_page=route != "healthcare", target_index=index)
         return SimpleNamespace(usage={}, output=decision)
 
     async def stream(self, messages, tools, *, tool_choice="auto"):
@@ -151,6 +159,267 @@ async def ask(api, question, *, history=(), conversation_id="conversation"):
 
 def payloads(events, event_type):
     return [event["payload"] for event in events if event["type"] == event_type]
+
+
+async def answer_waiting(api, receipt, events, answer):
+    waiting = payloads(events, "run.waiting_for_input")[-1]
+    path = f"/api/v1/chat/runs/{receipt['run_id']}/input"
+    body = {"request_id": waiting["request_id"], "answer": answer}
+    response = await api.post(path, json=body)
+    response.raise_for_status()
+    resumed = response.json()
+    assert resumed["run_id"] == receipt["run_id"]
+    return await read_events(api, resumed), path, body
+
+
+@pytest.mark.asyncio
+async def test_followup_reads_one_subject_then_confirms_only_the_current_draft(workspace):
+    async with workspace.serve() as api:
+        receipt, first = await ask(api, "用合成资料演示复诊准备 marker_do_not_log")
+        assert first[-1]["type"] == "run.waiting_for_input"
+        assert payloads(first, "agent.dispatched")[0]["agent"] == "followup"
+        assert "另一份带检查日期" in payloads(first, "message.completed")[-1]["content"]
+        headers = {"X-Followup-Key": receipt["followup_key"]}
+        run_id = receipt["run_id"]
+        base = f"/api/v1/chat/runs/{run_id}"
+        case_path = f"{base}/followup"
+        assert (await api.get(case_path, headers={"X-Followup-Key": "wrong"})).status_code == 404
+        waiting = payloads(first, "run.waiting_for_input")[-1]
+        assert (await api.post(f"{base}/input", json={
+            "request_id": waiting["request_id"], "answer": FollowupCommand.CONFIRM,
+        })).status_code == 404
+        assert (await api.post(f"{base}/input", headers=headers, json={
+            "request_id": waiting["request_id"], "answer": "marker_unsolicited_clinical_note",
+        })).status_code == 422
+        upload = await api.post(
+            f"{case_path}/materials",
+            headers={**headers, "X-Followup-Subject": "DEMO-001", "X-Followup-File": "other.json"},
+            content=json.dumps([
+                {"subject_id": "DEMO-001", "kind": "report", "item": "should_not_merge"},
+                {"subject_id": "DEMO-999", "kind": "report", "item": "marker_other_subject"},
+            ]),
+        )
+        upload.raise_for_status()
+        case = upload.json()
+        assert case["files"][-1]["rows"] == 0
+        assert "对象编号不一致" in case["files"][-1]["error"]
+        assert all(row["record"]["item"] != "should_not_merge" for row in case["records"])
+        assert len(case["records"]) == 13
+        added = await api.post(f"{case_path}/demo-supplement", headers=headers)
+        added.raise_for_status()
+        again = await api.post(f"{case_path}/demo-supplement", headers=headers)
+        assert again.json() == added.json()
+        assert len(added.json()["records"]) == 15
+
+    async def respond(api, events, command):
+        waiting = payloads(events, "run.waiting_for_input")[-1]
+        body = {"request_id": waiting["request_id"], "answer": command}
+        response = await api.post(f"{base}/input", headers=headers, json=body)
+        response.raise_for_status()
+        return response.json(), body, await read_events(api, response.json())
+
+    async with workspace.serve() as api:
+        resumed, _, events = await respond(api, first, FollowupCommand.PREPARE)
+        assert resumed["run_id"] == run_id
+        case = (await api.get(case_path, headers=headers)).json()
+        assert case["saved"] is None
+        comparisons = {row["item"]: row for row in case["draft"]["comparisons"]}
+        assert comparisons["空腹血糖"]["delta"] == "-0.3"
+        assert comparisons["肌酐"]["delta"] is None
+        assert comparisons["肌酐"]["reasons"] == ["单位缺失或不同"]
+        # Repair a missing date while the prior version is waiting for confirmation.
+        entry = next(row for row in case["records"] if row["record"]["kind"] == "medication_note")
+        updated = await api.patch(
+            f"{case_path}/records/{entry['id']}", headers=headers,
+            json={"revision": case["revision"], "fields": {"record_date": "2026-11-16"}},
+        )
+        updated.raise_for_status()
+        case = updated.json()
+        corrected = next(row for row in case["records"] if row["id"] == entry["id"])
+        assert corrected["record"]["record_date"] == "2026-11-16"
+        assert corrected["original"]["record_date"] is None and case["draft"] is None
+
+        _, _, refreshed = await respond(api, events, FollowupCommand.CONFIRM)
+        assert refreshed[-1]["type"] == "run.waiting_for_input"
+        assert (await api.get(case_path, headers=headers)).json()["saved"] is None
+        _, confirmation, completed = await respond(api, refreshed, FollowupCommand.CONFIRM)
+        assert completed[-1]["type"] == "run.completed"
+        saved = (await api.get(case_path, headers=headers)).json()["saved"]
+        assert [(item["title"], item["due_date"]) for item in saved["tasks"]] == [
+            ("带上两次检查报告", "2026-11-27"),
+        ]
+        assert "第 2 行" in saved["tasks"][0]["source"]
+        replay = await api.post(f"{base}/input", headers=headers, json=confirmation)
+        assert replay.json()["replayed"] is True
+        assert (await api.get(case_path, headers=headers)).json()["saved"] == saved
+        detail = (await api.get(base)).text
+        for private in (
+            "marker_do_not_log", "marker_other_subject", "marker_unsolicited_clinical_note",
+            "空腹血糖", "合成补充报告.csv", receipt["followup_key"],
+        ):
+            assert private not in detail
+        tools = payloads(completed, "tool.completed")
+        assert {tool["name"] for tool in tools} == {
+            "followup_read_materials", "followup_prepare_materials", "followup_save_confirmed",
+        }
+        assert {tool["agent_run_id"] for tool in tools} == {tools[0]["agent_run_id"]}
+    assert not workspace.models.planner_inputs
+    assert not workspace.models.specialist_inputs
+
+
+@pytest.mark.asyncio
+async def test_followup_import_can_retry_a_document_with_the_correct_subject(workspace):
+    async with workspace.serve() as api:
+        receipt, events = await ask(api, "整理下次复诊的资料")
+        assert events[-1]["type"] == "run.waiting_for_input"
+        headers = {"X-Followup-Key": receipt["followup_key"], "X-Followup-File": "supplied.json"}
+        case = f"/api/v1/chat/runs/{receipt['run_id']}/followup"
+        data = json.dumps([{
+            "subject_id": "CASE-01", "kind": "report", "item": "Glucose", "value": 5.9,
+        }])
+        wrong = await api.post(
+            f"{case}/materials", content=data,
+            headers={**headers, "X-Followup-Subject": "CASE-02"},
+        )
+        assert wrong.json()["subject_id"] is None
+        corrected = await api.post(
+            f"{case}/materials", content=data, headers={**headers, "X-Followup-Subject": "CASE-01"},
+        )
+        corrected.raise_for_status()
+        assert corrected.json()["subject_id"] == "CASE-01"
+        assert corrected.json()["records"][0]["record"]["value"] == "5.9"
+        assert len(corrected.json()["files"]) == 1
+        assert corrected.json()["files"][0]["error"] is None
+
+
+@pytest.mark.asyncio
+async def test_math_practice_resumes_grades_once_and_reviews_the_wrong_question(workspace):
+    models = workspace.models
+    models.decisions.append({
+        "route": "learning", "learning_skill": "math-practice",
+        "math_practice": {"topic": "一元一次方程", "count": 4},
+    })
+    review_route = {
+        "route": "learning", "learning_skill": "math-practice",
+        "math_practice": {"review": True},
+    }
+    bank = question_bank()
+    assert len(bank) == 50
+    async with workspace.serve() as api:
+        receipt, first = await ask(api, "给我 4 道一元一次方程练习")
+        [question_step] = payloads(first, "tool.completed")
+        assert question_step["name"] == MathPractice.name
+        data = question_step["result"]["data"]
+        assert not any(field in data for field in ("answer", "analysis", "counts"))
+        assert len(data["progress"]["question_ids"]) == 4
+        first_id, _, third_id, _ = data["progress"]["question_ids"]
+        question = bank[first_id]
+        wrong_letter = next(letter for letter in question.options if letter != question.answer)
+        assert "第 1 / 4 题" in payloads(first, "message.completed")[-1]["content"]
+        original_agent_run_id = question_step["agent_run_id"]
+
+    async with workspace.serve() as api:
+        models.decisions.append({
+            "route": "learning", "learning_skill": "math-resources",
+            "resources": {"topic": "Oxford Owl", "completed": True},
+        })
+        # The resource is completed while a separate practice run is still waiting.
+        _, resource = await ask(api, "我已完成 Oxford Owl 的练习")
+        assert "已记录完成" in payloads(resource, "message.completed")[-1]["content"]
+        events, _, _ = await answer_waiting(api, receipt, first, "两个都选")
+        assert "第 1 / 4 题" in payloads(events, "message.completed")[-1]["content"]
+        events, path, body = await answer_waiting(api, receipt, events, wrong_letter)
+        feedback = payloads(events, "message.completed")[-1]["content"]
+        assert "答错了" in feedback and "题库原解析" in feedback and question.source_url in feedback
+        assert "第 2 / 4 题" in feedback
+        assert (await api.post(path, json=body)).json()["replayed"] is True
+        assert (await api.post(path, json={**body, "answer": question.answer})).status_code == 409
+        events, _, _ = await answer_waiting(api, receipt, events, "跳过")
+        assert "第 3 / 4 题" in payloads(events, "message.completed")[-1]["content"]
+        events, _, _ = await answer_waiting(api, receipt, events, f"我选 {bank[third_id].answer}。")
+        assert "答对了" in payloads(events, "message.completed")[-1]["content"]
+        events, _, _ = await answer_waiting(api, receipt, events, "结束练习")
+        assert events[-1]["type"] == "run.completed"
+        results = payloads(events, "tool.completed")
+        assert {result["agent_run_id"] for result in results} == {original_agent_run_id}
+        assert len(payloads(events, "skill.loaded")) == 1
+        assert results[-1]["result"]["data"]["counts"] == {
+            "correct": 1, "incorrect": 1, "skipped": 1, "unanswered": 1,
+        }
+        models.decisions.append(review_route)
+        review_receipt, review = await ask(api, "重练错题")
+        progress = payloads(review, "tool.completed")[-1]["result"]["data"]["progress"]
+        assert progress["question_ids"] == [first_id]
+        reviewed, _, _ = await answer_waiting(api, review_receipt, review, question.answer)
+        assert reviewed[-1]["type"] == "run.completed"
+        models.decisions.append(review_route)
+        _, no_wrong = await ask(api, "看看还有错题吗")
+        assert "暂无可复练的错题" in payloads(no_wrong, "message.completed")[-1]["content"]
+        models.decisions.append({
+            "route": "learning", "learning_skill": "math-resources", "resources": {"topic": "分数"},
+        })
+        _, records = await ask(api, "查看分数学习资料")
+        assert "这一项已记录完成" in payloads(records, "message.completed")[-1]["content"]
+    assert not models.specialist_inputs
+
+
+@pytest.mark.asyncio
+async def test_teacher_exam_retains_confirmed_scope_and_never_fills_with_another_notice(workspace):
+    models = workspace.models
+    models.decisions.extend([
+        {"route": "exam_prep", "teacher_exam": {
+            "region": "湖北", "year": 2026, "subject": "初中数学",
+        }},
+        {"route": "exam_prep", "teacher_exam": {"session": "second"}},
+        {"route": "exam_prep", "teacher_exam": {
+            "year": 2027, "region": "湖北", "subject": "初中数学",
+        }},
+        {"route": "exam_prep", "teacher_exam": {
+            "region": "湖北", "year": 2026, "subject": "初中数学", "session": "first",
+        }},
+    ])
+    async with workspace.serve() as api:
+        receipt, first = await ask(api, "2026 年湖北初中数学教资笔试何时报名？")
+        [need_input] = payloads(first, "run.waiting_for_input")
+        assert "上半年或下半年" in need_input["questions"][0]
+        assert not payloads(first, "tool.completed")
+        events, _, _ = await answer_waiting(api, receipt, first, "下半年")
+        [dispatch] = payloads(events, "agent.dispatched")
+        [call] = payloads(events, "tool.completed")
+        assert dispatch["agent"] == call["agent"] == "exam_prep"
+        assert dispatch["agent_run_id"] == call["agent_run_id"]
+        assert call["name"] == TeacherWrittenExam.name
+        answer = payloads(events, "message.completed")[-1]["content"]
+        assert "7 月 3 日" in answer and "15957.html" in answer and "347-1.htm" in answer
+        assert "15603.html" not in answer
+
+        _, out_of_scope = await ask(api, "2027 年湖北初中数学教资笔试何时报名？")
+        result = payloads(out_of_scope, "tool.completed")[-1]["result"]["data"]
+        assert result["scope"]["year"] == 2027 and result["matched"] is False
+        assert "7 月 3 日" not in result["answer"]
+        _, first_session = await ask(api, "2026 年上半年湖北初中数学教资笔试呢？")
+        answer = payloads(first_session, "message.completed")[-1]["content"]
+        assert "1 月 9 日" in answer and "15603.html" in answer
+        assert "15957.html" not in answer
+
+
+@pytest.mark.asyncio
+async def test_official_learning_resource_completion_is_saved_in_the_conversation(workspace):
+    query = {"topic": "分数", "age": 9}
+    workspace.models.decisions.extend([
+        {"route": "learning", "learning_skill": "math-resources", "resources": params}
+        for params in (query, {"topic": "Oxford Owl", "completed": True}, query)
+    ])
+    async with workspace.serve() as api:
+        _, events = await ask(api, "9 岁想学分数，推荐一个官方练习")
+        [tool] = payloads(events, "tool.completed")
+        assert tool["name"] == LearningResources.name
+        assert tool["result"]["data"]["sources"] == [
+            "https://home.oxfordowl.co.uk/maths/primary-fractions/",
+        ]
+        await ask(api, "已经完成了 Oxford Owl 的分数练习")
+        _, saved = await ask(api, "再看看 9 岁的分数练习")
+        assert "这一项已记录完成" in payloads(saved, "message.completed")[-1]["content"]
 
 
 @pytest.mark.asyncio
@@ -286,11 +555,19 @@ async def test_course_editor_gets_exact_page_and_verified_public_rule(workspace,
         receipt, events = await ask(api, f"用医学人文考纲核对课程页 {url}")
         assert events[-1]["type"] == "run.completed", events[-1]
         assert [
-            (e["type"], e["payload"].get("agent") or e["payload"].get("name"))
-            for e in events if e["type"] in {"agent.dispatched", "tool.completed"}
+            (e["type"], e["payload"]["agent"])
+            for e in events
+            if e["type"] in {"agent.dispatched", "tool.completed", "agent.completed"}
         ] == [
-            ("agent.dispatched", "healthcare"), ("tool.completed", "medical_exam_syllabus"),
-            ("agent.dispatched", "seo"), ("tool.completed", "seo_page_metadata"),
+            ("agent.dispatched", "healthcare"), ("tool.completed", "healthcare"),
+            ("agent.completed", "healthcare"), ("agent.dispatched", "seo"),
+            ("tool.completed", "seo"), ("agent.completed", "seo"),
+        ]
+        dispatches = payloads(events, "agent.dispatched")
+        [medical_id, seo_id] = [item["agent_run_id"] for item in dispatches]
+        assert medical_id != seo_id
+        assert [item["agent_run_id"] for item in payloads(events, "agent.completed")] == [
+            medical_id, seo_id,
         ]
         rule_call, page_call = payloads(events, "tool.started")
         rule_receipt, page_receipt = payloads(events, "tool.completed")
@@ -298,6 +575,8 @@ async def test_course_editor_gets_exact_page_and_verified_public_rule(workspace,
         assert page_call["arguments"] == {"url": url}
         assert rule_receipt["tool_call_id"] == rule_call["tool_call_id"]
         assert page_receipt["tool_call_id"] == page_call["tool_call_id"]
+        assert rule_receipt["agent_run_id"] == rule_call["agent_run_id"] == medical_id
+        assert page_receipt["agent_run_id"] == page_call["agent_run_id"] == seo_id
         assert all(p["result"]["success"] for p in (rule_receipt, page_receipt))
         detail = (await api.get(f"/api/v1/chat/runs/{receipt['run_id']}")).json()
         assert detail["status"] == "COMPLETED"
@@ -323,6 +602,8 @@ async def test_failed_course_editor_reuses_both_receipts_after_restart(workspace
     async with workspace.serve() as api:
         receipt, first = await ask(api, "核对医学人文考纲 https://courses.example/clinical-course.html")
         assert first[-1]["type"] == "run.failed"
+        [failure] = payloads(first, "agent.failed")
+        assert failure["agent"] == "seo"
         prior = payloads(first, "tool.completed")
         assert len(prior) == 2 and all(result["result"]["success"] for result in prior)
     models.replies.append("已根据此前两份证据核对。")
@@ -332,7 +613,11 @@ async def test_failed_course_editor_reuses_both_receipts_after_restart(workspace
         events = await read_events(api, receipt)
         assert events[-1]["type"] == "run.completed", events[-1]
         assert payloads(events, "tool.completed") == prior
-        assert [p["agent"] for p in payloads(events, "agent.dispatched")] == ["healthcare", "seo"]
+        dispatches = payloads(events, "agent.dispatched")
+        assert [p["agent"] for p in dispatches] == ["healthcare", "seo", "seo"]
+        retry_id = failure["agent_run_id"]
+        assert dispatches[1]["agent_run_id"] == dispatches[2]["agent_run_id"] == retry_id
+        assert payloads(events, "agent.completed")[-1]["agent_run_id"] == failure["agent_run_id"]
     assert len(models.planner_inputs) == 1
     assert len(models.specialist_inputs) == 2
     assert models.specialist_inputs[0] == models.specialist_inputs[1]

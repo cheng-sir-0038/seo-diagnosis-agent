@@ -5,7 +5,9 @@ import json
 import logging
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from typing import Any
 
@@ -39,6 +41,20 @@ _BUDGET_PREFIX = (
     "本次调查已达到本轮调查预算，以下结论基于已经获得的证据；数据不足的部分已明确标注。"
 )
 _DUPLICATE_GUARD_PREFIX = "检测到重复工具调用，已停止继续补查；以下结论基于已经获得的证据。"
+_SPECIALIST_DISPATCHED = "agent.dispatched"
+_SPECIALIST_COMPLETED = "agent.completed"
+_SPECIALIST_FAILED = "agent.failed"
+_SPECIALIST_LIFECYCLE = frozenset({
+    _SPECIALIST_DISPATCHED, _SPECIALIST_COMPLETED, _SPECIALIST_FAILED, "run.waiting_for_input",
+})
+_active_specialist: ContextVar[tuple[str, dict[str, str]] | None] = ContextVar(
+    "active_specialist", default=None,
+)
+
+
+def _specialist_payload(run: AgentRun) -> dict[str, str]:
+    scope = _active_specialist.get()
+    return scope[1] if scope is not None and scope[0] == run.id else {}
 
 
 class AgentExecutor:
@@ -148,6 +164,40 @@ class AgentExecutor:
             run, run.messages, iteration=run.iteration, tool_count=run.tool_count, stage=stage,
         )
 
+    @asynccontextmanager
+    async def specialist(self, run: AgentRun, agent: str, *, sender: str) -> AsyncIterator[str]:
+        previous = next(
+            (event for event in reversed(run.events)
+             if event.type in _SPECIALIST_LIFECYCLE and event.payload.get("agent") == agent
+             and event.payload.get("agent_run_id")),
+            None,
+        )
+        agent_run_id = (
+            previous.payload["agent_run_id"]
+            if previous is not None and previous.type != _SPECIALIST_COMPLETED
+            else f"agent_{uuid.uuid4().hex}"
+        )
+        payload = {"agent": agent, "agent_run_id": agent_run_id}
+        token = _active_specialist.set((run.id, payload))
+        try:
+            if previous is None or previous.type != _SPECIALIST_DISPATCHED:
+                await self.emit(run, _SPECIALIST_DISPATCHED, {**payload, "from": sender})
+            yield agent_run_id
+        except (asyncio.CancelledError, _RunCancelledError):
+            raise
+        except Exception:
+            try:
+                await self.emit(run, _SPECIALIST_FAILED, payload, severity=Severity.ERROR)
+            except Exception as event_exc:
+                logger.warning("Failed to persist specialist failure: %s", type(event_exc).__name__)
+            raise
+        finally:
+            _active_specialist.reset(token)
+
+    async def complete_specialist(self, run: AgentRun) -> None:
+        if payload := _specialist_payload(run):
+            await self.emit(run, _SPECIALIST_COMPLETED, payload)
+
     async def required_tool(self, run: AgentRun, call: ToolCall) -> ToolResult:
         """执行工作流指定的取证步骤，恢复时沿用同一调用的成功回执。"""
         for event in reversed(run.events):
@@ -160,6 +210,21 @@ class AgentExecutor:
         replies: list[dict[str, Any]] = []
         await self._execute_tool(run, call, replies)
         return ToolResult.model_validate_json(replies[-1]["content"])
+
+    async def run_tool_workflow(
+        self, run: AgentRun, call: ToolCall, *, evidence_answer: Callable[[AgentRun], str | None],
+    ) -> None:
+        """Start a planned tool step and use the normal checkpoints and input receipts."""
+        executed = any(
+            event.type in {"tool.completed", "tool.failed"}
+            and event.payload.get("tool_call_id") == call.id
+            for event in run.events
+        )
+        if run.human_input is None and not run.pending_tool_calls and not executed:
+            run.messages.append(_assistant_tool_call(call))
+            run.pending_tool_calls = [_serialize_tool_call(call)]
+            await self.checkpoint(run, stage="tools_pending")
+        await self.run_turns(run, evidence_answer=evidence_answer)
 
     async def run_turns(
         self, run: AgentRun, *,
@@ -188,12 +253,7 @@ class AgentExecutor:
                     id=f"resume_{uuid.uuid4().hex}", name=run.human_input.tool_name,
                     arguments=run.human_input.tool_arguments,
                 )
-                messages.append({"role": "assistant", "content": None, "tool_calls": [{
-                    "id": call.id, "type": "function", "function": {
-                        "name": call.name,
-                        "arguments": json.dumps(call.arguments, ensure_ascii=False),
-                    },
-                }]})
+                messages.append(_assistant_tool_call(call))
                 run.pending_tool_calls = [_serialize_tool_call(call)]
                 await self._save_checkpoint(
                     run, messages, iteration=iteration, tool_count=tool_count,
@@ -434,6 +494,7 @@ class AgentExecutor:
         )
         if self.persistence is not None:
             await self.persistence.finalize(run)
+        await self.complete_specialist(run)
         await self.emit(run, "run.completed", {
             "status": run.status.value,
             "partial": run.partial,
@@ -500,7 +561,7 @@ class AgentExecutor:
         pending = run.human_input
         if pending is None or pending.answer is not None:
             return False
-        text = "还需要你补充以下信息：\n\n" + "\n".join(
+        text = pending.message or "还需要你补充以下信息：\n\n" + "\n".join(
             f"{index + 1}. {question}" for index, question in enumerate(pending.questions)
         )
         if not messages or messages[-1].get("content") != text:
@@ -508,6 +569,7 @@ class AgentExecutor:
         waiting = {
             "request_id": pending.request_id, "questions": pending.questions,
             "allow_use_available": pending.allow_use_available,
+            **_specialist_payload(run),
         }
         events = (
             AgentEvent(run_id=run.id, sequence=run.sequence + 1, type="message.completed",
@@ -754,6 +816,8 @@ class AgentExecutor:
         severity: Severity = Severity.INFO,
         stage: str | None = None,
     ) -> None:
+        if event_type.startswith(("tool.", "skill.")):
+            payload = {**payload, **_specialist_payload(run)}
         event = run.emit(event_type, payload)
         if self.persistence is not None:
             await self.persistence.persist_event(run, event)
@@ -769,6 +833,15 @@ class AgentExecutor:
     def _check_cancel(run: AgentRun) -> None:
         if run.cancel_event.is_set():
             raise _RunCancelledError
+
+
+def _assistant_tool_call(call: ToolCall) -> dict[str, Any]:
+    return {"role": "assistant", "content": None, "tool_calls": [{
+        "id": call.id, "type": "function", "function": {
+            "name": call.name,
+            "arguments": json.dumps(call.arguments, ensure_ascii=False),
+        },
+    }]}
 
 
 def _has_reused_tool_result(run: AgentRun) -> bool:

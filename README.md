@@ -1,6 +1,6 @@
 # SEO Diagnosis Agent
 
-在工作台提问后，LangGraph 主 Agent 用 DeepSeek 判断本轮业务，再分派给 SEO/GEO 或医药专员。医药专员按任务加载 Skill 和对应工具，按数据回执给出答案。对话会显示谁接手、加载了什么 Skill，以及证据从哪里来。
+在工作台提问后，LangGraph 主 Agent 分派给 SEO/GEO、医药、学习陪练、报考备考或随访与复诊准备专员。常规请求用 DeepSeek 判断业务，明确的复诊资料请求直接进入资料整理流程。对话显示专员进度和 Skill，展开「执行详情」可核对工具回执。
 
 ![多 Agent 工作台首页，含考研、医药和网站业务入口](docs/screenshots/01-chat-overview.png)
 
@@ -20,6 +20,10 @@
 | “按 2026 年湖北医师资格公告，我 2025 年技能通过、综合没过，还要重考技能吗？” | 医药专员核对考区、年份和考点条件，缺少条件会暂停，等用户补充后继续。 |
 | “对比 2026 年武汉科技大学 105101 和湖北民族大学 105100 的初试科目。” | 医药专员按各校专业代码做 PostgreSQL 全文检索，用命中段落和官方出处生成可核对的回答。 |
 | “用医学人文修订通知核对湖北医师资格考试报名页的适用类别。” | 医药专员查公告，SEO 专员读取用户给出的网页，核对两份原文。[湖北考区报名页](https://www.hbwsrc.cn/news/show-1830.html) |
+| “出 3 道一元一次方程题，一次出一道。” | 学习陪练从 TAL-SCQ5K 选题。回复选项字母后看到判分与原解析，中途可回来继续。 |
+| “9 岁学分数，有什么官方练习？” | 按年龄和主题推荐 Oxford Owl 或 Cambridge NRICH 的原站练习，做完可在本对话登记。 |
+| “2026 年下半年湖北初中数学教资笔试怎么准备？” | 报考备考核对公告和科目，给出报名清单、备考顺序与 304 大纲链接。 |
+| “用合成资料演示一次复诊准备，帮我对照两次报告。” | 随访与复诊准备专员先追问缺的报告，补齐后按记录条件对照，展示来源并等你确认保存资料包和待办。 |
 
 医考工具使用带年份和出处的官方公告摘录，网页核对直接读取指定的公开页面。[专员编排](src/agent/workspace/supervisor.py) · [医药 Skill](src/healthcare_agent/skills.py)
 
@@ -60,11 +64,19 @@ flowchart TB
     API --> MAIN["LangGraph 主 Agent / DeepSeek"]
     MAIN --> MED["医药专员 / 按任务加载 Skill"]
     MAIN --> SEO["SEO/GEO 专员"]
+    MAIN --> LEARN["学习陪练 / 方程练习与资源"]
+    MAIN --> EXAM["报考备考 / 教资笔试"]
+    MAIN --> VISIT["随访与复诊准备 / 本次提供的资料"]
     MED -->|公开考纲依据| SEO
     SEO --> EXEC["Agent 执行器"]
     MED --> EXEC
+    LEARN --> EXEC
+    EXAM --> EXEC
+    VISIT --> EXEC
     EXEC --> HEALTH["医考公告 / 考研检索 / 医保目录 / PubMed"]
     HEALTH --> RUNDB
+    EXEC --> FOLLOWUP["资料读取回执 / 对照 / 确认保存"]
+    FOLLOWUP --> RUNDB
     EXEC --> WF["业务工作流：页面 / 搜索 / 关键词 / 草稿"]
     EXEC --> TOOL["只读 SEO 工具"]
     WF --> TOOL
@@ -82,6 +94,20 @@ flowchart TB
 ```
 
 对话中的站点取证只读，建议和生成图保存在本应用。创建执行任务、审批和发布走各自的业务接口。
+
+### 学习陪练和报考备考
+
+- 学习陪练收录 TAL-SCQ5K 的 50 道「一元一次方程」及应用题，一组最多 5 道。程序按题库的选项判分，保留原解析和出处。每答一题保存回执，刷新页面或重启服务后还能接着答。回复「跳过」或「结束练习」分别计入跳过和未答；完成后在同一对话说「重练错题」，可以再次练习错题。[题库来源与许可](src/education_agent/corpus/README.md) · [练习实现](src/education_agent/practice.py)
+- 官方资源按年龄和主题匹配。可试「给 15 岁学生找一道方程探究题」，做完后回复「我完成了 NRICH 的方程练习」来记录。应用保存官方链接和完成状态。[资源索引](src/education_agent/resources.py)
+- 报考备考覆盖湖北 2026 年上下半年的初中数学教师资格笔试。条件不全时追问，年度、地区、学段或科目超出资料范围时提示缺口。两条业务使用现有 DeepSeek 配置，题库与公开资料无需额外 API Key。[业务 Skill](src/education_agent/skills.py) · [湖北报名公告](https://www.hbea.edu.cn/html/jszg/index.html) · [中国教育考试网 304 大纲](https://ntce.neea.edu.cn/html1/report/1508/347-1.htm)
+
+### 随访与复诊准备
+
+从首页点「随访与复诊准备」发送合成演示。初始只有一份报告。载入合成补充报告后，在同一个 Run 里点「整理并核对资料」。资料区保留每行的来源，展示报告差值、不可直接比较的项目，以及原记录中的安排。核对后点保存，程序将当前版本和已确认的待办写入 PostgreSQL。修订资料会更新版本，旧预览需要重新核对。[Agent 工作流](src/followup_agent/workflow.py) · [验收用例](tests/agent/test_workspace_scenarios.py)
+
+手动导入时使用匿名对象编号。首版支持 UTF-8 CSV、记录数组 JSON 和同字段模板的文字 PDF。PDF 每页首行是列名，字段用 `|` 分隔。必填字段是 `subject_id`、`kind` 和 `item`，日期使用 `YYYY-MM-DD`。样例展示了报告、已有安排、用户自述和用药资料的字段。[合成资料模板](src/followup_agent/examples/initial.csv) · [合成补充报告](src/followup_agent/examples/supplement.csv) · [FHIR R4 Observation 字段参考](https://hl7.org/fhir/R4/observation.html)
+
+资料内容保存在当前服务的独立资料表。模型对话和执行日志只使用步骤及数量回执。报告对照仅核对原值与来源，临床解释由医生或药师负责。使用合成或已去标识的记录即可演示。
 
 ## 业务场景与现有入口
 
@@ -108,7 +134,7 @@ flowchart TB
 
 ## 工具与业务工作流
 
-在工作台点「专员与工具」，可以查看这次会话里两位专员能调用的工具。对话回复按实际交接顺序展示专员和操作。展开「执行详情」可核对每次调用的状态与耗时。
+在工作台点「专员与工具」，可以查看五位专员及其可用工具。对话回复按实际交接顺序展示专员和操作。展开「执行详情」可核对每次调用的状态与耗时。
 
 | 医药 Skill | 注册工具 | 免费公开资料 |
 | --- | --- | --- |

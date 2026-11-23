@@ -1,0 +1,3 @@
+subject_id,kind,record_date,item,value,unit,specimen,method,reference_range,flag,note,due_date,plan_status
+DEMO-001,report,2026-11-20,空腹血糖,5.9,mmol/L,静脉血浆,己糖激酶法,3.9-6.1,,,,
+DEMO-001,report,2026-11-20,肌酐,0.96,mg/dL,血清,酶法,,,,,

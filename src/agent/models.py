@@ -31,6 +31,7 @@ class HumanInputRequest(BaseModel):
         min_length=1, max_length=3
     )
     allow_use_available: bool = False
+    message: str | None = Field(default=None, min_length=1, max_length=12000)
 
 
 class HumanInputAnswer(BaseModel):

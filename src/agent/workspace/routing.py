@@ -2,11 +2,23 @@ from __future__ import annotations
 
 import re
 from enum import StrEnum
+from typing import Literal
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.core.exceptions import InternalAdapterError
+from src.education_agent.practice import MathPracticeQuery
+from src.education_agent.resources import ResourceQuery
+from src.education_agent.skills import (
+    EDUCATION_SKILLS,
+    EXAM_PREP_DOMAIN,
+    LEARNING_DOMAIN,
+    EducationSkill,
+)
+from src.education_agent.teacher_exam import TeacherExamQuery
+from src.followup_agent.workflow import DOMAIN as FOLLOWUP_DOMAIN
+from src.followup_agent.workflow import FOLLOWUP_SKILL
 from src.healthcare_agent.skills import HealthcareSkill
 from src.providers.page_metadata.client import normalize_site_url
 
@@ -14,17 +26,22 @@ from src.providers.page_metadata.client import normalize_site_url
 class Specialist(StrEnum):
     SEO = "seo"
     HEALTHCARE = "healthcare"
+    LEARNING = LEARNING_DOMAIN
+    EXAM_PREP = EXAM_PREP_DOMAIN
+    FOLLOWUP = FOLLOWUP_DOMAIN
 
 
 class Route(StrEnum):
     SEO = Specialist.SEO
     HEALTHCARE = Specialist.HEALTHCARE
+    LEARNING = Specialist.LEARNING
+    EXAM_PREP = Specialist.EXAM_PREP
+    FOLLOWUP = Specialist.FOLLOWUP
     COURSE_REVIEW = "course_review"
     CLARIFY = "clarify"
 
 
-ROUTE_PROMPT_KEY = "workspace.route.v2"
-DISPATCHED_EVENT = "agent.dispatched"
+ROUTE_PROMPT_KEY = "workspace.route.v4"
 SKILL_LOADED_EVENT = "skill.loaded"
 SUPERVISOR_NODE = "supervisor"
 ASK_PAGE = "请发要检查的公开网页链接或域名。"
@@ -38,6 +55,10 @@ class RouteDecision(BaseModel):
     healthcare_skill: HealthcareSkill | None = Field(
         default=None, description="本次医药任务使用的 Skill。需要门店私有数据时留空",
     )
+    learning_skill: Literal[EducationSkill.MATH_PRACTICE, EducationSkill.RESOURCES] | None = None
+    math_practice: MathPracticeQuery | None = None
+    resources: ResourceQuery | None = None
+    teacher_exam: TeacherExamQuery | None = None
     target_index: int | None = Field(default=None, ge=1, description="候选页面从 1 开始的序号")
     question: str | None = Field(default=None, max_length=300, description="意图不清时的追问")
 
@@ -55,13 +76,19 @@ ROUTING_PROMPT = (
     "course_review 专用于拿医学人文考纲核对招生或课程页的公开说法，需要页面。"
     "用户提供了课程页、或刚问过医学人文修订又要求对照网页，使用 course_review；"
     "单纯问网页的 Title 仍由 seo 处理。明确的医考或门店问题不因含有参考链接而转 SEO。"
-    "没有明确的业务意图或超出这些业务就选 clarify，给一个自然、简短的追问。"
     "用户要求检查或更换具体网页时，target_index 必填，即使只有一个也选 1。"
     "它引用候选页序号。参考文献链接不选，沿用上轮页面时不选。"
     "多个链接且无法分清目标时不选。不从助手答案或作为依据的引用中推测网址。"
     "用户沿用上文的问题时结合前一轮业务与当前页面。问题里有足够信息就直接分派。"
     "院校与招生相关的后续问题可沿用 previous_healthcare_skill。"
-)
+    "\nlearning 负责数学陪练和推荐学习资料。考研仍走 healthcare。"
+    "教师资格笔试走 exam_prep，条件不全也先保留已明确的字段。"
+    "待补充 teacher_exam 时用 pending_teacher_exam 与用户刚补充的条件合并，"
+    "该次查询尚未结束。后续追问同一考期时可沿用 previous_teacher_exam。"
+    "没有明确的业务意图或超出这些业务就选 clarify，给一个自然、简短的追问。"
+) + "\n" + "\n".join(
+    EDUCATION_SKILLS.get(name).prompt_fragment for name in EDUCATION_SKILLS.names()
+) + "\n" + FOLLOWUP_SKILL.prompt_fragment
 
 
 def explicit_healthcare_skill(question: str) -> HealthcareSkill | None:

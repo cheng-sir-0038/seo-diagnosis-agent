@@ -63,12 +63,23 @@ async def test_tool_directory_lists_the_live_registries_without_running_tools(mo
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as api:
         default = await api.get("/api/v1/chat/tools")
         assert default.status_code == 200
-        medical, search = default.json()["specialists"]
+        medical, search, learning, exam, followup = default.json()["specialists"]
         assert medical["agent"] == "healthcare"
         assert {s["name"] for s in medical["skills"]} >= {"medicare-catalogue", "pubmed-literature"}
         medical_names = {t["name"] for t in medical["tools"]}
         assert medical_names == set(chat.build_healthcare_registry().names())
         assert search["agent"] == "seo" and search["tools"] == [] and search["note"]
+        assert learning["agent"] == "learning"
+        assert {t["name"] for t in learning["tools"]} == {
+            "tal_math_practice", "math_resource_lookup",
+        }
+        assert {s["name"] for s in learning["skills"]} == {"math-practice", "math-resources"}
+        assert exam["agent"] == "exam_prep"
+        assert exam["tools"][0]["name"] == "ntce_written_exam_lookup"
+        assert followup["agent"] == "followup"
+        assert {tool["name"] for tool in followup["tools"]} == {
+            "followup_read_materials", "followup_prepare_materials", "followup_save_confirmed",
+        }
         database = SimpleNamespace(started=True)
 
         async def last_target(conversation_id, *, include_dialog):
@@ -84,7 +95,7 @@ async def test_tool_directory_lists_the_live_registries_without_running_tools(mo
         monkeypatch.setattr(chat.seo_agent_system_service, "find_site_by_host", find_site)
         response = await api.get("/api/v1/chat/tools", params={"conversation_id": "course-turn"})
         scoped = response.json()
-        medical, search = scoped["specialists"]
+        medical, search, *_ = scoped["specialists"]
         assert "postgraduate_admissions_search" in {t["name"] for t in medical["tools"]}
         assert "graduate-admissions" in {s["name"] for s in medical["skills"]}
         assert "seo_page_metadata" in {t["name"] for t in search["tools"]}

@@ -23,11 +23,17 @@ export interface CreateRunResponse {
   events_url: string
   cancel_url: string
   after_sequence?: number
+  followup_key?: string | null
 }
 
-export async function submitAgentInput(runId: string, requestId: string, answer: string, action: 'answer' | 'use_available' = 'answer'): Promise<CreateRunResponse> {
+export async function submitAgentInput(
+  runId: string, requestId: string, answer: string,
+  action: 'answer' | 'use_available' = 'answer', followupKey?: string,
+): Promise<CreateRunResponse> {
+  const headers = new Headers({ 'Content-Type': 'application/json' })
+  if (followupKey) headers.set('X-Followup-Key', followupKey)
   const response = await fetch(agentApiUrl(`${CHAT_RUNS}/${runId}/input`), {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    method: 'POST', headers,
     body: JSON.stringify({ request_id: requestId, answer, action }),
   })
   if (!response.ok) {

@@ -152,17 +152,20 @@ describe('ChatPage SEO Agent integration', () => {
   })
 
   it('keeps the human-input request and its continuation cursor across reloads', async () => {
+    const medical = { agent: 'healthcare', agent_run_id: 'medical' }
+    const seo = { agent: 'seo', agent_run_id: 'page' }
     streamAgentEvents.mockImplementationOnce(async (_url, onEvent: (item: AgentEvent) => void) => {
       onEvent(event(1, 'run.started', {}))
-      onEvent(event(2, 'agent.dispatched', { agent: 'healthcare' }))
+      onEvent(event(2, 'agent.dispatched', medical))
       onEvent(event(3, 'message.completed', { content: '这个页面主要提供什么内容？' }))
-      onEvent(event(4, 'run.waiting_for_input', { request_id: 'input_1', questions: ['这个页面主要提供什么内容？'] }))
+      onEvent(event(4, 'run.waiting_for_input', { ...medical, request_id: 'input_1', questions: ['这个页面主要提供什么内容？'] }))
       return { lastEventId: 3, terminal: true }
     })
     const first = render(<ChatPage />)
     fireEvent.change(screen.getByRole('textbox', { name: '给业务助理发送消息' }), { target: { value: '根据页面给我一份建议' } })
     fireEvent.click(screen.getByRole('button', { name: '发送消息' }))
     expect(await screen.findByText('进度已保存，补充后继续本次分析。')).toBeInTheDocument()
+    expect(screen.getByRole('list', { name: '专员进度' })).toHaveTextContent('医药业务待补充')
     first.unmount()
     submitAgentInput.mockResolvedValue({ run_id: 'run_1', task_id: 'agtask_12345678', thread_id: 'chat_12345678',
       status: 'recovering', events_url: '/api/v1/seo-agent/chat/runs/run_1/events', cancel_url: '/cancel', after_sequence: 4 })
@@ -172,10 +175,13 @@ describe('ChatPage SEO Agent integration', () => {
     })
     streamAgentEvents.mockImplementationOnce(async (_url, onEvent: (item: AgentEvent) => void) => {
       onEvent(event(5, 'run.resumed', {}))
-      onEvent(event(6, 'agent.dispatched', { agent: 'seo' }))
-      onEvent(event(7, 'message.completed', { content: '建议已整理，请人工确认。' }))
-      onEvent(event(8, 'run.completed', {}))
-      return { lastEventId: 8, terminal: true }
+      onEvent(event(6, 'agent.dispatched', medical))
+      onEvent(event(7, 'agent.completed', medical))
+      onEvent(event(8, 'agent.dispatched', seo))
+      onEvent(event(9, 'agent.completed', seo))
+      onEvent(event(10, 'message.completed', { content: '建议已整理，请人工确认。' }))
+      onEvent(event(11, 'run.completed', {}))
+      return { lastEventId: 11, terminal: true }
     })
     const continuation = render(<ChatPage />)
     expect(screen.getByText('进度已保存，补充后继续本次分析。')).toBeInTheDocument()
@@ -186,9 +192,9 @@ describe('ChatPage SEO Agent integration', () => {
 
     const second = render(<ChatPage />)
     const answer = await screen.findByText('建议已整理，请人工确认。')
-    const participants = within(answer.closest('article')!).getByRole('list', { name: '参与专员' })
+    const participants = within(answer.closest('article')!).getByRole('list', { name: '专员进度' })
     expect(within(participants).getAllByRole('listitem').map(item => item.textContent))
-      .toEqual(['医药业务', 'SEO / GEO'])
+      .toEqual(['医药业务已完成', 'SEO / GEO已完成'])
     expect(screen.getByText('这个页面主要提供什么内容？')).toBeInTheDocument()
     expect(submitAgentInput).toHaveBeenCalledWith('run_1', 'input_1', '这里汇总野外观察笔记', 'answer')
     expect(submitAgentInput).toHaveBeenCalledTimes(1)
@@ -197,8 +203,52 @@ describe('ChatPage SEO Agent integration', () => {
     second.unmount()
     render(<ChatPage />)
     const saved = await screen.findByText('建议已整理，请人工确认。')
-    expect(within(saved.closest('article')!).getByRole('list', { name: '参与专员' }))
-      .toHaveTextContent('医药业务SEO / GEO')
+    expect(within(saved.closest('article')!).getByRole('list', { name: '专员进度' }))
+      .toHaveTextContent('医药业务已完成SEO / GEO已完成')
+  })
+
+  it('renders a math exercise and submits the choice to the same run after reload', async () => {
+    const coach = { agent: 'learning', agent_run_id: 'practice' }
+    streamAgentEvents.mockImplementationOnce(async (_url, onEvent: (item: AgentEvent) => void) => {
+      onEvent(event(1, 'run.started', {}))
+      onEvent(event(2, 'agent.dispatched', coach))
+      onEvent(event(3, 'skill.loaded', {
+        ...coach, skill: 'math-practice', label: '一元一次方程练习',
+      }))
+      onEvent(event(4, 'tool.completed', {
+        ...coach, tool_call_id: 'question_1', name: 'tal_math_practice',
+      }))
+      onEvent(event(5, 'message.completed', { content: '### 第 1 / 1 题\n\n设 $\\frac{x}{2}=3$。' }))
+      onEvent(event(6, 'run.waiting_for_input', {
+        ...coach, request_id: 'choice_1', questions: ['回复一个选项字母。'],
+      }))
+      return { lastEventId: 6, terminal: true }
+    })
+    const first = render(<ChatPage />)
+    fireEvent.click(screen.getByRole('button', { name: /数学陪练/ }))
+    fireEvent.click(screen.getByRole('button', { name: '发送消息' }))
+    const heading = await screen.findByRole('heading', { name: '第 1 / 1 题' })
+    expect(heading.closest('.markdown-body')?.querySelector('.katex')).not.toBeNull()
+    expect(screen.getByRole('list', { name: '专员进度' })).toHaveTextContent('学习陪练待补充')
+    first.unmount()
+
+    submitAgentInput.mockResolvedValue({
+      run_id: 'run_1', status: 'recovering', events_url: '/events', cancel_url: '/cancel', after_sequence: 7,
+    })
+    streamAgentEvents.mockImplementationOnce(async (_url, onEvent: (item: AgentEvent) => void) => {
+      onEvent(event(8, 'run.resumed', {}))
+      onEvent(event(9, 'agent.completed', coach))
+      onEvent(event(10, 'message.completed', { content: '答对了。本组共答对 1 道。' }))
+      onEvent(event(11, 'run.completed', {}))
+      return { lastEventId: 11, terminal: true }
+    })
+    render(<ChatPage />)
+    const composer = screen.getByPlaceholderText('输入选项字母、跳过或结束练习')
+    fireEvent.change(composer, { target: { value: 'B' } })
+    fireEvent.click(screen.getByRole('button', { name: '发送消息' }))
+    expect(await screen.findByText('答对了。本组共答对 1 道。')).toBeInTheDocument()
+    expect(createAgentRun).toHaveBeenCalledTimes(1)
+    expect(submitAgentInput).toHaveBeenCalledWith('run_1', 'choice_1', 'B', 'answer')
   })
 
   it('lets the user explicitly finish with available facts', async () => {
@@ -242,31 +292,37 @@ describe('ChatPage SEO Agent integration', () => {
 
   it('shows which specialist ran even when its first operation fails', async () => {
     streamAgentEvents.mockImplementationOnce(async (_url, onEvent: (item: AgentEvent) => void) => {
+      const specialist = { agent: 'healthcare', agent_run_id: 'medical' }
       onEvent(event(1, 'run.started', {}))
-      onEvent(event(2, 'agent.dispatched', { agent: 'healthcare' }))
-      onEvent(event(3, 'run.failed', { message: '资料暂时不可用' }))
-      return { lastEventId: 3, terminal: true }
+      onEvent(event(2, 'agent.dispatched', specialist))
+      onEvent(event(3, 'agent.failed', specialist))
+      onEvent(event(4, 'run.failed', { message: '资料暂时不可用' }))
+      return { lastEventId: 4, terminal: true }
     })
     render(<ChatPage />)
     fireEvent.change(screen.getByRole('textbox', { name: '给业务助理发送消息' }), { target: { value: '帮我查考试大纲' } })
     fireEvent.click(screen.getByRole('button', { name: '发送消息' }))
-    const participants = await screen.findByRole('list', { name: '参与专员' })
-    expect(participants).toHaveTextContent('医药业务')
+    const participants = await screen.findByRole('list', { name: '专员进度' })
+    expect(participants).toHaveTextContent('医药业务失败')
     expect(within(participants.closest('article')!).getByText('本轮执行中断。')).toBeInTheDocument()
   })
 
   it('keeps the actual tool with the specialist who used it when the conversation is reopened', async () => {
     streamAgentEvents.mockImplementationOnce(async (_url, onEvent: (item: AgentEvent) => void) => {
-      onEvent(event(1, 'agent.dispatched', { agent: 'healthcare' }))
+      const medical = { agent: 'healthcare', agent_run_id: 'medical' }
+      const seo = { agent: 'seo', agent_run_id: 'page' }
+      onEvent(event(1, 'agent.dispatched', medical))
       onEvent(event(2, 'skill.loaded', {
-        agent: 'healthcare', skill: 'medical-exam-syllabus', label: '医考考纲核对',
+        ...medical, skill: 'medical-exam-syllabus', label: '医考考纲核对',
       }))
-      onEvent(event(3, 'tool.completed', { tool_call_id: 'rule', name: 'medical_exam_syllabus' }))
-      onEvent(event(4, 'agent.dispatched', { agent: 'seo' }))
-      onEvent(event(5, 'tool.completed', { tool_call_id: 'page', name: 'seo_page_metadata' }))
-      onEvent(event(6, 'message.completed', { content: '两位专员核对完成。' }))
-      onEvent(event(7, 'run.completed', {}))
-      return { lastEventId: 7, terminal: true }
+      onEvent(event(3, 'agent.dispatched', seo))
+      onEvent(event(4, 'tool.completed', { ...medical, tool_call_id: 'rule', name: 'medical_exam_syllabus' }))
+      onEvent(event(5, 'tool.completed', { ...seo, tool_call_id: 'page', name: 'seo_page_metadata' }))
+      onEvent(event(6, 'agent.completed', medical))
+      onEvent(event(7, 'agent.completed', seo))
+      onEvent(event(8, 'message.completed', { content: '两位专员核对完成。' }))
+      onEvent(event(9, 'run.completed', {}))
+      return { lastEventId: 9, terminal: true }
     })
     const first = render(<ChatPage />)
     fireEvent.change(screen.getByLabelText('给业务助理发送消息'), { target: { value: '检查课程页的说法' } })
@@ -274,10 +330,15 @@ describe('ChatPage SEO Agent integration', () => {
     await screen.findByText('两位专员核对完成。')
     first.unmount()
     render(<ChatPage />)
-    const list = within(screen.getByRole('list', { name: '参与专员' })).getAllByRole('listitem')
+    const list = within(screen.getByRole('list', { name: '专员进度' })).getAllByRole('listitem')
     expect(list).toHaveLength(2)
-    expect(list[0]).toHaveTextContent('医药业务Skill · 医考考纲核对查证考纲条款')
-    expect(list[1]).toHaveTextContent('SEO / GEO读取网页内容')
+    expect(list[0]).toHaveTextContent('医药业务已完成Skill · 医考考纲核对查证考纲条款')
+    expect(list[1]).toHaveTextContent('SEO / GEO已完成读取网页内容')
+    fireEvent.click(screen.getByText('执行详情'))
+    const medicalDetails = await screen.findByRole('region', { name: '医药业务' })
+    const seoDetails = screen.getByRole('region', { name: 'SEO / GEO' })
+    expect(within(medicalDetails).getByText('查证考纲条款')).toBeInTheDocument()
+    expect(within(seoDetails).getByText('读取网页内容')).toBeInTheDocument()
   })
 
   it('fills a relevant starter without running a query until the user sends it', () => {
@@ -297,7 +358,7 @@ describe('ChatPage SEO Agent integration', () => {
       target: { value: '检查本站首页' },
     })
     fireEvent.click(screen.getByLabelText('发送消息'))
-    expect(await screen.findByRole('status', { name: '分析进度' })).toHaveTextContent('正在理解你的问题')
+    expect(await screen.findByRole('status', { name: '分析进度' })).toHaveTextContent('正在准备任务')
     expect(screen.getByLabelText('停止生成')).toBeEnabled()
     expect(screen.queryByRole('region', { name: '本次结果' })).not.toBeInTheDocument()
   })

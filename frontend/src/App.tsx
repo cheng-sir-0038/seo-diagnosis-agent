@@ -4,7 +4,24 @@ import zhCN from 'antd/locale/zh_CN'
 import { ProductShell } from './components/ProductShell'
 import './styles.css'
 
+const themeVariables = {
+  colorPrimary: '--color-primary',
+  colorInfo: '--color-primary',
+  colorSuccess: '--color-success',
+  colorText: '--color-text',
+  colorTextSecondary: '--color-text-muted',
+  colorBgLayout: '--color-bg',
+  colorBorder: '--color-border',
+  fontFamily: '--font-ui',
+}
+
 export default function App() {
+  const rootStyle = getComputedStyle(document.documentElement)
+  const tokens = Object.fromEntries(
+    Object.entries(themeVariables)
+      .map(([key, variable]) => [key, rootStyle.getPropertyValue(variable).trim()])
+      .filter(([, value]) => value),
+  )
   return (
     <ConfigProvider
       locale={zhCN}
@@ -13,16 +30,9 @@ export default function App() {
           Tabs: { horizontalItemMargin: '0 0 0 32px', horizontalItemMarginRTL: '0 32px 0 0' },
         },
         token: {
-          colorPrimary: '#6948e9',
-          colorInfo: '#6948e9',
-          colorSuccess: '#11754d',
-          colorText: '#221a38',
-          colorTextSecondary: '#5d5572',
-          colorBgLayout: '#f7f5ff',
-          colorBorder: '#e4def6',
+          ...tokens,
           borderRadius: 10,
           controlHeight: 38,
-          fontFamily: 'system-ui, "PingFang SC", "Microsoft YaHei", sans-serif',
         },
       }}
     >

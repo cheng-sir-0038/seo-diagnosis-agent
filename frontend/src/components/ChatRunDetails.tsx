@@ -1,11 +1,12 @@
 import { RightOutlined } from '@ant-design/icons'
 import { useState } from 'react'
 
-import { specialistNames, type ToolRun } from '../types/agent'
+import { specialists } from '../specialists'
+import type { SpecialistRun, ToolRun } from '../types/agent'
 import { toolResultLabel } from './toolLabels'
 import { RawJsonResult } from './renderers/RawJsonResult'
 
-const toolStatus = { completed: '已完成', failed: '失败', running: '执行中' }
+const toolStatus = { completed: '已完成', failed: '失败', running: '执行中', cancelled: '已停止' }
 
 function ToolRunDetails({ tool }: { tool: ToolRun }) {
   const [open, setOpen] = useState(false)
@@ -21,7 +22,6 @@ function ToolRunDetails({ tool }: { tool: ToolRun }) {
       <div className="chat-run-tool-heading">
         <strong>{toolResultLabel(tool)}</strong>
         <div className="chat-run-tool-meta">
-          {tool.agent ? <span>{specialistNames[tool.agent]}</span> : null}
           <span className={`chat-run-tool-status ${tool.status}`}>{toolStatus[tool.status]}</span>
           {duration ? <span>{duration}</span> : null}
         </div>
@@ -47,9 +47,15 @@ function ToolRunDetails({ tool }: { tool: ToolRun }) {
   )
 }
 
-export function ChatRunDetails({ tools }: { tools?: ToolRun[] }) {
+export function ChatRunDetails({ tools, agentRuns = [] }: { tools?: ToolRun[], agentRuns?: SpecialistRun[] }) {
   const [open, setOpen] = useState(false)
   if (!tools?.length) return null
+  const groups = agentRuns.map(run => ({
+    id: run.id,
+    name: specialists[run.agent].name,
+    tools: tools.filter(tool => tool.agentRunId === run.id),
+  })).filter(group => group.tools.length)
+  const unassigned = tools.filter(tool => !groups.some(group => group.id === tool.agentRunId))
 
   return (
     <details className="chat-run-details" onToggle={(event) => setOpen(event.currentTarget.open)}>
@@ -60,7 +66,18 @@ export function ChatRunDetails({ tools }: { tools?: ToolRun[] }) {
       </summary>
       {open ? (
         <div className="chat-run-calls">
-          {tools.map((tool) => <ToolRunDetails key={tool.id} tool={tool} />)}
+          {groups.map(group => (
+            <section className="chat-run-group" key={group.id} aria-label={group.name}>
+              <h3>{group.name}</h3>
+              {group.tools.map(tool => <ToolRunDetails key={tool.id} tool={tool} />)}
+            </section>
+          ))}
+          {unassigned.length > 0 && (
+            <div className="chat-run-group">
+              {groups.length > 0 && <h3>其他工具</h3>}
+              {unassigned.map(tool => <ToolRunDetails key={tool.id} tool={tool} />)}
+            </div>
+          )}
         </div>
       ) : null}
     </details>

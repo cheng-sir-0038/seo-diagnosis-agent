@@ -1,5 +1,5 @@
 import type { Root } from 'hast'
-import type { ReactNode } from 'react'
+import type { ComponentProps, ReactNode } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 
@@ -18,7 +18,16 @@ function insertResultSlot() {
   }
 }
 
-export function MarkdownMessage({ content, results }: { content: string; results?: ReactNode }) {
+export interface MarkdownMessageProps {
+  content: string
+  results?: ReactNode
+  remarkPlugins?: NonNullable<ComponentProps<typeof ReactMarkdown>['remarkPlugins']>
+  rehypePlugins?: NonNullable<ComponentProps<typeof ReactMarkdown>['rehypePlugins']>
+}
+
+export function MarkdownMessage({
+  content, results, remarkPlugins = [], rehypePlugins = [],
+}: MarkdownMessageProps) {
   const sanitized = sanitizeAssistantContent(content)
   const segments = splitMarkdownContent(sanitized.content)
   const lead = results ? segments.findIndex((segment) => segment.type === 'markdown') : -1
@@ -29,8 +38,8 @@ export function MarkdownMessage({ content, results }: { content: string; results
           ? <MarkdownDataSummary data={segment.data} key={`summary-${index}`} />
           : (
               <ReactMarkdown
-                remarkPlugins={[remarkGfm]}
-                rehypePlugins={index === lead ? [insertResultSlot] : undefined}
+                remarkPlugins={[remarkGfm, ...remarkPlugins]}
+                rehypePlugins={index === lead ? [...rehypePlugins, insertResultSlot] : rehypePlugins}
                 components={{
                   a: ({ node, href, children, ...props }) => {
                     const start = node?.position?.start.offset

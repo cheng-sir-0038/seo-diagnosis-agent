@@ -6,8 +6,8 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import func, select, update
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import cast, func, select, update
+from sqlalchemy.dialects.postgresql import JSONB, insert
 from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -398,6 +398,29 @@ class AgentChatHarnessStore:
             if _json(dispatch_state_json, {}).get("active_agent") != agent:
                 return []
             return await _checkpoint_dialog(session, checkpoint_id)
+
+    async def completed_tool_data(
+        self, conversation_id: str, names: tuple[str, ...],
+    ) -> list[dict[str, Any]]:
+        payload = cast(AgentRunEventRow.payload_json, JSONB)
+        query = (
+            select(payload["result"]["data"])
+            .select_from(AgentRunEventRow)
+            .join(AgentRunRow, AgentRunEventRow.agent_run_id == AgentRunRow.id)
+            .join(WorkflowThreadRow, AgentRunRow.workflow_thread_id == WorkflowThreadRow.id)
+            .where(
+                WorkflowThreadRow.thread_id == f"conversation:{conversation_id}",
+                WorkflowThreadRow.site_id.is_(None),
+                WorkflowThreadRow.workflow_type == "AGENT_CHAT",
+                AgentRunRow.trigger_type == "CHAT",
+                AgentRunRow.status == "COMPLETED",
+                AgentRunEventRow.event_type == "tool.completed",
+                payload["name"].astext.in_(names),
+            )
+            .order_by(AgentRunRow.completed_at, AgentRunEventRow.created_at, AgentRunEventRow.id)
+        )
+        async with self.database.orm_session() as session:
+            return list(await session.scalars(query))
 
     async def get_run(self, run_id: str) -> dict[str, Any]:
         async with self.database.orm_session() as session:

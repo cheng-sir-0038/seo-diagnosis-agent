@@ -57,23 +57,55 @@ describe('reduceAgentEvent', () => {
   })
 
   it('tracks actual dispatches in order and ignores replayed events and unknown agents', () => {
-    const first = event(1, 'agent.dispatched', { agent: 'healthcare' })
-    const second = event(2, 'agent.dispatched', { agent: 'seo' })
-    const state = [first, second, second, event(3, 'agent.dispatched', { agent: 'unknown' })]
+    const first = event(1, 'agent.dispatched', { agent: 'healthcare', agent_run_id: 'medical' })
+    const second = event(2, 'agent.dispatched', { agent: 'seo', agent_run_id: 'page' })
+    const state = [first, second, second, event(3, 'agent.dispatched', { agent: 'unknown', agent_run_id: 'unknown' })]
       .reduce(reduceAgentEvent, initialRunState)
-    expect(state.agents).toEqual(['healthcare', 'seo'])
-    expect(reduceAgentEvent(state, event(0, 'run.reset', { status: 'pending' })).agents).toEqual([])
+    expect(state.agentRuns.map(run => run.agent)).toEqual(['healthcare', 'seo'])
+    expect(reduceAgentEvent(state, event(0, 'run.reset', { status: 'pending' })).agentRuns).toEqual([])
   })
 
-  it('attributes each call to the specialist that started it, including late completions', () => {
+  it('attributes interleaved calls by dispatch ID, including identical tool call IDs', () => {
+    const medical = { agent: 'healthcare', agent_run_id: 'medical' }
+    const seo = { agent: 'seo', agent_run_id: 'page' }
     const state = [
-      event(1, 'agent.dispatched', { agent: 'healthcare' }),
-      event(2, 'tool.started', { tool_call_id: 'rule', name: 'medical_exam_syllabus' }),
-      event(3, 'agent.dispatched', { agent: 'seo' }),
-      event(4, 'tool.completed', { tool_call_id: 'rule', name: 'medical_exam_syllabus' }),
-      event(5, 'tool.completed', { tool_call_id: 'page', name: 'seo_page_metadata' }),
+      event(1, 'agent.dispatched', medical),
+      event(2, 'agent.dispatched', seo),
+      event(3, 'tool.started', { ...medical, tool_call_id: 'call', name: 'medical_exam_syllabus' }),
+      event(4, 'tool.completed', { ...seo, tool_call_id: 'call', name: 'seo_page_metadata' }),
+      event(5, 'tool.failed', {
+        ...medical, tool_call_id: 'call', name: 'medical_exam_syllabus',
+        result: { success: false, error: '资料暂时无法读取' },
+      }),
+      event(6, 'tool.completed', { tool_call_id: 'unassigned', name: 'other_tool' }),
     ].reduce(reduceAgentEvent, initialRunState)
-    expect(state.tools.map(tool => tool.agent)).toEqual(['healthcare', 'seo'])
+    expect(state.tools.map(tool => [tool.agent, tool.agentRunId, tool.status])).toEqual([
+      ['healthcare', 'medical', 'failed'], ['seo', 'page', 'completed'], [undefined, undefined, 'completed'],
+    ])
+    expect(state.tools[0].error).toBe('资料暂时无法读取')
+  })
+
+  it('tracks waiting, reopening and failure independently for dispatches of the same specialist', () => {
+    const first = { agent: 'seo', agent_run_id: 'page' }
+    const second = { agent: 'seo', agent_run_id: 'another-page' }
+    const waiting = [
+      event(1, 'agent.dispatched', first),
+      event(2, 'agent.dispatched', second),
+      event(3, 'agent.completed', second),
+      event(4, 'run.waiting_for_input', { ...first, request_id: 'request', questions: ['是哪一页？'] }),
+    ].reduce(reduceAgentEvent, initialRunState)
+    expect(waiting.agentRuns.map(run => run.status)).toEqual(['waiting_for_input', 'completed'])
+    const failed = [
+      event(5, 'run.resumed', {}),
+      event(6, 'agent.dispatched', first),
+      event(7, 'agent.failed', first),
+      event(6, 'agent.dispatched', first),
+      event(8, 'run.failed', { message: '暂时无法读取网页' }),
+    ].reduce(reduceAgentEvent, waiting)
+    expect(failed.agentRuns.map(run => [run.id, run.status])).toEqual([
+      ['page', 'failed'], ['another-page', 'completed'],
+    ])
+    expect(failed.agentRuns[0].startedAt).toBe(waiting.agentRuns[0].startedAt)
   })
 
   it('marks budget completion as a partial successful result', () => {
@@ -88,6 +120,17 @@ describe('reduceAgentEvent', () => {
     expect(done.partial).toBe(true)
     expect(done.completionMode).toBe('budget_limit')
     expect(done.error).toBeUndefined()
+  })
+
+  it('stops open specialist and tool rows when the run is cancelled', () => {
+    const seo = { agent: 'seo', agent_run_id: 'page' }
+    const stopped = [
+      event(1, 'agent.dispatched', seo),
+      event(2, 'tool.started', { ...seo, tool_call_id: 'read', name: 'seo_page_metadata' }),
+      event(3, 'run.cancelled', {}),
+    ].reduce(reduceAgentEvent, initialRunState)
+    expect(stopped.agentRuns[0].status).toBe('cancelled')
+    expect(stopped.tools[0].status).toBe('cancelled')
   })
 
 })

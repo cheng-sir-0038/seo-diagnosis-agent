@@ -3,10 +3,13 @@ import {
   BookOutlined,
   BranchesOutlined,
   BulbOutlined,
+  CalculatorOutlined,
   ExperimentOutlined,
+  FormOutlined,
   MedicineBoxOutlined,
   MenuOutlined,
   PlusOutlined,
+  ProfileOutlined,
   ReadOutlined,
   RightOutlined,
   SearchOutlined,
@@ -16,9 +19,9 @@ import {
 import { Alert, Button, Input, Tag, Tooltip } from 'antd'
 import { type ComponentRef, lazy, Suspense, useEffect, useEffectEvent, useMemo, useReducer, useRef, useState } from 'react'
 
+import { AssistantRunStatus } from '../components/AssistantRunStatus'
 import { ChatRunDetails } from '../components/ChatRunDetails'
 import { InlineToolResults } from '../components/InlineToolResults'
-import { toolLabel } from '../components/toolLabels'
 import {
   cancelAgentRun,
   createAgentRun,
@@ -27,6 +30,7 @@ import {
   submitAgentInput,
   streamAgentEvents,
 } from '../services/agentApi'
+import type { FollowupAction } from '../services/followupApi'
 import { initialRunState, reduceAgentEvent } from '../state/agentState'
 import {
   createConversation,
@@ -37,22 +41,22 @@ import {
 } from '../state/conversations'
 import type {
   AgentEvent,
-  AppliedSkill,
   ChatMessage,
   Conversation,
   SavedAgentRun,
-  Specialist,
   ToolRun,
 } from '../types/agent'
-import { specialistNames } from '../types/agent'
 
 const { TextArea } = Input
 const SpecialistDirectory = lazy(() => import('../components/SpecialistDirectory'))
+const FollowupPanel = lazy(() => import('../components/FollowupPanel'))
+const MathPracticeMessage = lazy(() => import('../components/MathPracticeMessage'))
 const MarkdownMessage = lazy(async () => {
   const module = await import('../components/MarkdownMessage')
   return { default: module.MarkdownMessage }
 })
 const replyLoading = <div className="agent-activity" role="status">正在加载回复…</div>
+const mathPracticeToolName = 'tal_math_practice'
 
 const starterGroups = [
   {
@@ -77,6 +81,12 @@ const starterGroups = [
     title: '医药资料',
     tone: 'medicine',
     examples: [
+      {
+        title: '随访与复诊准备',
+        detail: '补齐资料，核对并保存待办',
+        icon: ProfileOutlined,
+        prompt: '用合成资料演示一次复诊准备。帮我核对两次报告，整理下次要带的资料和已有安排。',
+      },
       {
         title: '医保药品目录',
         detail: '核查通用名、剂型和分类',
@@ -106,6 +116,24 @@ const starterGroups = [
         detail: '由两位专员比对公告与页面',
         icon: BranchesOutlined,
         prompt: '请按医学人文修订通知核对 https://www.hbwsrc.cn/news/show-1830.html 中的适用考试类别。',
+      },
+    ],
+  },
+  {
+    title: '学习与备考',
+    tone: 'learning',
+    examples: [
+      {
+        title: '数学陪练',
+        detail: '解方程，逐题看解析',
+        icon: CalculatorOutlined,
+        prompt: '我想练 3 道一元一次方程题，请一次出一道，做完给我看解析。',
+      },
+      {
+        title: '教资笔试',
+        detail: '查报名时间和备考大纲',
+        icon: FormOutlined,
+        prompt: '查一下 2026 年下半年湖北初中数学教资笔试的报名时间、考试科目和官方备考大纲。',
       },
     ],
   },
@@ -145,6 +173,7 @@ const persistableToolResults = (tools: ToolRun[]): ToolRun[] => tools.map((tool)
   id: tool.id,
   name: tool.name,
   agent: tool.agent,
+  agentRunId: tool.agentRunId,
   status: tool.status,
   render_hint: tool.render_hint,
   error: tool.error,
@@ -175,9 +204,10 @@ function ReplyContent({ content, tools }: { content: string, tools?: ToolRun[] }
     && isRecord(tool.result.data) && tool.result.data.answer === content
   ))
   if (admissionsReceipt || !content) return results
+  const Message = tools?.some(tool => tool.name === mathPracticeToolName) ? MathPracticeMessage : MarkdownMessage
   return (
     <Suspense fallback={replyLoading}>
-      <MarkdownMessage content={content} results={results} />
+      <Message content={content} results={results} />
     </Suspense>
   )
 }
@@ -190,31 +220,6 @@ interface ActiveRunConnection extends SavedAgentRun {
 interface ConnectionIssue {
   message: string
   canResume: boolean
-}
-
-function ReplyAuthor({ agents, tools, skills }: { agents?: Specialist[], tools?: ToolRun[], skills?: AppliedSkill[] }) {
-  return (
-    <>
-      <div className="assistant-name">业务助理</div>
-      {agents && agents.length > 0 ? (
-        <ol className="assistant-agents" aria-label="参与专员">
-          {agents.map((agent, index) => {
-            const calls = tools?.filter(tool => tool.agent === agent || (!tool.agent && agents.length === 1)) ?? []
-            const actions = [...new Set(calls.map(tool => toolLabel(tool.name)))]
-            const skill = skills?.find(item => item.agent === agent)
-            const Icon = agent === 'healthcare' ? BookOutlined : SearchOutlined
-            return (
-              <li key={`${agent}-${index}`} className={`specialist-${agent}`}>
-                <span className="participant-label"><Icon aria-hidden="true" />{specialistNames[agent]}</span>
-                {skill && <span className="participant-skill">Skill · {skill.label}</span>}
-                {actions.length > 0 && <small>{actions.slice(0, 2).join(' · ')}{actions.length > 2 ? ` 等 ${actions.length} 项` : ''}</small>}
-              </li>
-            )
-          })}
-        </ol>
-      ) : null}
-    </>
-  )
 }
 
 export function ChatPage() {
@@ -235,17 +240,19 @@ export function ChatPage() {
   const activeConnectionRef = useRef<ActiveRunConnection | undefined>(undefined)
   const active = conversations.find((item) => item.id === activeId) ?? conversations[0]
   const latestAssistant = [...active.messages].reverse().find((message) => message.role === 'assistant')
+  const awaitingFollowup = !!latestAssistant?.inputRequest && !!latestAssistant.followupKey
+  const followupPanels = new Map<string, string>()
+  for (const message of active.messages) {
+    if (message.runId && message.followupKey) followupPanels.set(message.runId, message.id)
+  }
+  const awaitingPractice = !!latestAssistant?.inputRequest
+    && latestAssistant.toolResults?.some(tool => tool.name === mathPracticeToolName)
   const running = run.status === 'running' || run.status === 'pending' || run.status === 'recovering'
   const currentReplyId = !running && run.runId && latestAssistant?.runId === run.runId
     ? latestAssistant.id
     : undefined
   const emptyConversation = active.messages.length === 0 && !run.assistantText && run.tools.length === 0
   const querying = run.tools.some((tool) => tool.status === 'running')
-  const activity = querying
-    ? { title: '正在读取实际数据', detail: '先核对来源，再给你判断。' }
-    : run.tools.length > 0
-      ? { title: '正在整理这次调查', detail: '把能确认的事实和暂时缺少的证据分开说明。' }
-      : { title: '正在理解你的问题', detail: '先看清目标，再找需要的证据。' }
 
   useEffect(() => {
     saveConversations(conversations)
@@ -268,7 +275,7 @@ export function ChatPage() {
     dispatch(event)
   }
 
-  const resetRun = (status: 'idle' | 'pending', prior?: Pick<SavedAgentRun, 'priorAgents' | 'priorSkills'>) => {
+  const resetRun = (status: 'idle' | 'pending', prior?: Pick<SavedAgentRun, 'priorAgentRuns' | 'priorSkills'>) => {
     const event: AgentEvent = {
       event_id: crypto.randomUUID(),
       run_id: '',
@@ -289,7 +296,7 @@ export function ChatPage() {
         || conversation.activeRun.afterSequence !== connection.afterSequence) return conversation
       const settled = ['completed', 'cancelled', 'waiting_for_input'].includes(state.status)
       const activeRun = settled ? undefined : conversation.activeRun
-      if (!state.assistantText && state.tools.length === 0 && state.agents.length === 0) {
+      if (!state.assistantText && state.tools.length === 0 && state.agentRuns.length === 0) {
         return { ...conversation, activeRun }
       }
       const fallback = state.tools.some(tool => tool.status === 'completed')
@@ -303,10 +310,12 @@ export function ChatPage() {
         content: state.assistantText || fallback,
         createdAt: new Date().toISOString(),
         toolResults: persistableToolResults(state.tools),
-        agents: state.agents,
+        agentRuns: state.agentRuns,
         skills: state.skills,
         runId: connection.runId,
         inputRequest: state.humanInput,
+        followupKey: state.agentRuns.some(item => item.agent === 'followup')
+          ? connection.followupKey : undefined,
       }
       return {
         ...conversation,
@@ -463,10 +472,11 @@ export function ChatPage() {
     selectConversation(conversation.id)
   }
 
-  const send = async (action: 'answer' | 'use_available' = 'answer') => {
-    const content = action === 'use_available'
+  const send = async (action: 'answer' | 'use_available' = 'answer', followupAction?: FollowupAction) => {
+    if (awaitingFollowup && !followupAction) return
+    const content = followupAction ?? (action === 'use_available'
       ? '请先用现有事实生成草稿，未确认的内容保留待补充，结束本轮追问。'
-      : input.trim()
+      : input.trim())
     if (!content || running) return
 
     setInput('')
@@ -487,13 +497,15 @@ export function ChatPage() {
     const pendingInput = latestAssistant?.inputRequest
     const previousRunId = latestAssistant?.runId
     const prior = pendingInput && previousRunId
-      ? { priorAgents: latestAssistant.agents, priorSkills: latestAssistant.skills }
+      ? { priorAgentRuns: latestAssistant.agentRuns, priorSkills: latestAssistant.skills }
       : undefined
     resetRun('pending', prior)
 
     try {
+      const followupKey = pendingInput ? latestAssistant?.followupKey : undefined
+      const access: [string?] = followupKey ? [followupKey] : []
       const created = pendingInput && previousRunId
-        ? await submitAgentInput(previousRunId, pendingInput.requestId, content, action)
+        ? await submitAgentInput(previousRunId, pendingInput.requestId, content, action, ...access)
         : await createAgentRun(history, active.id)
       const saved: SavedAgentRun = {
         ...prior,
@@ -501,6 +513,7 @@ export function ChatPage() {
         eventsUrl: created.events_url,
         cancelUrl: created.cancel_url,
         afterSequence: created.after_sequence ?? 0,
+        followupKey: followupKey ?? created.followup_key ?? undefined,
       }
       setActiveConversation((conversation) => ({ ...conversation, activeRun: saved }))
       if (activeIdRef.current === active.id) await attachRun(saved, active.id)
@@ -571,7 +584,9 @@ export function ChatPage() {
     resetRun('idle')
   }
 
-  const composer = (
+  const composer = awaitingFollowup && !running && !connectionIssue && run.status !== 'failed' ? (
+    <div className="chat-composer-wrap"><small>通过上方的复诊资料区继续本次整理。</small></div>
+  ) : (
     <div className="chat-composer-wrap">
       {connectionIssue ? (
         <Alert
@@ -600,16 +615,16 @@ export function ChatPage() {
         />
       ) : null}
       {run.status === 'failed' && !currentReplyId ? (
-        <ChatRunDetails tools={run.tools} />
+        <ChatRunDetails tools={run.tools} agentRuns={run.agentRuns} />
       ) : null}
       <div className="chat-composer">
         <TextArea
-            ref={composerRef}
+          ref={composerRef}
           aria-label="给业务助理发送消息"
           value={input}
-          disabled={running}
-          placeholder="输入业务问题，或粘贴要检查的网址…"
-          autoSize={{ minRows: emptyConversation ? 2 : 1, maxRows: 6 }}
+          disabled={running || awaitingFollowup}
+          placeholder={awaitingPractice ? '输入选项字母、跳过或结束练习' : '输入业务问题或粘贴网址'}
+          autoSize={{ minRows: 1, maxRows: 6 }}
           onChange={(event) => setInput(event.target.value)}
           onPressEnter={(event) => {
             if (!event.shiftKey) {
@@ -620,23 +635,22 @@ export function ChatPage() {
         />
         {running ? (
           <Tooltip title="停止生成">
-            <Button aria-label="停止生成" danger shape="circle" icon={<StopOutlined />} onClick={() => void stop()} />
+            <Button aria-label="停止生成" danger icon={<StopOutlined />} onClick={() => void stop()} />
           </Tooltip>
         ) : (
           <Tooltip title="发送消息">
             <Button
               aria-label="发送消息"
               type="primary"
-              shape="circle"
               icon={<SendOutlined />}
-              disabled={!input.trim()}
+              disabled={!input.trim() || awaitingFollowup}
               onClick={() => void send()}
             />
           </Tooltip>
         )}
       </div>
-      <small>{latestAssistant?.inputRequest && !running
-        ? '进度已保存，补充后继续本次分析。'
+      <small>{!running && latestAssistant?.inputRequest
+        ? (awaitingPractice ? '练习进度已保存，回来可以接着答。' : '进度已保存，补充后继续本次分析。')
         : 'Enter 发送，Shift + Enter 换行'}
         {latestAssistant?.inputRequest?.allowUseAvailable && !running ? (
           <Button className="human-input-continue" type="link" size="small" onClick={() => void send('use_available')}>
@@ -700,7 +714,7 @@ export function ChatPage() {
               <div className="welcome-hero">
                 <div className="welcome-intro">
                   <h1>今天想查什么？</h1>
-                  <p>两位专员帮你查考试、医药资料和网页。</p>
+                  <p>检查网页、查公开资料、练数学，或整理复诊记录。</p>
                 </div>
                 <img
                   className="welcome-illustration"
@@ -731,9 +745,25 @@ export function ChatPage() {
               <div className="chat-message-content">
                 {item.role === 'assistant' ? (
                   <>
-                    <ReplyAuthor agents={item.agents} skills={item.skills} tools={item.id === currentReplyId ? run.tools : item.toolResults} />
-                    <ChatRunDetails tools={item.id === currentReplyId ? run.tools : item.toolResults} />
+                    <AssistantRunStatus
+                      agentRuns={item.agentRuns}
+                      skills={item.skills}
+                      tools={item.id === currentReplyId ? run.tools : item.toolResults}
+                    />
+                    <ChatRunDetails
+                      tools={item.id === currentReplyId ? run.tools : item.toolResults}
+                      agentRuns={item.agentRuns}
+                    />
                     <ReplyContent content={item.content} tools={item.toolResults} />
+                    {item.runId && item.followupKey && followupPanels.get(item.runId) === item.id && (
+                      <Suspense fallback={replyLoading}>
+                        <FollowupPanel
+                          runId={item.runId} access={item.followupKey}
+                          canContinue={item.id === latestAssistant?.id && !!item.inputRequest && !running}
+                          onContinue={choice => void send('answer', choice)}
+                        />
+                      </Suspense>
+                    )}
                   </>
                 ) : item.content}
               </div>
@@ -744,17 +774,16 @@ export function ChatPage() {
             <article className="chat-message assistant streaming">
               <div className="avatar agent-avatar" aria-hidden="true"><BulbOutlined /></div>
               <div className="chat-message-content">
-                <ReplyAuthor agents={run.agents} skills={run.skills} tools={run.tools} />
+                <AssistantRunStatus agentRuns={run.agentRuns} skills={run.skills} tools={run.tools} />
                 {!run.assistantText || querying ? (
                   <div className="agent-activity" role="status" aria-label="分析进度" aria-live="polite">
                     <div className="agent-activity-title">
-                      <strong>{activity.title}</strong>
+                      <strong>{run.stage}</strong>
                       <span className="activity-dots" aria-hidden="true"><i /><i /><i /></span>
                     </div>
-                    <span>{activity.detail}</span>
                   </div>
                 ) : null}
-                <ChatRunDetails tools={run.tools} />
+                <ChatRunDetails tools={run.tools} agentRuns={run.agentRuns} />
                 <ReplyContent content={run.assistantText} tools={run.tools} />
                 {run.assistantText ? <span className="cursor" /> : null}
               </div>

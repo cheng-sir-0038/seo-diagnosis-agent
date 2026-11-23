@@ -17,6 +17,7 @@ from sqlalchemy import (
     event,
     or_,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Connection
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -246,6 +247,14 @@ class AgentRuntimeTaskRow(Base):
     created_at: Mapped[str]
     updated_at: Mapped[str]
     completed_at: Mapped[str | None]
+
+
+class FollowupCaseRow(Base):
+    __tablename__ = "followup_cases"
+
+    run_id: Mapped[TextId] = mapped_column(ForeignKey("agent_runs.id", ondelete="CASCADE"))
+    access_hash: Mapped[str]
+    state: Mapped[dict[str, Any]] = mapped_column(JSONB)
 
 
 class AgentRunEventRow(Base):

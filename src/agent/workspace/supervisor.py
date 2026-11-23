@@ -1,17 +1,18 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Awaitable, Callable
 from typing import Any, TypedDict
 from uuid import uuid4
 
 from langgraph.graph import END, START, StateGraph
 
+from src.agent.config import Skill
 from src.agent.models import AgentRun, HumanInputState
 from src.agent.providers.base import ToolCall
 from src.agent.runtime.executor import AgentExecutor
 from src.agent.tools.registry import ToolRegistry
 from src.agent.workspace.routing import (
-    DISPATCHED_EVENT,
     ROUTE_PROMPT_KEY,
     SKILL_LOADED_EVENT,
     SUPERVISOR_NODE,
@@ -22,6 +23,17 @@ from src.agent.workspace.routing import (
     page_candidates,
     select_page,
 )
+from src.education_agent.practice import MAX_QUESTIONS, MathPractice
+from src.education_agent.resources import LearningResources
+from src.education_agent.skills import (
+    EDUCATION_SKILLS,
+    EducationSkill,
+    education_tools,
+    learning_history,
+)
+from src.education_agent.teacher_exam import TeacherExamQuery
+from src.followup_agent.store import FollowupCaseStore
+from src.followup_agent.workflow import FOLLOWUP_SKILL, followup_tools, run_followup
 from src.healthcare_agent import public_rule_evidence
 from src.healthcare_agent.exams import MedicalExamSyllabus
 from src.healthcare_agent.skills import (
@@ -52,6 +64,7 @@ def conversation_context(previous: dict[str, Any]) -> dict[str, Any]:
         "previous_run_id": previous.get("source_run_id"),
         "previous_agent": previous.get("active_agent"),
         "previous_healthcare_skill": previous.get("healthcare_skill"),
+        "previous_teacher_exam": previous.get("teacher_exam"),
     }
 
 
@@ -69,24 +82,36 @@ class WorkspaceSupervisor:
         self, executor: AgentExecutor, planner: StructuredModelRunner, seo: SeoSpecialist,
         medical_tools: Callable[[], ToolRegistry],
         load_dialog: Callable[[str, str, str], Awaitable[list[dict[str, str]]]],
+        load_tool_data: Callable[[str, tuple[str, ...]], Awaitable[list[dict[str, Any]]]] | None,
+        followup_store: FollowupCaseStore | None = None,
     ) -> None:
         self.executor, self.planner, self.seo = executor, planner, seo
         self.medical_tools, self.load_dialog = medical_tools, load_dialog
+        self.load_tool_data = load_tool_data
+        self.followup_store = followup_store
         self.client = executor.observer.client if executor.observer else None
         graph = StateGraph(GraphState)
         graph.add_node(SUPERVISOR_NODE, self.plan)
-        graph.add_node(Specialist.HEALTHCARE, self.healthcare)
-        graph.add_node(Specialist.SEO, self.search)
+        specialists = {
+            Specialist.HEALTHCARE: self.healthcare,
+            Specialist.SEO: self.search,
+            Specialist.LEARNING: self.education,
+            Specialist.EXAM_PREP: self.education,
+            Specialist.FOLLOWUP: self.followup,
+        }
+        for agent, node in specialists.items():
+            graph.add_node(agent, node)
         graph.add_node(Route.CLARIFY, self.clarify)
         graph.add_edge(START, SUPERVISOR_NODE)
         graph.add_conditional_edges(SUPERVISOR_NODE, lambda state: state["next_node"], {
-            node: node for node in (Specialist.HEALTHCARE, Specialist.SEO, Route.CLARIFY)
+            node: node for node in (*specialists, Route.CLARIFY)
         })
         graph.add_conditional_edges(Specialist.HEALTHCARE, lambda state: state["next_node"], {
             Specialist.SEO: Specialist.SEO, END: END,
         })
-        graph.add_edge(Specialist.SEO, END)
-        graph.add_edge(Route.CLARIFY, END)
+        direct = specialists.keys() - {Specialist.HEALTHCARE}
+        for node in (*direct, Route.CLARIFY):
+            graph.add_edge(node, END)
         self.graph = graph.compile()
 
     async def execute(self, run: AgentRun) -> None:
@@ -120,6 +145,8 @@ class WorkspaceSupervisor:
                             ],
                             "previous_route": saved.get("route") or saved.get("previous_route"),
                             "previous_healthcare_skill": saved.get("previous_healthcare_skill"),
+                            "previous_teacher_exam": saved.get("previous_teacher_exam"),
+                            "pending_teacher_exam": saved.get("teacher_exam") if answered else None,
                             "previous_intent": next(
                                 (m["content"] for m in reversed(previous) if m["role"] == "user"),
                                 None,
@@ -134,7 +161,7 @@ class WorkspaceSupervisor:
                         run.token_usage[key] = run.token_usage.get(key, 0) + count
                 question = decision.question if decision.route == Route.CLARIFY else None
                 if decision.route == Route.CLARIFY:
-                    question = question or "你想检查网页，还是查考试、医保或医学文献资料？"
+                    question = question or "你想检查网页、查资料、练题，还是整理复诊记录？"
                 if decision.route in {Route.SEO, Route.COURSE_REVIEW}:
                     saved["target_url"], question = select_page(
                         saved.get("target_url"), targets, invalid, decision,
@@ -144,6 +171,29 @@ class WorkspaceSupervisor:
                     saved["healthcare_skill"] = (
                         explicit_healthcare_skill(latest) or decision.healthcare_skill
                     )
+                elif decision.route == Route.LEARNING:
+                    if decision.learning_skill:
+                        request = (
+                            decision.math_practice
+                            if decision.learning_skill == EducationSkill.MATH_PRACTICE
+                            else decision.resources
+                        )
+                        saved.update(
+                            learning_skill=decision.learning_skill,
+                            learning_arguments=request.model_dump(mode="json") if request else {},
+                        )
+                    else:
+                        question = "你想做数学题，还是找可以跟着练习的官方学习资料？"
+                elif decision.route == Route.EXAM_PREP:
+                    constraints = saved.get("teacher_exam", {}) if answered else {}
+                    extracted = decision.teacher_exam or TeacherExamQuery()
+                    query = TeacherExamQuery.model_validate({
+                        **constraints, **extracted.model_dump(exclude_none=True),
+                    })
+                    question = query.clarification()
+                    saved["teacher_exam"] = query.model_dump(mode="json", exclude_none=True)
+                elif decision.route == Route.FOLLOWUP:
+                    saved.pop("target_url", None)
                 saved.update(
                     route=decision.route, question=question, awaiting_page=wait_for_target,
                     pending_targets=targets if wait_for_target else [],
@@ -160,7 +210,11 @@ class WorkspaceSupervisor:
                 if span:
                     span.output_data = {
                         "route": decision.route, "target_url": saved.get("target_url"),
-                        "question": question, "skill": saved.get("healthcare_skill"),
+                        "question": question, "skill": (
+                            saved.get("healthcare_skill") or saved.get("learning_skill")
+                            or (EducationSkill.TEACHER_EXAM
+                                if decision.route == Route.EXAM_PREP else None)
+                        ),
                     }
         if saved.get("question"):
             return {"next_node": Route.CLARIFY}
@@ -179,16 +233,6 @@ class WorkspaceSupervisor:
         await self.executor.run_turns(run)
         return {}
 
-    async def _announce(self, run: AgentRun, agent: Specialist) -> None:
-        already_sent = any(
-            event.type == DISPATCHED_EVENT and event.payload.get("agent") == agent
-            for event in run.events
-        )
-        if not already_sent:
-            await self.executor.emit(
-                run, DISPATCHED_EVENT, {"from": SUPERVISOR_NODE, "agent": agent},
-            )
-
     async def _previous_dialog(self, run: AgentRun, agent: str | None) -> list[dict[str, str]]:
         saved = run.dispatch_state
         source = saved.get("previous_run_id")
@@ -205,6 +249,90 @@ class WorkspaceSupervisor:
             return dialog
         return [*await self._previous_dialog(run, agent), *dialog]
 
+    async def _record_skill(
+        self, run: AgentRun, agent_run_id: str, skill: Skill, prompt_hash: str,
+    ) -> None:
+        if any(
+            event.type == SKILL_LOADED_EVENT and event.payload.get("agent_run_id") == agent_run_id
+            for event in run.events
+        ):
+            return
+        payload = {
+            "agent": skill.domain, "skill": skill.name, "label": skill.description,
+            "tools": self.executor.tools.names(), "prompt_hash": prompt_hash,
+        }
+        async with observed_operation(
+            self.client, "workspace.skill", kind=SpanKind.INTERNAL, input_data=payload,
+        ):
+            await self.executor.emit(run, SKILL_LOADED_EVENT, payload)
+
+    async def education(self, state: GraphState) -> dict:
+        run = state["run"]
+        saved = run.dispatch_state
+        agent = Specialist(saved["route"])
+        if agent == Specialist.EXAM_PREP:
+            skill = EDUCATION_SKILLS.get(EducationSkill.TEACHER_EXAM)
+            arguments = saved["teacher_exam"]
+        else:
+            skill = EDUCATION_SKILLS.get(saved["learning_skill"])
+            arguments = saved["learning_arguments"]
+        tool_name = skill.tools[0]
+        async with observed_operation(
+            self.client, f"workspace.{agent}", kind=SpanKind.AGENT,
+            input_data={"skill": skill.name, "arguments": arguments},
+        ) as span, self.executor.specialist(run, agent, sender=SUPERVISOR_NODE) as agent_run_id:
+            if (
+                agent == Specialist.LEARNING and "learning_history" not in saved
+                and self.load_tool_data and run.conversation_id
+            ):
+                receipts = await self.load_tool_data(
+                    run.conversation_id, (MathPractice.name, LearningResources.name),
+                )
+                saved["learning_history"] = learning_history(receipts)
+            registry = education_tools(
+                agent, **saved.get("learning_history", {}),
+                practice_limit=max(0, min(MAX_QUESTIONS, self.executor.max_tool_calls - 1)),
+            )
+            self.executor.tools = ToolRegistry(registry.get(name) for name in skill.tools)
+            prompt_hash = hashlib.sha256(skill.prompt_fragment.encode()).hexdigest()
+            await self._record_skill(run, agent_run_id, skill, prompt_hash)
+            saved["active_agent"] = agent
+
+            def answer(current: AgentRun) -> str | None:
+                for event in reversed(current.events):
+                    if event.type not in {"tool.completed", "tool.failed"} or (
+                        event.payload.get("name") != tool_name
+                    ):
+                        continue
+                    result = event.payload["result"]
+                    if not result["success"]:
+                        return result.get("error") or "本次未能取得资料，请稍后重试。"
+                    return result["data"].get("answer")
+                return None
+
+            await self.executor.run_tool_workflow(
+                run, ToolCall(f"{tool_name}_start", tool_name, arguments), evidence_answer=answer,
+            )
+            if span:
+                span.output_data = {"status": run.status.value}
+        return {}
+
+    async def followup(self, state: GraphState) -> dict:
+        run = state["run"]
+        agent = Specialist.FOLLOWUP
+        async with observed_operation(
+            self.client, "workspace.followup", kind=SpanKind.AGENT,
+            input_data={"skill": FOLLOWUP_SKILL.name},
+        ) as span, self.executor.specialist(run, agent, sender=SUPERVISOR_NODE) as agent_run_id:
+            self.executor.tools = followup_tools(self.followup_store)
+            prompt_hash = hashlib.sha256(FOLLOWUP_SKILL.prompt_fragment.encode()).hexdigest()
+            await self._record_skill(run, agent_run_id, FOLLOWUP_SKILL, prompt_hash)
+            run.dispatch_state["active_agent"] = agent
+            await run_followup(self.executor, run, self.followup_store)
+            if span:
+                span.output_data = {"status": run.status.value}
+        return {}
+
     async def healthcare(self, state: GraphState) -> dict[str, str]:
         run = state["run"]
         saved = run.dispatch_state
@@ -220,8 +348,9 @@ class WorkspaceSupervisor:
         async with observed_operation(
             self.client, "workspace.healthcare", kind=SpanKind.AGENT,
             input_data={"route": saved["route"], "skill": skill_id},
-        ) as span:
-            await self._announce(run, Specialist.HEALTHCARE)
+        ) as span, self.executor.specialist(
+            run, Specialist.HEALTHCARE, sender=SUPERVISOR_NODE,
+        ) as agent_run_id:
             registry = self.medical_tools()
             try:
                 skill, self.executor.tools, prompt = render_healthcare_skill(skill_id, registry)
@@ -238,15 +367,7 @@ class WorkspaceSupervisor:
                 await self.executor.run_turns(run, evidence_answer=lambda _: text)
                 return {"next_node": END}
             saved["healthcare_skill"] = skill_id
-            skill_event = {
-                "agent": Specialist.HEALTHCARE, "skill": skill.name, "label": skill.description,
-                "tools": self.executor.tools.names(), "prompt_hash": prompt.prompt_hash,
-            }
-            if not any(event.type == SKILL_LOADED_EVENT for event in run.events):
-                async with observed_operation(
-                    self.client, "workspace.skill", kind=SpanKind.INTERNAL, input_data=skill_event,
-                ):
-                    await self.executor.emit(run, SKILL_LOADED_EVENT, skill_event)
+            await self._record_skill(run, agent_run_id, skill, prompt.prompt_hash)
             if course_review:
                 tool = MedicalExamSyllabus.name
                 result = await self.executor.required_tool(
@@ -256,6 +377,7 @@ class WorkspaceSupervisor:
                 if not evidence:
                     raise ValueError("本次未取得可交接的公开考纲依据，请稍后再试。")
                 saved["public_rule"] = evidence
+                await self.executor.complete_specialist(run)
                 await self.executor.checkpoint(run, stage="public_rule_verified")
                 if span:
                     span.output_data = {"recipient": Specialist.SEO, "public_rule": evidence}
@@ -280,19 +402,17 @@ class WorkspaceSupervisor:
         saved = run.dispatch_state
         target = saved.get("target_url")
         rule = saved.get("public_rule")
-        if rule:
-            dialog = [{"role": "user", "content": f"请用已核实的考纲条款核对课程页 {target}。"}]
-        else:
-            dialog = await self._specialist_dialog(run, Specialist.SEO)
-        prompt, registry = await self.seo(
-            target, [m["content"] for m in dialog if m["role"] == "user"],
-        )
-        self.executor.tools = registry
         async with observed_operation(
             self.client, "workspace.seo", kind=SpanKind.AGENT,
             input_data={"target_url": target, "public_rule": rule},
-        ) as span:
-            await self._announce(run, Specialist.SEO)
+        ) as span, self.executor.specialist(run, Specialist.SEO, sender=SUPERVISOR_NODE):
+            if rule:
+                dialog = [{"role": "user", "content": f"请用已核实的考纲条款核对课程页 {target}。"}]
+            else:
+                dialog = await self._specialist_dialog(run, Specialist.SEO)
+            prompt, self.executor.tools = await self.seo(
+                target, [message["content"] for message in dialog if message["role"] == "user"],
+            )
             if not saved.get("active_agent"):
                 if rule:
                     page = await self.executor.required_tool(

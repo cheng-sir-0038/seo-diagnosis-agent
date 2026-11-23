@@ -1,3 +1,6 @@
+import type { Specialist, SpecialistStatus } from '../specialists'
+export type { Specialist } from '../specialists'
+
 export type AgentEventType =
   | 'run.started'
   | 'run.resumed'
@@ -5,6 +8,8 @@ export type AgentEventType =
   | 'input.submitted'
   | 'input.accepted'
   | 'agent.dispatched'
+  | 'agent.completed'
+  | 'agent.failed'
   | 'skill.loaded'
   | 'stage.changed'
   | 'message.started'
@@ -38,11 +43,16 @@ export interface HumanInputRequest {
 
 export type RenderHint = 'chart' | 'table' | 'tree' | 'cards'
 
-export const specialistNames = { seo: 'SEO / GEO', healthcare: '医药业务' } as const
-export type Specialist = keyof typeof specialistNames
+export interface SpecialistRun {
+  id: string
+  agent: Specialist
+  status: SpecialistStatus
+  startedAt: string
+}
 
 export interface AppliedSkill {
   agent: Specialist
+  agentRunId?: string
   name: string
   label: string
 }
@@ -60,7 +70,8 @@ export interface ToolRun {
   id: string
   name: string
   agent?: Specialist
-  status: 'running' | 'completed' | 'failed'
+  agentRunId?: string
+  status: 'running' | 'completed' | 'failed' | 'cancelled'
   arguments?: unknown
   result?: unknown
   error?: string
@@ -74,7 +85,7 @@ export interface RunState {
   status: RunStatus
   stage: string
   assistantText: string
-  agents: Specialist[]
+  agentRuns: SpecialistRun[]
   skills: AppliedSkill[]
   tools: ToolRun[]
   events: AgentEvent[]
@@ -91,19 +102,21 @@ export interface ChatMessage {
   content: string
   createdAt: string
   toolResults?: ToolRun[]
-  agents?: Specialist[]
+  agentRuns?: SpecialistRun[]
   skills?: AppliedSkill[]
   runId?: string
   inputRequest?: HumanInputRequest
+  followupKey?: string
 }
 
 export interface SavedAgentRun {
-  priorAgents?: Specialist[]
+  priorAgentRuns?: SpecialistRun[]
   priorSkills?: AppliedSkill[]
   runId: string
   eventsUrl: string
   cancelUrl: string
   afterSequence: number
+  followupKey?: string
 }
 
 export interface Conversation {
