@@ -8,6 +8,14 @@ from src.agent.models import AgentEvent, AgentRun
 class AgentRunPersistence(Protocol):
     async def persist_event(self, run: AgentRun, event: AgentEvent) -> None: ...
 
+    async def save_waiting(
+        self,
+        run: AgentRun,
+        *,
+        messages: list[dict[str, Any]],
+        events: tuple[AgentEvent, AgentEvent],
+    ) -> dict[str, Any]: ...
+
     async def save_checkpoint(
         self,
         run: AgentRun,

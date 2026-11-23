@@ -2,14 +2,15 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import App from '../App'
-import { saveProductConfig } from '../services/productApi'
+import { loadProductConfig, saveProductConfig } from '../services/productApi'
 
 const json = (data: unknown, status = 200) =>
   Promise.resolve(new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } }))
 
-describe('SEO specialist product app', () => {
+describe('business chat workspace', () => {
   beforeEach(() => {
     window.localStorage.clear()
+    window.sessionStorage.clear()
     window.history.replaceState(null, '', '/')
     Element.prototype.scrollIntoView = vi.fn()
   })
@@ -20,29 +21,62 @@ describe('SEO specialist product app', () => {
     vi.restoreAllMocks()
   })
 
-  it('shows the setup screen when no site exists', async () => {
-    vi.stubGlobal('fetch', vi.fn(() => json([])))
-    render(<App />)
-    expect(await screen.findByText('配置你的 SEO 优化专员')).toBeInTheDocument()
-    expect(screen.getByLabelText('站点域名')).toBeInTheDocument()
-    expect(screen.getByRole('combobox', { name: '目标国家' })).toBeInTheDocument()
-    expect(screen.getByRole('combobox', { name: '默认语言' })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /创建并进入对话工作区/ })).toBeInTheDocument()
-  })
-
-  it('explains why no request is sent when required setup fields are missing', async () => {
+  it('opens chat in a fresh browser and makes no site or actor requests', async () => {
     const fetchMock = vi.fn(() => json([]))
     vi.stubGlobal('fetch', fetchMock)
     render(<App />)
+    expect(await screen.findByRole('textbox', { name: '给业务助理发送消息' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: /页面检查/ })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /医保药品目录/ })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /PubMed 文献检索/ })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /医考报名/ })).toBeInTheDocument()
+    expect(screen.queryByRole('link', { name: 'SEO 站点登记' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /考研招生对比/ })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /网页与考纲联查/ }))
+    expect((screen.getByLabelText('给业务助理发送消息') as HTMLTextAreaElement).value).toContain('www.hbwsrc.cn/')
+    expect(screen.queryByLabelText('站点域名')).not.toBeInTheDocument()
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
 
-    fireEvent.click(await screen.findByRole('button', { name: /创建并进入对话工作区/ }))
+  it('loads registered tools on demand and retries a failed directory request', async () => {
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(() => json({}, 503))
+      .mockImplementationOnce(() => json({ specialists: [
+        {
+          agent: 'healthcare', tools: [{ name: 'medical_exam_syllabus', description: '核对官方考纲' }],
+          skills: [{ name: 'medical-exam-syllabus', label: '医考考纲核对', tools: ['medical_exam_syllabus'] }],
+        },
+        { agent: 'seo', tools: [] },
+      ] }))
+    vi.stubGlobal('fetch', fetchMock)
+    render(<App />)
+    expect(fetchMock).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: '专员与工具' }))
+    fireEvent.click(await screen.findByRole('button', { name: '重试' }))
+    expect(await screen.findByText('查证考纲条款')).toBeVisible()
+    expect(screen.getByText('Skill · 医考考纲核对')).toBeVisible()
+    expect(screen.getByLabelText('1 个工具')).toBeVisible()
+    expect(fetchMock.mock.calls.every(call => String(call[0]).includes('/api/v1/chat/tools?conversation_id='))).toBe(true)
+  })
+
+  it('validates registration from its direct URL and can return to chat', async () => {
+    const fetchMock = vi.fn(() => json([]))
+    vi.stubGlobal('fetch', fetchMock)
+    window.history.replaceState(null, '', '/#/site-setup')
+    render(<App />)
+
+    fireEvent.click(await screen.findByRole('button', { name: '登记站点' }))
 
     expect(await screen.findByText('请先完成所有必填项')).toBeInTheDocument()
     expect(screen.getByLabelText('站点域名')).toHaveFocus()
     expect(fetchMock).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('link', { name: '返回对话' }))
+    await waitFor(() => expect(window.location.hash).toBe('#/chat'))
+    expect(await screen.findByLabelText('给业务助理发送消息')).toBeEnabled()
   })
 
-  it('creates the workspace and enters the chat interface', async () => {
+  it('returns to chat after explicitly registering an SEO site', async () => {
+    window.history.replaceState(null, '', '/#/site-setup')
     const site = {
       id: 'site-new',
       name: 'SEO 演示站点',
@@ -73,34 +107,41 @@ describe('SEO specialist product app', () => {
     fireEvent.change(await screen.findByLabelText('站点域名'), { target: { value: 'example.com' } })
     fireEvent.change(screen.getByLabelText('负责人邮箱'), { target: { value: 'owner@example.com' } })
     fireEvent.change(screen.getByLabelText('执行者邮箱'), { target: { value: 'writer@example.com' } })
-    fireEvent.click(screen.getByRole('button', { name: /创建并进入对话工作区/ }))
+    fireEvent.click(screen.getByRole('button', { name: '登记站点' }))
 
-    expect(await screen.findByRole('heading', { name: /你来提问，\s*我来查证。/ })).toBeInTheDocument()
-    expect(screen.getByRole('tab', { name: /对话/ })).toHaveAttribute('aria-selected', 'true')
+    expect(await screen.findByRole('textbox', { name: '给业务助理发送消息' })).toBeEnabled()
     expect(createdSitePayload).toMatchObject({ default_country: 'US', default_language: 'en-US' })
   })
 
-  it('opens chat when an unavailable product route is requested', async () => {
+  it('clears only the previous workspace data and preserves data from the new version', async () => {
     const productConfig = { siteId: 'site-1', ownerActorId: 'owner-1', agentActorId: 'agent-1', executorActorId: 'executor-1' }
-    saveProductConfig(productConfig)
-    window.localStorage.setItem('seo-agent-product-config-v1', JSON.stringify(productConfig))
+    localStorage.setItem('seo-agent-product-config-v1', JSON.stringify(productConfig))
+    localStorage.setItem('agent-workspace-conversations-v1', JSON.stringify([
+      { id: 'old', title: '旧站点对话', messages: [], updatedAt: '2026-07-24' },
+    ]))
+    sessionStorage.setItem('agent-workspace-active-conversation-v1', 'old')
+    localStorage.setItem('unrelated', 'local data')
+    sessionStorage.setItem('unrelated', 'tab data')
     window.history.replaceState(null, '', '/#/schedules')
-    const fetchMock = vi.fn((input: RequestInfo | URL) => {
-      const url = String(input)
-      if (url.includes('/sites/site-1')) return json({ id: 'site-1', name: 'Demo', domain: 'example.com' })
-      if (url.includes('/workbench/summary')) return json({ pending_approvals: 1, high_value_opportunities: 2, medium_opportunities: 3, active_tasks: 4, active_scan_runs: 0, active_monitoring_plans: 1, recent_work_records: [] })
-      if (url.includes('/approvals')) return json([])
-      if (url.includes('/opportunities')) return json([])
-      if (url.includes('/schedules')) return json([])
-      if (url.includes('/tasks')) return json([])
-      if (url.includes('/subscriptions')) return json([])
-      if (url.includes('/system/status')) return json({ database_started: true, checkpoint_started: true, adapters: [] })
-      return json([])
-    })
+    const fetchMock = vi.fn(() => json({ detail: '站点不存在' }, 404))
     vi.stubGlobal('fetch', fetchMock)
+    const first = render(<App />)
+    expect(await screen.findByRole('textbox', { name: '给业务助理发送消息' })).toBeEnabled()
+    expect(screen.queryByText('旧站点对话')).not.toBeInTheDocument()
+    expect(localStorage.getItem('seo-agent-product-config-v1')).toBeNull()
+    expect(localStorage.getItem('agent-workspace-conversations-v1')).toBeNull()
+    expect(sessionStorage.getItem('agent-workspace-active-conversation-v1')).toBeNull()
+    expect(localStorage.getItem('unrelated')).toBe('local data')
+    expect(sessionStorage.getItem('unrelated')).toBe('tab data')
+    const active = sessionStorage.getItem('agent-workspace-active-conversation-v2')
+    expect(active).toBeTruthy()
+    saveProductConfig(productConfig)
+
+    first.unmount()
     render(<App />)
-    expect(await screen.findByRole('heading', { name: /你来提问，\s*我来查证。/ })).toBeInTheDocument()
-    expect(screen.getByRole('tab', { name: /对话/ })).toHaveAttribute('aria-selected', 'true')
-    await waitFor(() => expect(fetchMock).toHaveBeenCalled())
+    expect(await screen.findByRole('textbox', { name: '给业务助理发送消息' })).toBeEnabled()
+    expect(sessionStorage.getItem('agent-workspace-active-conversation-v2')).toBe(active)
+    expect(loadProductConfig()).toEqual(productConfig)
+    expect(fetchMock).not.toHaveBeenCalled()
   })
 })

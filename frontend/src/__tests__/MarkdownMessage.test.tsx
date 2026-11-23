@@ -6,6 +6,16 @@ import { MarkdownMessage } from '../components/MarkdownMessage'
 afterEach(cleanup)
 
 describe('MarkdownMessage', () => {
+  it('keeps Chinese sentence punctuation outside bare citations and preserves explicit links', () => {
+    const url = 'https://example.org/course.html'
+    const named = 'https://example.org/课程（上）'
+    render(<MarkdownMessage content={`通知（${url}）适用于课程。出处为 ${url}。另见 [课程原文](${named})。`} />)
+    const citations = screen.getAllByRole('link', { name: url })
+    expect(citations).toHaveLength(2)
+    expect(citations.every(link => link.getAttribute('href') === url)).toBe(true)
+    expect(screen.getByText(/）适用于课程/)).toBeVisible()
+    expect(decodeURI(String(screen.getByRole('link', { name: '课程原文' }).getAttribute('href')))).toBe(named)
+  })
   it('places results after the opening paragraph and keeps the rest of the reply', () => {
     render(
       <MarkdownMessage

@@ -7,17 +7,19 @@ from unittest.mock import patch
 import httpx
 import pytest
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from sqlalchemy import select
 
-from src.agent.loop import AgentLoop
 from src.agent.models import RunStatus
 from src.agent.observability import AgentRunObserver
 from src.agent.providers.base import ModelChunk, ToolCall
 from src.agent.providers.fake import FakeModelProvider
 from src.agent.run_manager import RunManager
+from src.agent.runtime.executor import AgentExecutor
 from src.models.common import Capability
 from src.models.geo import GeoCitationRequest, GeoContentDraft, GeoQuestionSelection
 from src.observability.client import ObservabilityClient
 from src.observability.exporters import OpenTelemetryExporter
+from src.observability.schema import SpanRow
 from src.observability.storage import ObservabilityDatabase
 from src.seo_agent.chat.tools import build_seo_agent_registry
 from src.seo_agent.geo_a2a import LOCAL_URL, GeoCitationClient, GeoPeerError
@@ -281,9 +283,9 @@ class ModelAnswers:
     ("opaque packaging", "建议前置已有说明"),
 ])
 async def test_geo_chain_hands_off_evidence_and_records_the_real_a2a_task(
-    tmp_path, focus, expected_title,
+    pg_url, focus, expected_title,
 ):
-    database = ObservabilityDatabase(tmp_path / "obs.db")
+    database = ObservabilityDatabase(pg_url)
     exported = InMemorySpanExporter()
     observer = ObservabilityClient(
         database,
@@ -345,7 +347,7 @@ async def test_geo_chain_hands_off_evidence_and_records_the_real_a2a_task(
     run = RunManager().create_run([{"role": "user", "content": "Investigate coffee storage."}])
     try:
         with patch.object(provider, "stream", wraps=provider.stream) as stream:
-            await AgentLoop(
+            await AgentExecutor(
                 provider,
                 registry,
                 observer=AgentRunObserver(observer, operation_name="seo_agent.chat"),
@@ -397,7 +399,7 @@ async def test_geo_chain_hands_off_evidence_and_records_the_real_a2a_task(
         ]
         spans = {
             row["operation_name"]: row
-            for row in await database.fetch_all("SELECT * FROM obs_spans")
+            for row in await database.fetch_all(select(SpanRow.__table__))
         }
         assert outside_review in spans["seo_page_metadata"]["output_json"]
         task_id = data["evidence"]["citations"]["a2a_task_id"]

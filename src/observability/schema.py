@@ -1,229 +1,296 @@
-SCHEMA_VERSION = "4"
+from __future__ import annotations
 
-SCHEMA_SQL = r"""
-CREATE TABLE IF NOT EXISTS obs_schema_migrations (
-    version TEXT PRIMARY KEY,
-    applied_at TEXT NOT NULL
-);
+from sqlalchemy import Float, ForeignKey, Index, Integer, Text, UniqueConstraint
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-CREATE TABLE IF NOT EXISTS obs_projects (
-    id TEXT PRIMARY KEY,
-    project_key TEXT NOT NULL UNIQUE,
-    name TEXT NOT NULL,
-    service_name TEXT,
-    metadata_json TEXT NOT NULL DEFAULT '{}',
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
 
-CREATE TABLE IF NOT EXISTS obs_traces (
-    id TEXT PRIMARY KEY,
-    project_id TEXT NOT NULL REFERENCES obs_projects(id) ON DELETE RESTRICT,
-    operation_name TEXT NOT NULL,
-    session_id TEXT,
-    user_id TEXT,
-    status TEXT NOT NULL,
-    input_json TEXT NOT NULL DEFAULT '{}',
-    output_json TEXT NOT NULL DEFAULT '{}',
-    error_code TEXT,
-    error_message TEXT,
-    started_at TEXT NOT NULL,
-    completed_at TEXT,
-    duration_ms REAL,
-    otel_trace_id TEXT NOT NULL,
-    otel_root_span_id TEXT NOT NULL,
-    metadata_json TEXT NOT NULL DEFAULT '{}'
-);
+class Base(DeclarativeBase):
+    """PostgreSQL metadata shared by observations and prompt management."""
 
-CREATE TABLE IF NOT EXISTS obs_trace_links (
-    id TEXT PRIMARY KEY,
-    source_trace_id TEXT NOT NULL REFERENCES obs_traces(id) ON DELETE RESTRICT,
-    target_trace_id TEXT NOT NULL REFERENCES obs_traces(id) ON DELETE RESTRICT,
-    relation_type TEXT NOT NULL,
-    attributes_json TEXT NOT NULL DEFAULT '{}',
-    created_at TEXT NOT NULL,
-    UNIQUE(source_trace_id, target_trace_id, relation_type)
-);
 
-CREATE TABLE IF NOT EXISTS obs_runs (
-    id TEXT PRIMARY KEY,
-    trace_id TEXT NOT NULL REFERENCES obs_traces(id) ON DELETE RESTRICT,
-    thread_id TEXT,
-    trigger_type TEXT NOT NULL,
-    attempt_no INTEGER NOT NULL DEFAULT 1,
-    agent_name TEXT,
-    workflow_name TEXT,
-    model_provider TEXT,
-    model_name TEXT,
-    status TEXT NOT NULL,
-    stop_reason TEXT,
-    error_code TEXT,
-    error_message TEXT,
-    started_at TEXT NOT NULL,
-    completed_at TEXT,
-    duration_ms REAL,
-    metadata_json TEXT NOT NULL DEFAULT '{}'
-);
+class ProjectRow(Base):
+    __tablename__ = "obs_projects"
+    __table_args__ = (
+        UniqueConstraint("project_key"),
+    )
 
-CREATE TABLE IF NOT EXISTS obs_spans (
-    id TEXT PRIMARY KEY,
-    trace_id TEXT NOT NULL REFERENCES obs_traces(id) ON DELETE RESTRICT,
-    run_id TEXT REFERENCES obs_runs(id) ON DELETE RESTRICT,
-    parent_span_id TEXT REFERENCES obs_spans(id) ON DELETE RESTRICT,
-    kind TEXT NOT NULL,
-    component_name TEXT,
-    operation_name TEXT NOT NULL,
-    status TEXT NOT NULL,
-    input_json TEXT NOT NULL DEFAULT '{}',
-    output_json TEXT NOT NULL DEFAULT '{}',
-    error_code TEXT,
-    error_message TEXT,
-    started_at TEXT NOT NULL,
-    completed_at TEXT,
-    duration_ms REAL,
-    metadata_json TEXT NOT NULL DEFAULT '{}'
-);
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    project_key: Mapped[str] = mapped_column(Text)
+    name: Mapped[str] = mapped_column(Text)
+    service_name: Mapped[str | None] = mapped_column(Text)
+    metadata_json: Mapped[str] = mapped_column(Text, server_default="{}")
+    created_at: Mapped[str] = mapped_column(Text)
+    updated_at: Mapped[str] = mapped_column(Text)
 
-CREATE TABLE IF NOT EXISTS obs_events (
-    id TEXT PRIMARY KEY,
-    trace_id TEXT NOT NULL REFERENCES obs_traces(id) ON DELETE RESTRICT,
-    run_id TEXT REFERENCES obs_runs(id) ON DELETE RESTRICT,
-    span_id TEXT REFERENCES obs_spans(id) ON DELETE RESTRICT,
-    sequence INTEGER NOT NULL,
-    event_type TEXT NOT NULL,
-    severity TEXT NOT NULL,
-    stage TEXT,
-    payload_json TEXT NOT NULL DEFAULT '{}',
-    occurred_at TEXT NOT NULL,
-    UNIQUE(trace_id, sequence)
-);
 
-CREATE TABLE IF NOT EXISTS obs_model_calls (
-    id TEXT PRIMARY KEY,
-    trace_id TEXT NOT NULL REFERENCES obs_traces(id) ON DELETE RESTRICT,
-    run_id TEXT REFERENCES obs_runs(id) ON DELETE RESTRICT,
-    span_id TEXT REFERENCES obs_spans(id) ON DELETE RESTRICT,
-    provider TEXT NOT NULL,
-    model TEXT NOT NULL,
-    operation TEXT NOT NULL,
-    prompt_key TEXT,
-    prompt_version TEXT,
-    prompt_version_id TEXT,
-    evaluation_case_id TEXT,
-    experiment_variant_id TEXT,
-    input_tokens INTEGER,
-    output_tokens INTEGER,
-    reasoning_tokens INTEGER,
-    cached_tokens INTEGER,
-    total_tokens INTEGER,
-    estimated_cost REAL,
-    latency_ms REAL,
-    time_to_first_token_ms REAL,
-    finish_reason TEXT,
-    structured_output_valid INTEGER,
-    retry_count INTEGER NOT NULL DEFAULT 0,
-    status TEXT NOT NULL,
-    error_code TEXT,
-    error_message TEXT,
-    input_summary_json TEXT NOT NULL DEFAULT '{}',
-    output_summary_json TEXT NOT NULL DEFAULT '{}',
-    started_at TEXT NOT NULL,
-    completed_at TEXT NOT NULL
-);
+class TraceRow(Base):
+    __tablename__ = "obs_traces"
+    __table_args__ = (
+        Index("idx_obs_traces_project_time", "project_id", "started_at"),
+    )
 
-CREATE TABLE IF NOT EXISTS obs_tool_calls (
-    id TEXT PRIMARY KEY,
-    trace_id TEXT NOT NULL REFERENCES obs_traces(id) ON DELETE RESTRICT,
-    run_id TEXT REFERENCES obs_runs(id) ON DELETE RESTRICT,
-    span_id TEXT REFERENCES obs_spans(id) ON DELETE RESTRICT,
-    tool_call_id TEXT NOT NULL,
-    tool_name TEXT NOT NULL,
-    adapter_key TEXT,
-    operation TEXT NOT NULL,
-    arguments_json TEXT NOT NULL DEFAULT '{}',
-    result_summary_json TEXT NOT NULL DEFAULT '{}',
-    status TEXT NOT NULL,
-    retry_count INTEGER NOT NULL DEFAULT 0,
-    timeout_seconds REAL,
-    latency_ms REAL,
-    external_request_id TEXT,
-    error_code TEXT,
-    error_message TEXT,
-    started_at TEXT NOT NULL,
-    completed_at TEXT NOT NULL,
-    UNIQUE(trace_id, tool_call_id)
-);
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    project_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("obs_projects.id", ondelete="RESTRICT"),
+    )
+    operation_name: Mapped[str] = mapped_column(Text)
+    session_id: Mapped[str | None] = mapped_column(Text)
+    user_id: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text)
+    input_json: Mapped[str] = mapped_column(Text, server_default="{}")
+    output_json: Mapped[str] = mapped_column(Text, server_default="{}")
+    error_code: Mapped[str | None] = mapped_column(Text)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[str] = mapped_column(Text)
+    completed_at: Mapped[str | None] = mapped_column(Text)
+    duration_ms: Mapped[float | None] = mapped_column(Float)
+    otel_trace_id: Mapped[str] = mapped_column(Text)
+    otel_root_span_id: Mapped[str] = mapped_column(Text)
+    metadata_json: Mapped[str] = mapped_column(Text, server_default="{}")
 
-CREATE TABLE IF NOT EXISTS obs_issues (
-    id TEXT PRIMARY KEY,
-    project_id TEXT NOT NULL REFERENCES obs_projects(id) ON DELETE RESTRICT,
-    fingerprint TEXT NOT NULL,
-    title TEXT NOT NULL,
-    issue_type TEXT NOT NULL,
-    severity TEXT NOT NULL,
-    component TEXT,
-    status TEXT NOT NULL,
-    occurrence_count INTEGER NOT NULL DEFAULT 1,
-    affected_trace_count INTEGER NOT NULL DEFAULT 1,
-    first_seen_at TEXT NOT NULL,
-    last_seen_at TEXT NOT NULL,
-    resolved_at TEXT,
-    reopened_at TEXT,
-    latest_context_json TEXT NOT NULL DEFAULT '{}',
-    UNIQUE(project_id, fingerprint)
-);
 
-CREATE TABLE IF NOT EXISTS obs_issue_occurrences (
-    id TEXT PRIMARY KEY,
-    issue_id TEXT NOT NULL REFERENCES obs_issues(id) ON DELETE RESTRICT,
-    trace_id TEXT NOT NULL REFERENCES obs_traces(id) ON DELETE RESTRICT,
-    run_id TEXT REFERENCES obs_runs(id) ON DELETE RESTRICT,
-    span_id TEXT REFERENCES obs_spans(id) ON DELETE RESTRICT,
-    fingerprint TEXT NOT NULL,
-    issue_type TEXT NOT NULL,
-    severity TEXT NOT NULL,
-    component TEXT,
-    error_code TEXT,
-    message TEXT NOT NULL,
-    context_json TEXT NOT NULL DEFAULT '{}',
-    occurred_at TEXT NOT NULL
-);
+class TraceLinkRow(Base):
+    __tablename__ = "obs_trace_links"
+    __table_args__ = (
+        Index("idx_obs_trace_links_target", "target_trace_id", "created_at"),
+        Index("idx_obs_trace_links_source", "source_trace_id", "created_at"),
+        UniqueConstraint("source_trace_id", "target_trace_id", "relation_type"),
+    )
 
-CREATE TABLE IF NOT EXISTS obs_issue_trace_links (
-    issue_id TEXT NOT NULL REFERENCES obs_issues(id) ON DELETE RESTRICT,
-    trace_id TEXT NOT NULL REFERENCES obs_traces(id) ON DELETE RESTRICT,
-    created_at TEXT NOT NULL,
-    PRIMARY KEY(issue_id, trace_id)
-);
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    source_trace_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("obs_traces.id", ondelete="RESTRICT"),
+    )
+    target_trace_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("obs_traces.id", ondelete="RESTRICT"),
+    )
+    relation_type: Mapped[str] = mapped_column(Text)
+    attributes_json: Mapped[str] = mapped_column(Text, server_default="{}")
+    created_at: Mapped[str] = mapped_column(Text)
 
-CREATE TABLE IF NOT EXISTS obs_metric_points (
-    id TEXT PRIMARY KEY,
-    project_id TEXT NOT NULL REFERENCES obs_projects(id) ON DELETE RESTRICT,
-    trace_id TEXT REFERENCES obs_traces(id) ON DELETE RESTRICT,
-    run_id TEXT REFERENCES obs_runs(id) ON DELETE RESTRICT,
-    span_id TEXT REFERENCES obs_spans(id) ON DELETE RESTRICT,
-    metric_name TEXT NOT NULL,
-    value REAL NOT NULL,
-    unit TEXT,
-    dimensions_json TEXT NOT NULL DEFAULT '{}',
-    recorded_at TEXT NOT NULL
-);
 
-CREATE INDEX IF NOT EXISTS idx_obs_traces_project_time
-    ON obs_traces(project_id, started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_obs_trace_links_source
-    ON obs_trace_links(source_trace_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_obs_trace_links_target
-    ON obs_trace_links(target_trace_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_obs_runs_trace ON obs_runs(trace_id, started_at);
-CREATE INDEX IF NOT EXISTS idx_obs_spans_trace ON obs_spans(trace_id, started_at);
-CREATE INDEX IF NOT EXISTS idx_obs_events_trace ON obs_events(trace_id, sequence);
-CREATE INDEX IF NOT EXISTS idx_obs_model_calls_trace ON obs_model_calls(trace_id, started_at);
-CREATE INDEX IF NOT EXISTS idx_obs_tool_calls_trace ON obs_tool_calls(trace_id, started_at);
-CREATE INDEX IF NOT EXISTS idx_obs_issues_project_status
-    ON obs_issues(project_id, status, last_seen_at DESC);
-CREATE INDEX IF NOT EXISTS idx_obs_occurrences_issue
-    ON obs_issue_occurrences(issue_id, occurred_at DESC);
-CREATE INDEX IF NOT EXISTS idx_obs_metrics_name_time
-    ON obs_metric_points(metric_name, recorded_at DESC);
-"""
+class RunRow(Base):
+    __tablename__ = "obs_runs"
+    __table_args__ = (
+        Index("idx_obs_runs_trace", "trace_id", "started_at"),
+    )
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    trace_id: Mapped[str] = mapped_column(Text, ForeignKey("obs_traces.id", ondelete="RESTRICT"))
+    thread_id: Mapped[str | None] = mapped_column(Text)
+    trigger_type: Mapped[str] = mapped_column(Text)
+    attempt_no: Mapped[int] = mapped_column(Integer, server_default="1")
+    agent_name: Mapped[str | None] = mapped_column(Text)
+    workflow_name: Mapped[str | None] = mapped_column(Text)
+    model_provider: Mapped[str | None] = mapped_column(Text)
+    model_name: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text)
+    stop_reason: Mapped[str | None] = mapped_column(Text)
+    error_code: Mapped[str | None] = mapped_column(Text)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[str] = mapped_column(Text)
+    completed_at: Mapped[str | None] = mapped_column(Text)
+    duration_ms: Mapped[float | None] = mapped_column(Float)
+    metadata_json: Mapped[str] = mapped_column(Text, server_default="{}")
+
+
+class SpanRow(Base):
+    __tablename__ = "obs_spans"
+    __table_args__ = (
+        Index("idx_obs_spans_trace", "trace_id", "started_at"),
+    )
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    trace_id: Mapped[str] = mapped_column(Text, ForeignKey("obs_traces.id", ondelete="RESTRICT"))
+    run_id: Mapped[str | None] = mapped_column(Text, ForeignKey("obs_runs.id", ondelete="RESTRICT"))
+    parent_span_id: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("obs_spans.id", ondelete="RESTRICT"),
+    )
+    kind: Mapped[str] = mapped_column(Text)
+    component_name: Mapped[str | None] = mapped_column(Text)
+    operation_name: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text)
+    input_json: Mapped[str] = mapped_column(Text, server_default="{}")
+    output_json: Mapped[str] = mapped_column(Text, server_default="{}")
+    error_code: Mapped[str | None] = mapped_column(Text)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[str] = mapped_column(Text)
+    completed_at: Mapped[str | None] = mapped_column(Text)
+    duration_ms: Mapped[float | None] = mapped_column(Float)
+    metadata_json: Mapped[str] = mapped_column(Text, server_default="{}")
+
+
+class EventRow(Base):
+    __tablename__ = "obs_events"
+    __table_args__ = (
+        Index("idx_obs_events_trace", "trace_id", "sequence"),
+        UniqueConstraint("trace_id", "sequence"),
+    )
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    trace_id: Mapped[str] = mapped_column(Text, ForeignKey("obs_traces.id", ondelete="RESTRICT"))
+    run_id: Mapped[str | None] = mapped_column(Text, ForeignKey("obs_runs.id", ondelete="RESTRICT"))
+    span_id: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("obs_spans.id", ondelete="RESTRICT"),
+    )
+    sequence: Mapped[int] = mapped_column(Integer)
+    event_type: Mapped[str] = mapped_column(Text)
+    severity: Mapped[str] = mapped_column(Text)
+    stage: Mapped[str | None] = mapped_column(Text)
+    payload_json: Mapped[str] = mapped_column(Text, server_default="{}")
+    occurred_at: Mapped[str] = mapped_column(Text)
+
+
+class ModelCallRow(Base):
+    __tablename__ = "obs_model_calls"
+    __table_args__ = (
+        Index("idx_obs_model_calls_trace", "trace_id", "started_at"),
+    )
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    trace_id: Mapped[str] = mapped_column(Text, ForeignKey("obs_traces.id", ondelete="RESTRICT"))
+    run_id: Mapped[str | None] = mapped_column(Text, ForeignKey("obs_runs.id", ondelete="RESTRICT"))
+    span_id: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("obs_spans.id", ondelete="RESTRICT"),
+    )
+    provider: Mapped[str] = mapped_column(Text)
+    model: Mapped[str] = mapped_column(Text)
+    operation: Mapped[str] = mapped_column(Text)
+    prompt_key: Mapped[str | None] = mapped_column(Text)
+    prompt_version: Mapped[str | None] = mapped_column(Text)
+    prompt_version_id: Mapped[str | None] = mapped_column(Text)
+    evaluation_case_id: Mapped[str | None] = mapped_column(Text)
+    experiment_variant_id: Mapped[str | None] = mapped_column(Text)
+    input_tokens: Mapped[int | None] = mapped_column(Integer)
+    output_tokens: Mapped[int | None] = mapped_column(Integer)
+    reasoning_tokens: Mapped[int | None] = mapped_column(Integer)
+    cached_tokens: Mapped[int | None] = mapped_column(Integer)
+    total_tokens: Mapped[int | None] = mapped_column(Integer)
+    estimated_cost: Mapped[float | None] = mapped_column(Float)
+    latency_ms: Mapped[float | None] = mapped_column(Float)
+    time_to_first_token_ms: Mapped[float | None] = mapped_column(Float)
+    finish_reason: Mapped[str | None] = mapped_column(Text)
+    structured_output_valid: Mapped[int | None] = mapped_column(Integer)
+    retry_count: Mapped[int] = mapped_column(Integer, server_default="0")
+    status: Mapped[str] = mapped_column(Text)
+    error_code: Mapped[str | None] = mapped_column(Text)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    input_summary_json: Mapped[str] = mapped_column(Text, server_default="{}")
+    output_summary_json: Mapped[str] = mapped_column(Text, server_default="{}")
+    started_at: Mapped[str] = mapped_column(Text)
+    completed_at: Mapped[str] = mapped_column(Text)
+
+
+class ToolCallRow(Base):
+    __tablename__ = "obs_tool_calls"
+    __table_args__ = (
+        Index("idx_obs_tool_calls_trace", "trace_id", "started_at"),
+        UniqueConstraint("trace_id", "tool_call_id"),
+    )
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    trace_id: Mapped[str] = mapped_column(Text, ForeignKey("obs_traces.id", ondelete="RESTRICT"))
+    run_id: Mapped[str | None] = mapped_column(Text, ForeignKey("obs_runs.id", ondelete="RESTRICT"))
+    span_id: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("obs_spans.id", ondelete="RESTRICT"),
+    )
+    tool_call_id: Mapped[str] = mapped_column(Text)
+    tool_name: Mapped[str] = mapped_column(Text)
+    adapter_key: Mapped[str | None] = mapped_column(Text)
+    operation: Mapped[str] = mapped_column(Text)
+    arguments_json: Mapped[str] = mapped_column(Text, server_default="{}")
+    result_summary_json: Mapped[str] = mapped_column(Text, server_default="{}")
+    status: Mapped[str] = mapped_column(Text)
+    retry_count: Mapped[int] = mapped_column(Integer, server_default="0")
+    timeout_seconds: Mapped[float | None] = mapped_column(Float)
+    latency_ms: Mapped[float | None] = mapped_column(Float)
+    external_request_id: Mapped[str | None] = mapped_column(Text)
+    error_code: Mapped[str | None] = mapped_column(Text)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[str] = mapped_column(Text)
+    completed_at: Mapped[str] = mapped_column(Text)
+
+
+class IssueRow(Base):
+    __tablename__ = "obs_issues"
+    __table_args__ = (
+        Index("idx_obs_issues_project_status", "project_id", "status", "last_seen_at"),
+        UniqueConstraint("project_id", "fingerprint"),
+    )
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    project_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("obs_projects.id", ondelete="RESTRICT"),
+    )
+    fingerprint: Mapped[str] = mapped_column(Text)
+    title: Mapped[str] = mapped_column(Text)
+    issue_type: Mapped[str] = mapped_column(Text)
+    severity: Mapped[str] = mapped_column(Text)
+    component: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text)
+    occurrence_count: Mapped[int] = mapped_column(Integer, server_default="1")
+    affected_trace_count: Mapped[int] = mapped_column(Integer, server_default="1")
+    first_seen_at: Mapped[str] = mapped_column(Text)
+    last_seen_at: Mapped[str] = mapped_column(Text)
+    resolved_at: Mapped[str | None] = mapped_column(Text)
+    reopened_at: Mapped[str | None] = mapped_column(Text)
+    latest_context_json: Mapped[str] = mapped_column(Text, server_default="{}")
+
+
+class IssueOccurrenceRow(Base):
+    __tablename__ = "obs_issue_occurrences"
+    __table_args__ = (
+        Index("idx_obs_occurrences_issue", "issue_id", "occurred_at"),
+    )
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    issue_id: Mapped[str] = mapped_column(Text, ForeignKey("obs_issues.id", ondelete="RESTRICT"))
+    trace_id: Mapped[str] = mapped_column(Text, ForeignKey("obs_traces.id", ondelete="RESTRICT"))
+    run_id: Mapped[str | None] = mapped_column(Text, ForeignKey("obs_runs.id", ondelete="RESTRICT"))
+    span_id: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("obs_spans.id", ondelete="RESTRICT"),
+    )
+    fingerprint: Mapped[str] = mapped_column(Text)
+    issue_type: Mapped[str] = mapped_column(Text)
+    severity: Mapped[str] = mapped_column(Text)
+    component: Mapped[str | None] = mapped_column(Text)
+    error_code: Mapped[str | None] = mapped_column(Text)
+    message: Mapped[str] = mapped_column(Text)
+    context_json: Mapped[str] = mapped_column(Text, server_default="{}")
+    occurred_at: Mapped[str] = mapped_column(Text)
+
+
+class IssueTraceLinkRow(Base):
+    __tablename__ = "obs_issue_trace_links"
+
+    issue_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("obs_issues.id", ondelete="RESTRICT"), primary_key=True,
+    )
+    trace_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("obs_traces.id", ondelete="RESTRICT"), primary_key=True,
+    )
+    created_at: Mapped[str] = mapped_column(Text)
+
+
+class MetricPointRow(Base):
+    __tablename__ = "obs_metric_points"
+    __table_args__ = (
+        Index("idx_obs_metrics_name_time", "metric_name", "recorded_at"),
+    )
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    project_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("obs_projects.id", ondelete="RESTRICT"),
+    )
+    trace_id: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("obs_traces.id", ondelete="RESTRICT"),
+    )
+    run_id: Mapped[str | None] = mapped_column(Text, ForeignKey("obs_runs.id", ondelete="RESTRICT"))
+    span_id: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("obs_spans.id", ondelete="RESTRICT"),
+    )
+    metric_name: Mapped[str] = mapped_column(Text)
+    value: Mapped[float] = mapped_column(Float)
+    unit: Mapped[str | None] = mapped_column(Text)
+    dimensions_json: Mapped[str] = mapped_column(Text, server_default="{}")
+    recorded_at: Mapped[str] = mapped_column(Text)

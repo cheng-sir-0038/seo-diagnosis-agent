@@ -1,10 +1,18 @@
-import type { AgentEvent, AgentTaskStatusGroup, AgentTaskSummary, ChatMessage } from '../types/agent'
+import type { AgentEvent, AgentTaskStatusGroup, AgentTaskSummary, ChatMessage, SpecialistDirectoryData } from '../types/agent'
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? ''
+const CHAT_RUNS = '/api/v1/chat/runs'
 const TERMINAL_EVENTS = new Set<AgentEvent['type']>(['run.completed', 'run.failed', 'run.cancelled', 'run.waiting_for_input'])
 
 export function agentApiUrl(path: string): string {
   return `${API_BASE}${path}`
+}
+
+export async function listWorkspaceTools(conversationId: string, signal?: AbortSignal): Promise<SpecialistDirectoryData> {
+  const query = new URLSearchParams({ conversation_id: conversationId })
+  const response = await fetch(agentApiUrl(`/api/v1/chat/tools?${query}`), { signal })
+  if (!response.ok) throw new Error(`读取工具目录失败（${response.status}）`)
+  return response.json()
 }
 
 export interface CreateRunResponse {
@@ -18,7 +26,7 @@ export interface CreateRunResponse {
 }
 
 export async function submitAgentInput(runId: string, requestId: string, answer: string, action: 'answer' | 'use_available' = 'answer'): Promise<CreateRunResponse> {
-  const response = await fetch(`${API_BASE}/api/v1/seo-agent/chat/runs/${runId}/input`, {
+  const response = await fetch(agentApiUrl(`${CHAT_RUNS}/${runId}/input`), {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ request_id: requestId, answer, action }),
   })
@@ -29,11 +37,6 @@ export async function submitAgentInput(runId: string, requestId: string, answer:
         : `提交补充信息失败（${response.status}）`)
   }
   return response.json() as Promise<CreateRunResponse>
-}
-
-export interface AgentRunContext {
-  siteId: string
-  conversationId?: string
 }
 
 export interface AgentRunDetail {
@@ -73,19 +76,19 @@ export class AgentStreamConnectionError extends Error {
   }
 }
 
-export async function createAgentRun(messages: ChatMessage[], context: AgentRunContext): Promise<CreateRunResponse> {
-  const response = await fetch(agentApiUrl('/api/v1/seo-agent/chat/runs'), {
+export async function createAgentRun(messages: ChatMessage[], conversationId?: string): Promise<CreateRunResponse> {
+  const response = await fetch(agentApiUrl(CHAT_RUNS), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      site_id: context.siteId,
-      conversation_id: context.conversationId,
+      conversation_id: conversationId,
       messages: messages.map(({ role, content }) => ({ role, content })),
     }),
   })
   if (!response.ok) {
     const detail = await response.json().catch(() => ({}))
-    throw new Error(detail.detail ?? `创建 Agent 运行失败（${response.status}）`)
+    throw new Error(typeof detail.detail === 'string' ? detail.detail
+      : detail.detail?.message ?? `创建 Agent 运行失败（${response.status}）`)
   }
   return response.json() as Promise<CreateRunResponse>
 }
@@ -217,13 +220,13 @@ function waitForRetry(delayMs: number, signal?: AbortSignal): Promise<void> {
 }
 
 export async function getAgentRun(runId: string): Promise<AgentRunDetail> {
-  const response = await fetch(`${API_BASE}/api/v1/seo-agent/chat/runs/${runId}`)
+  const response = await fetch(agentApiUrl(`${CHAT_RUNS}/${runId}`))
   if (!response.ok) throw new Error(`读取 Agent 运行失败（${response.status}）`)
   return response.json() as Promise<AgentRunDetail>
 }
 
 export async function resumeAgentRun(runId: string): Promise<{ run_id: string; status: string }> {
-  const response = await fetch(`${API_BASE}/api/v1/seo-agent/chat/runs/${runId}/resume`, { method: 'POST' })
+  const response = await fetch(agentApiUrl(`${CHAT_RUNS}/${runId}/resume`), { method: 'POST' })
   if (!response.ok) throw new Error(`恢复 Agent 运行失败（${response.status}）`)
   return response.json() as Promise<{ run_id: string; status: string }>
 }

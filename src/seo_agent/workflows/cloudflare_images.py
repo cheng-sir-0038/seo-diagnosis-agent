@@ -51,7 +51,7 @@ class CloudflareShareImages:
 
     @property
     def directory(self) -> Path:
-        return self.config.seo_agent_sqlite_path.with_suffix(".share-images")
+        return self.config.share_image_directory
 
     async def generate(self, prompt: str, *, width: int, height: int) -> ShareImageAsset:
         account = self.config.cloudflare_account_id

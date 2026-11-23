@@ -4,8 +4,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from sqlalchemy import insert, select
 
 from src.observability.client import ObservabilityClient
+from src.observability.schema import TraceLinkRow
 from src.observability.storage import ObservabilityDatabase
 from src.promptops.registry import PromptRegistry
 from src.seo_agent.approvals.policy import ActionPolicy
@@ -14,6 +16,7 @@ from src.seo_agent.automation.models import DeliveryReviewOutput
 from src.seo_agent.automation.prompts import SeoPromptSeeder
 from src.seo_agent.automation.structured import StructuredModelAutomation
 from src.seo_agent.db.database import SeoAgentDatabase
+from src.seo_agent.db.models import TABLES
 from src.seo_agent.diagnosis.contracts import DiagnosisCoordinator, DiagnosisRequest
 from src.seo_agent.monitoring.execution import (
     IndexingObservation,
@@ -170,10 +173,10 @@ def test_action_policy_is_specific_versioned_and_fail_closed() -> None:
 
 @pytest.mark.asyncio
 async def test_prd_and_review_business_outputs_store_prompt_version(
-    tmp_path: Path, approve_opportunity
+    pg_url, tmp_path: Path, approve_opportunity
 ) -> None:
-    business = SeoAgentDatabase(tmp_path / "seo-agent.db")
-    observability = ObservabilityDatabase(tmp_path / "observability.db")
+    business = SeoAgentDatabase(pg_url)
+    observability = ObservabilityDatabase(pg_url)
     await business.startup()
     await observability.startup()
     registry = PromptRegistry(observability)
@@ -193,12 +196,25 @@ async def test_prd_and_review_business_outputs_store_prompt_version(
     )
     now = "2026-07-24T00:00:00+00:00"
     await business.execute(
-        "INSERT INTO opportunities(id, site_id, fingerprint, normalized_intent, opportunity_type, "
-        "target_country, target_language, title, current_score, priority_level, status, "
-        "current_summary, policy_version, first_seen_at, last_seen_at, created_at, updated_at) "
-        "VALUES ('opp-1', ?, 'fp', 'maintenance cost', 'CONTENT_GAP', 'US', 'en', "
-        "'Maintenance Cost', 88, 'HIGH', 'WAITING_FOR_DECISION', 'pricing gap', 'v1', ?, ?, ?, ?)",
-        (site["id"], now, now, now, now),
+        insert(TABLES['opportunities']).values(
+            id='opp-1',
+            site_id=site['id'],
+            fingerprint='fp',
+            normalized_intent='maintenance cost',
+            opportunity_type='CONTENT_GAP',
+            target_country='US',
+            target_language='en',
+            title='Maintenance Cost',
+            current_score=88,
+            priority_level='HIGH',
+            status='WAITING_FOR_DECISION',
+            current_summary='pricing gap',
+            policy_version='v1',
+            first_seen_at=now,
+            last_seen_at=now,
+            created_at=now,
+            updated_at=now,
+        ),
     )
     await approve_opportunity(business, site["id"], "opp-1", owner["id"])
     tasks = TaskDeliveryService(business, artifact_root=tmp_path / "artifacts")
@@ -253,8 +269,8 @@ async def test_prd_and_review_business_outputs_store_prompt_version(
 
 
 @pytest.mark.asyncio
-async def test_trace_links_are_queryable_from_both_sides(tmp_path: Path) -> None:
-    database = ObservabilityDatabase(tmp_path / "observability.db")
+async def test_trace_links_are_queryable_from_both_sides(pg_url) -> None:
+    database = ObservabilityDatabase(pg_url)
     await database.startup()
     client = ObservabilityClient(database, project_key="seo-agent")
     try:
@@ -278,10 +294,10 @@ async def test_trace_links_are_queryable_from_both_sides(tmp_path: Path) -> None
 
 @pytest.mark.asyncio
 async def test_monitoring_check_runs_in_new_linked_trace(
-    tmp_path: Path, approve_opportunity
+    pg_url, tmp_path: Path, approve_opportunity
 ) -> None:
-    business = SeoAgentDatabase(tmp_path / "seo-agent.db")
-    obs_db = ObservabilityDatabase(tmp_path / "observability.db")
+    business = SeoAgentDatabase(pg_url)
+    obs_db = ObservabilityDatabase(pg_url)
     await business.startup()
     await obs_db.startup()
     observer = ObservabilityClient(obs_db, project_key="seo-agent")
@@ -296,12 +312,24 @@ async def test_monitoring_check_runs_in_new_linked_trace(
     owner = await system.create_actor(actor_type="USER", name="Owner", email="owner@test.com")
     now = "2026-07-24T00:00:00+00:00"
     await business.execute(
-        "INSERT INTO opportunities(id, site_id, fingerprint, normalized_intent, opportunity_type, "
-        "target_country, target_language, title, current_score, priority_level, status, "
-        "policy_version, first_seen_at, last_seen_at, created_at, updated_at) "
-        "VALUES ('opp-1', ?, 'fp', 'intent', 'CONTENT_GAP', 'US', 'en', 'Opportunity', "
-        "85, 'HIGH', 'WAITING_FOR_DECISION', 'v1', ?, ?, ?, ?)",
-        (site["id"], now, now, now, now),
+        insert(TABLES['opportunities']).values(
+            id='opp-1',
+            site_id=site['id'],
+            fingerprint='fp',
+            normalized_intent='intent',
+            opportunity_type='CONTENT_GAP',
+            target_country='US',
+            target_language='en',
+            title='Opportunity',
+            current_score=85,
+            priority_level='HIGH',
+            status='WAITING_FOR_DECISION',
+            policy_version='v1',
+            first_seen_at=now,
+            last_seen_at=now,
+            created_at=now,
+            updated_at=now,
+        ),
     )
     await approve_opportunity(business, site["id"], "opp-1", owner["id"])
     tasks = TaskDeliveryService(business, artifact_root=tmp_path / "artifacts")
@@ -390,8 +418,9 @@ async def test_monitoring_check_runs_in_new_linked_trace(
         assert plan is not None
         assert plan["origin_trace_id"] == origin_trace_id
         check = await business.fetch_one(
-            "SELECT * FROM monitoring_checks WHERE monitoring_plan_id = ? ORDER BY sequence_no",
-            (plan["id"],),
+            select(TABLES["monitoring_checks"])
+            .where(TABLES["monitoring_checks"].c.monitoring_plan_id == plan["id"])
+            .order_by(TABLES["monitoring_checks"].c.sequence_no),
         )
         assert check is not None
         execution = MonitoringExecutionService(business, monitoring, observer)
@@ -400,13 +429,17 @@ async def test_monitoring_check_runs_in_new_linked_trace(
             collector=FakeIndexingCollector(),
         )
         stored_check = await business.fetch_one(
-            "SELECT * FROM monitoring_checks WHERE id = ?", (check["id"],)
+            select(TABLES["monitoring_checks"]).where(
+                TABLES["monitoring_checks"].c.id == check["id"]
+            )
         )
         assert stored_check is not None
         assert stored_check["trace_id"] == result.trace_id
         link = await obs_db.fetch_one(
-            "SELECT * FROM obs_trace_links WHERE source_trace_id = ? AND target_trace_id = ?",
-            (origin_trace_id, result.trace_id),
+            select(TraceLinkRow.__table__).where(
+                TraceLinkRow.source_trace_id == origin_trace_id,
+                TraceLinkRow.target_trace_id == result.trace_id,
+            ),
         )
         assert link is not None
         assert link["relation_type"] == "FOLLOW_UP"
@@ -424,14 +457,17 @@ async def test_monitoring_check_runs_in_new_linked_trace(
             ),
         )
         stored_ranking = await business.fetch_one(
-            "SELECT * FROM monitoring_checks WHERE id = ?",
-            (ranking_check["id"],),
+            select(TABLES["monitoring_checks"]).where(
+                TABLES["monitoring_checks"].c.id == ranking_check["id"]
+            ),
         )
         assert stored_ranking is not None
         assert stored_ranking["trace_id"] == ranking_result["execution_trace_id"]
         ranking_link = await obs_db.fetch_one(
-            "SELECT * FROM obs_trace_links WHERE source_trace_id = ? AND target_trace_id = ?",
-            (origin_trace_id, ranking_result["execution_trace_id"]),
+            select(TraceLinkRow.__table__).where(
+                TraceLinkRow.source_trace_id == origin_trace_id,
+                TraceLinkRow.target_trace_id == ranking_result["execution_trace_id"],
+            ),
         )
         assert ranking_link is not None
     finally:

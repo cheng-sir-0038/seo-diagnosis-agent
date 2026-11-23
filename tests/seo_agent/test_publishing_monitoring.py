@@ -1,13 +1,24 @@
 from __future__ import annotations
 
 # ruff: noqa: E501
+import asyncio
 from pathlib import Path
 
 import pytest
+from aiohttp import web
+from sqlalchemy import func, insert, select, update
 
 from src.observability.client import ObservabilityClient
+from src.observability.schema import ToolCallRow
 from src.observability.storage import ObservabilityDatabase
 from src.seo_agent.db.database import SeoAgentDatabase
+from src.seo_agent.db.models import (
+    DeliveryRow,
+    MonitoringCheckRow,
+    MonitoringOutcomeGoalRow,
+    OpportunityRow,
+    PublishRecordRow,
+)
 from src.seo_agent.monitoring.service import MonitoringService
 from src.seo_agent.publishing.html_site import (
     HtmlPublishRequest,
@@ -21,8 +32,24 @@ from src.seo_agent.tasks.service import TaskDeliveryService
 
 
 @pytest.fixture
-async def context(tmp_path: Path, approve_opportunity):
-    db = SeoAgentDatabase(tmp_path / "seo-agent.db")
+async def published_site(tmp_path: Path):
+    directory = tmp_path / "site"
+    directory.mkdir()
+    app = web.Application()
+    app.router.add_static("/", directory)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    try:
+        await web.TCPSite(runner, "127.0.0.1", 0).start()
+        port = runner.addresses[0][1]
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        await runner.cleanup()
+
+
+@pytest.fixture
+async def context(tmp_path: Path, approve_opportunity, pg_url: str):
+    db = SeoAgentDatabase(pg_url)
     await db.startup()
     system = SeoAgentSystemService(db)
     site = await system.create_site(
@@ -38,8 +65,24 @@ async def context(tmp_path: Path, approve_opportunity):
     )
     now = "2026-07-23T00:00:00+00:00"
     await db.execute(
-        "INSERT INTO opportunities(id, site_id, fingerprint, normalized_intent, opportunity_type, target_country, target_language, title, current_score, priority_level, status, policy_version, first_seen_at, last_seen_at, created_at, updated_at) VALUES ('opp-1', ?, 'fp', 'intent', 'CONTENT_GAP', 'US', 'en', 'Opportunity', 85, 'HIGH', 'WAITING_FOR_DECISION', 'v1', ?, ?, ?, ?)",
-        (site["id"], now, now, now, now),
+        insert(OpportunityRow).values(
+            id="opp-1",
+            site_id=site["id"],
+            fingerprint="fp",
+            normalized_intent="intent",
+            opportunity_type="CONTENT_GAP",
+            target_country="US",
+            target_language="en",
+            title="Opportunity",
+            current_score=85,
+            priority_level="HIGH",
+            status="WAITING_FOR_DECISION",
+            policy_version="v1",
+            first_seen_at=now,
+            last_seen_at=now,
+            created_at=now,
+            updated_at=now,
+        )
     )
     await approve_opportunity(db, site["id"], "opp-1", owner["id"])
     tasks = TaskDeliveryService(db, artifact_root=tmp_path / "artifacts")
@@ -108,8 +151,10 @@ async def test_html_site_publisher_writes_atomic_file_and_rejects_traversal(tmp_
 
 
 @pytest.mark.asyncio
-async def test_html_site_publish_is_persisted_as_observed_tool_call(tmp_path: Path) -> None:
-    database = ObservabilityDatabase(tmp_path / "publish-observability.db")
+async def test_html_site_publish_is_persisted_as_observed_tool_call(
+    tmp_path: Path, pg_url: str
+) -> None:
+    database = ObservabilityDatabase(pg_url)
     await database.startup()
     client = ObservabilityClient(database, project_key="seo-agent")
     adapter = HtmlSitePublishAdapter(
@@ -128,7 +173,7 @@ async def test_html_site_publish_is_persisted_as_observed_tool_call(tmp_path: Pa
                 idempotency_key="publish:observed",
             )
         )
-        call = await database.fetch_one("SELECT * FROM obs_tool_calls")
+        call = await database.fetch_one(select(ToolCallRow.__table__))
         assert result.success is True
         assert call is not None
         assert call["tool_name"] == "html_site.publish"
@@ -152,67 +197,80 @@ async def test_publish_rejects_html_that_was_not_in_the_accepted_delivery(
     service = PublishingService(db, adapter, MonitoringService(db))
     if stored_content is not None:
         await db.execute(
-            "UPDATE deliveries SET structured_content_json = ? WHERE id = ?",
-            (stored_content, delivery["id"]),
+            update(DeliveryRow)
+            .where(DeliveryRow.id == delivery["id"])
+            .values(
+                structured_content_json=stored_content,
+            )
         )
 
     with pytest.raises(ValueError, match="验收"):
         await service.publish_delivery(
-            task_id=task["id"], delivery_id=delivery["id"], slug="guide",
-            html_content=html_content, submitted_by_actor_id=owner["id"],
-            idempotency_key="publish:unreviewed", target_environment="preview",
+            task_id=task["id"],
+            delivery_id=delivery["id"],
+            slug="guide",
+            html_content=html_content,
+            submitted_by_actor_id=owner["id"],
+            idempotency_key="publish:unreviewed",
+            target_environment="preview",
         )
     assert not (tmp_path / "site/guide.html").exists()
-    assert await db.fetch_value("SELECT COUNT(*) FROM publish_records") == 0
+    assert await db.fetch_value(select(func.count()).select_from(PublishRecordRow)) == 0
 
 
 @pytest.mark.asyncio
-async def test_publish_confirmation_creates_default_indexing_checks(context) -> None:
+async def test_publish_confirmation_creates_default_indexing_checks(
+    context, published_site
+) -> None:
     db, _, owner, task, delivery, tmp_path = context
     adapter = HtmlSitePublishAdapter(
         HtmlSiteSettings(
-            root_path=tmp_path / "site", base_url="https://example.com", content_subdir="pages"
+            root_path=tmp_path / "site", base_url=published_site, content_subdir="pages"
         )
     )
     monitoring = MonitoringService(db)
     service = PublishingService(db, adapter, monitoring)
-    record = await service.publish_delivery(
-        task_id=task["id"],
-        delivery_id=delivery["id"],
-        slug="guide",
-        html_content="<h1>Guide</h1>",
-        submitted_by_actor_id=owner["id"],
-        idempotency_key="publish:guide",
-        target_environment="preview",
-    )
-    repeated = await service.publish_delivery(
-        task_id=task["id"],
-        delivery_id=delivery["id"],
-        slug="guide",
-        html_content="<h1>Guide</h1>",
-        submitted_by_actor_id=owner["id"],
-        idempotency_key="publish:guide",
-        target_environment="preview",
-    )
+
+    async def publish():
+        return await service.publish_delivery(
+            task_id=task["id"],
+            delivery_id=delivery["id"],
+            slug="guide",
+            html_content="<h1>Guide</h1>",
+            submitted_by_actor_id=owner["id"],
+            idempotency_key="publish:guide",
+            target_environment="preview",
+        )
+
+    record, repeated = await asyncio.gather(publish(), publish())
     assert repeated["id"] == record["id"]
-    confirmed = await service.confirm_publish(
-        record["id"], confirmed_by_actor_id=owner["id"], published_url=record["candidate_url"]
-    )
+
+    async def confirm():
+        return await service.confirm_publish(
+            record["id"], confirmed_by_actor_id=owner["id"], published_url=record["candidate_url"]
+        )
+
+    confirmed, replay = await asyncio.gather(confirm(), confirm())
+    assert confirmed["confirmed_at"] == replay["confirmed_at"]
     plan = await monitoring.get_plan_by_publish(record["id"])
     assert confirmed["status"] == "CONFIRMED"
+    assert confirmed["error_code"] is None
     assert plan is not None
     checks = await db.fetch_all(
-        "SELECT * FROM monitoring_checks WHERE monitoring_plan_id = ? ORDER BY sequence_no",
-        (plan["id"],),
+        select(MonitoringCheckRow.__table__)
+        .where(MonitoringCheckRow.monitoring_plan_id == plan["id"])
+        .order_by(MonitoringCheckRow.sequence_no)
     )
     assert [item["sequence_no"] for item in checks] == [1, 2, 3, 4]
 
 
 @pytest.mark.asyncio
-async def test_indexing_then_ranking_goal_evaluation_is_deterministic(context) -> None:
+async def test_indexing_then_ranking_goal_evaluation_is_deterministic(
+    context, published_site
+) -> None:
     db, _, owner, task, delivery, tmp_path = context
     adapter = HtmlSitePublishAdapter(
-        HtmlSiteSettings(root_path=tmp_path / "site", base_url="https://example.com")
+        HtmlSiteSettings(root_path=tmp_path / "site", base_url=published_site)
     )
     monitoring = MonitoringService(db)
     publishing = PublishingService(db, adapter, monitoring)
@@ -239,8 +297,9 @@ async def test_indexing_then_ranking_goal_evaluation_is_deterministic(context) -
     )
     check = (
         await db.fetch_all(
-            "SELECT * FROM monitoring_checks WHERE monitoring_plan_id = ? ORDER BY sequence_no",
-            (plan["id"],),
+            select(MonitoringCheckRow.__table__)
+            .where(MonitoringCheckRow.monitoring_plan_id == plan["id"])
+            .order_by(MonitoringCheckRow.sequence_no)
         )
     )[0]
     await monitoring.record_indexing_result(
@@ -252,8 +311,10 @@ async def test_indexing_then_ranking_goal_evaluation_is_deterministic(context) -
     )
     outcome = await monitoring.evaluate_plan(plan["id"])
     link = await db.fetch_one(
-        "SELECT * FROM monitoring_outcome_goals WHERE monitoring_outcome_id = ? AND monitoring_goal_id = ?",
-        (outcome["id"], goal["id"]),
+        select(MonitoringOutcomeGoalRow.__table__).where(
+            MonitoringOutcomeGoalRow.monitoring_outcome_id == outcome["id"],
+            MonitoringOutcomeGoalRow.monitoring_goal_id == goal["id"],
+        )
     )
     assert outcome["outcome"] == "EFFECTIVE"
     assert link["status"] == "ACHIEVED"

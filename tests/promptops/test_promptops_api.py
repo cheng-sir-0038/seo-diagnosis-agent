@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 from httpx import ASGITransport, AsyncClient
 
@@ -14,10 +12,8 @@ from src.server import app
 
 
 @pytest.mark.asyncio
-async def test_promptops_api_manages_prompt_versions_and_dataset(
-    tmp_path: Path, monkeypatch
-) -> None:
-    database = ObservabilityDatabase(tmp_path / "api.db")
+async def test_promptops_api_manages_prompt_versions_and_dataset(pg_url: str, monkeypatch) -> None:
+    database = ObservabilityDatabase(pg_url)
     await database.startup()
     registry = PromptRegistry(database)
     await registry.startup()

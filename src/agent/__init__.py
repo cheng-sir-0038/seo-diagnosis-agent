@@ -7,11 +7,15 @@ from src.agent.config import (
     Skill,
     SkillRegistry,
 )
-from src.agent.loop import AgentLoop
 from src.agent.run_manager import RunManager, run_manager
+from src.agent.runtime.executor import AgentExecutor
+
+# Compatibility for callers importing the former public class from src.agent.
+AgentLoop = AgentExecutor
 
 __all__ = [
     "AgentConfig",
+    "AgentExecutor",
     "AgentLoop",
     "AgentPromptRenderer",
     "RenderedAgentPrompt",

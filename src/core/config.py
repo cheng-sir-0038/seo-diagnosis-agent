@@ -17,7 +17,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -36,8 +36,7 @@ class Settings(BaseSettings):
         host: FastAPI 服务绑定地址。
         port: FastAPI 服务绑定端口。
 
-        redis_url: Redis 连接地址，用于短期热缓存（TTL 自动过期）。
-        sqlite_path: SQLite 数据库文件路径，用于证据快照和历史数据持久化。
+        database_url: PostgreSQL 连接地址，用于业务、证据、观测和运行检查点。
         cache_default_ttl: 缓存默认过期时间（秒）。
 
         ahrefs_api_base_url: Ahrefs API v3 基础地址。
@@ -67,8 +66,8 @@ class Settings(BaseSettings):
     port: int = 8000
 
     # ---- 缓存与存储 ----
-    redis_url: str = "redis://localhost:6379/0"
-    sqlite_path: Path = Path("data/evidence.db")
+    database_url: str = Field(default="postgresql://seo_agent@127.0.0.1:5432/seo_agent", repr=False)
+    database_schema: str | None = None
     cache_default_ttl: int = 300  # 5 分钟
 
     # ---- Serper.dev API (实时 Google SERP) ----
@@ -142,8 +141,7 @@ class Settings(BaseSettings):
     agent_chat_recovery_enabled: bool = True
 
     # ---- SEO Agent persistence ----
-    seo_agent_sqlite_path: Path = Path("data/seo-agent.db")
-    langgraph_checkpoint_sqlite_path: Path = Path("data/langgraph-checkpoints.db")
+    share_image_directory: Path = Path("data/share-images")
     seo_agent_graph_version: str = "v1"
     seo_agent_policy_version: str = "v1"
 
@@ -173,7 +171,6 @@ class Settings(BaseSettings):
     automation_schedule_sync_minutes: int = 5
 
     # ---- Agent Observability Core ----
-    observability_sqlite_path: Path = Path("data/agent-observability.db")
     observability_project_key: str = "seo-agent"
     observability_project_name: str = "SEO Agent"
     observability_service_name: str = "seo-agent-api"

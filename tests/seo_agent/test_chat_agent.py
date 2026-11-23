@@ -5,11 +5,11 @@ from typing import Any
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from src.agent.loop import AgentLoop
 from src.agent.models import RunStatus
 from src.agent.providers.base import ModelChunk, ToolCall
 from src.agent.providers.fake import FakeModelProvider
 from src.agent.run_manager import RunManager, run_manager
+from src.agent.runtime.executor import AgentExecutor
 from src.models.common import Capability
 from src.seo_agent.chat.presentation import build_presentation
 from src.seo_agent.chat.runtime import build_seo_system_prompt
@@ -110,7 +110,7 @@ async def test_seo_agent_chooses_next_tool_after_reading_previous_result() -> No
         ]
     )
 
-    await AgentLoop(provider, registry, max_iterations=5).run(run)
+    await AgentExecutor(provider, registry, max_iterations=5).run(run)
 
     assert run.status == RunStatus.COMPLETED
     assert provider.calls == 3
@@ -178,7 +178,7 @@ def test_seo_system_prompt_contains_site_context_and_autonomous_tool_rules() -> 
 
 @pytest.mark.asyncio
 async def test_seo_chat_api_creates_site_bound_run(monkeypatch) -> None:
-    from src.api.routes import seo_agent_chat as route
+    from src.api.routes.workspace import conversations as route
 
     async def get_site(site_id: str) -> dict[str, Any]:
         assert site_id == "site_1"
@@ -186,7 +186,7 @@ async def test_seo_chat_api_creates_site_bound_run(monkeypatch) -> None:
 
     monkeypatch.setattr(route.seo_agent_system_service, "get_site", get_site)
     monkeypatch.setattr(
-        route, "build_seo_model_provider", lambda: FakeModelProvider.text("分析完成")
+        route, "build_conversation_model", lambda: FakeModelProvider.text("分析完成")
     )
     monkeypatch.setattr(
         route,
@@ -257,7 +257,7 @@ def test_registry_keeps_site_metrics_for_questions_that_may_need_them(
 
 @pytest.mark.asyncio
 async def test_seo_chat_api_rejects_when_no_live_tools(monkeypatch) -> None:
-    from src.api.routes import seo_agent_chat as route
+    from src.api.routes.workspace import conversations as route
 
     async def get_site(_site_id: str) -> dict[str, Any]:
         return SITE

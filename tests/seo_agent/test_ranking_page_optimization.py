@@ -4,11 +4,11 @@ import asyncio
 
 import pytest
 
-from src.agent.loop import AgentLoop
 from src.agent.models import RunStatus
 from src.agent.providers.base import ModelChunk, ToolCall
 from src.agent.providers.fake import FakeModelProvider
 from src.agent.run_manager import RunManager
+from src.agent.runtime.executor import AgentExecutor
 from src.core.exceptions import InternalProviderRequestError
 from src.models.common import Capability
 from src.seo_agent.chat.tools import build_seo_agent_registry
@@ -41,7 +41,7 @@ async def test_agent_loop_can_execute_ranking_page_workflow_and_render_cards():
         ]
     )
     run = RunManager().create_run([{"role": "user", "content": "看看已有排名页面怎么优化"}])
-    await AgentLoop(model, registry).run(run)
+    await AgentExecutor(model, registry).run(run)
     assert run.status == RunStatus.COMPLETED
     event = next(event for event in run.events if event.type == "tool.completed")
     assert event.payload["render_hint"] == "cards"

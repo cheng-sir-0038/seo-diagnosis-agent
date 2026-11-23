@@ -7,12 +7,15 @@ from src.agent.models import AgentRun, RunStatus
 from src.agent.providers.base import ModelProvider
 from src.agent.tools.base import ToolProtocol, ToolResult, ToolRuntimeContext
 from src.observability.client import ObservabilityClient, RunScope, SpanScope, TraceScope
+from src.observability.context import get_current_context
 from src.observability.instrumentation import observed_operation
 from src.observability.models import Severity, SpanKind, Status
 
+EXECUTOR_WORKFLOW = "agent-executor"
+
 
 class AgentRunObserver:
-    """把通用 Agent Loop 事件同步到 Agent Observability Core。"""
+    """记录 Agent 执行器的模型、工具与运行事件。"""
 
     def __init__(
         self,
@@ -21,7 +24,7 @@ class AgentRunObserver:
         operation_name: str,
         session_id: str | None = None,
         agent_name: str | None = None,
-        workflow_name: str = "agent-loop",
+        workflow_name: str = EXECUTOR_WORKFLOW,
     ) -> None:
         self.client = client
         self.operation_name = operation_name
@@ -115,7 +118,7 @@ class AgentRunObserver:
     ) -> None:
         if self.run_scope is None:
             return
-        async with self.run_scope.span(
+        async with self.span(
             f"{tool_name}.reused", kind=SpanKind.TOOL, component_name=tool_name,
             input_data=arguments, metadata={"reused": True},
         ) as span:
@@ -153,12 +156,14 @@ class AgentRunObserver:
     ) -> SpanScope | None:
         if self.run_scope is None:
             return None
+        context = get_current_context()
         return self.run_scope.span(
             operation_name,
             kind=kind,
             component_name=component_name,
             input_data=input_data,
             metadata=metadata,
+            parent_span_id=context.span_id if context and context.run_id == self.run_id else None,
         )
 
 

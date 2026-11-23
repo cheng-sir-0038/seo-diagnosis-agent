@@ -110,7 +110,9 @@ class PageChangeReviewWorkflow(AgentTool):
                         "fields": {key: baseline["data"][key] for key in FIELDS},
                     }
         else:
-            url = normalize_site_url(options.url or self.site["domain"])
+            url = normalize_site_url(
+                options.url or self.site.get("target_url") or self.site["domain"]
+            )
         if normalized_host(url) != normalized_host(self.site["domain"]):
             raise ValueError("页面复检只允许当前站点的页面")
         current = await steps.run(

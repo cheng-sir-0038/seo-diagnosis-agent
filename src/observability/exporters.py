@@ -18,9 +18,11 @@ from opentelemetry.sdk.trace.export import (
     SpanExporter,
 )
 from opentelemetry.trace import Link, NonRecordingSpan, Status, StatusCode, set_span_in_context
+from sqlalchemy import select
 
 from src.observability.models import ExportEnvelope, SpanKind
 from src.observability.otel_ids import ExplicitIdGenerator, span_context_from_hex
+from src.observability.schema import TraceRow
 from src.observability.storage import ObservabilityDatabase
 
 
@@ -52,8 +54,7 @@ class JsonlExporter:
 class OpenTelemetryExporter:
     """把内部 Trace 镜像为标准 OpenTelemetry Span。
 
-    SQLite 是内部真源；OTLP 仅是可选外部出口。内部 `obs_trace_links`
-    会在目标根 Span 创建时转换为 OpenTelemetry `Link`，而不是额外伪 Span。
+    PostgreSQL 保存内部记录。OTLP 导出根 Span 时将关联的 Trace 转成 OpenTelemetry Link。
     """
 
     def __init__(
@@ -93,8 +94,9 @@ class OpenTelemetryExporter:
             if self.database is None:
                 return
             trace = await self.database.fetch_one(
-                "SELECT otel_trace_id, otel_root_span_id FROM obs_traces WHERE id = ?",
-                (envelope.payload.get("trace_id"),),
+                select(TraceRow.otel_trace_id, TraceRow.otel_root_span_id).where(
+                    TraceRow.id == envelope.payload.get("trace_id")
+                )
             )
             if trace is None:
                 return

@@ -213,7 +213,7 @@ def _fit_character_budget(
         return messages
     fitted = [dict(item) for item in messages]
     # Preserve roles, tool-call relationships and the newest user intent. Only
-    # textual content is shortened; full content remains durable in SQLite.
+    # textual content is shortened; full content remains durable in the checkpoint.
     for message in fitted:
         content = message.get("content")
         if not isinstance(content, str) or len(content) <= 500:

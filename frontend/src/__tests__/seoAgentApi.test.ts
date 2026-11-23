@@ -15,22 +15,22 @@ describe('SEO Agent API', () => {
     vi.unstubAllGlobals()
   })
 
-  it('creates a site-bound SEO Agent run', async () => {
+  it('creates a business chat run with just the conversation and messages', async () => {
     const fetchMock = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(() => Promise.resolve(new Response(JSON.stringify({
       run_id: 'run_1',
       task_id: 'agtask_1',
       thread_id: 'chat_1',
       status: 'pending',
-      events_url: '/api/v1/seo-agent/chat/runs/run_1/events',
-      cancel_url: '/api/v1/seo-agent/chat/runs/run_1/cancel',
+      events_url: '/api/v1/chat/runs/run_1/events',
+      cancel_url: '/api/v1/chat/runs/run_1/cancel',
     }), { status: 201, headers: { 'Content-Type': 'application/json' } })))
     vi.stubGlobal('fetch', fetchMock)
 
-    await createAgentRun([message], { siteId: 'site_1', conversationId: 'conversation_1' })
+    await createAgentRun([message], 'conversation_1')
 
-    expect(fetchMock).toHaveBeenCalledWith('/api/v1/seo-agent/chat/runs', expect.objectContaining({ method: 'POST' }))
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/chat/runs', expect.objectContaining({ method: 'POST' }))
     const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body))
-    expect(body).toMatchObject({ site_id: 'site_1', conversation_id: 'conversation_1' })
+    expect(body).toEqual({ messages: [{ role: 'user', content: message.content }], conversation_id: 'conversation_1' })
   })
 
   it('loads persisted Agent tasks by site and status group', async () => {
@@ -115,9 +115,9 @@ it('reads and resumes an existing Agent run', async () => {
 
   expect(detail.status).toBe('FAILED')
   expect(resumed.status).toBe('recovering')
-  expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/seo-agent/chat/runs/run_1')
+  expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/chat/runs/run_1')
   expect(fetchMock.mock.calls[1]).toEqual([
-    '/api/v1/seo-agent/chat/runs/run_1/resume',
+    '/api/v1/chat/runs/run_1/resume',
     { method: 'POST' },
   ])
 })

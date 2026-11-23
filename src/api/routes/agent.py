@@ -8,12 +8,12 @@ from fastapi import APIRouter, HTTPException, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from src.agent.loop import AgentLoop
 from src.agent.models import AgentEvent
 from src.agent.observability import AgentRunObserver
 from src.agent.providers.base import ModelProvider
 from src.agent.providers.deepseek import DeepSeekProvider
 from src.agent.run_manager import run_manager
+from src.agent.runtime.executor import AgentExecutor
 from src.agent.tools.registry import build_default_registry
 from src.core.config import settings
 from src.observability.runtime import observability_client, observability_database
@@ -60,7 +60,7 @@ async def _execute(
         if observability_database.started
         else None
     )
-    loop = AgentLoop(
+    executor = AgentExecutor(
         provider,
         build_default_registry(),
         max_iterations=settings.agent_max_iterations,
@@ -68,7 +68,7 @@ async def _execute(
         tool_timeout=settings.agent_tool_timeout,
         observer=observer,
     )
-    await loop.run(run)
+    await executor.run(run)
 
 
 @router.post("/runs", response_model=CreateRunResponse, status_code=status.HTTP_201_CREATED)

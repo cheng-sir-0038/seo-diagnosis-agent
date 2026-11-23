@@ -5,20 +5,25 @@ import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 
-import aiosqlite
 import pytest
+from sqlalchemy import func, insert, select, update
+from sqlalchemy.exc import IntegrityError
 
 from src.seo_agent.approvals.service import ApprovalService
 from src.seo_agent.artifacts.renderers import MarkdownPrdRenderer, PdfPrdRenderer
 from src.seo_agent.db.database import SeoAgentDatabase
+from src.seo_agent.db.models import TABLES
 from src.seo_agent.services.system import SeoAgentSystemService
 from src.seo_agent.tasks.models import TaskPrdContent
 from src.seo_agent.tasks.service import TaskDeliveryService
 
+opportunities = TABLES["opportunities"]
+actions = TABLES["approval_actions"]
+
 
 @pytest.fixture
-async def context(tmp_path: Path):
-    db = SeoAgentDatabase(tmp_path / "seo-agent.db")
+async def context(tmp_path: Path, pg_url):
+    db = SeoAgentDatabase(pg_url)
     await db.startup()
     system = SeoAgentSystemService(db)
     site = await system.create_site(
@@ -36,20 +41,13 @@ async def context(tmp_path: Path):
     opportunity_ids = []
     for index in range(2):
         oid = f"opp-{index}"
-        await db.execute(
-            "INSERT INTO opportunities(id, site_id, fingerprint, normalized_intent, opportunity_type, target_country, target_language, title, current_score, priority_level, status, policy_version, first_seen_at, last_seen_at, created_at, updated_at) VALUES (?, ?, ?, ?, 'CONTENT_GAP', 'US', 'en', ?, 85, 'HIGH', 'WAITING_FOR_DECISION', 'v1', ?, ?, ?, ?)",
-            (
-                oid,
-                site["id"],
-                f"fp-{index}",
-                f"intent-{index}",
-                f"Opportunity {index}",
-                now,
-                now,
-                now,
-                now,
-            ),
-        )
+        await db.execute(insert(opportunities).values(
+            id=oid, site_id=site["id"], fingerprint=f"fp-{index}", normalized_intent=f"intent-{index}",
+            opportunity_type="CONTENT_GAP", target_country="US", target_language="en",
+            title=f"Opportunity {index}", current_score=85, priority_level="HIGH",
+            status="WAITING_FOR_DECISION", policy_version="v1", first_seen_at=now, last_seen_at=now,
+            created_at=now, updated_at=now,
+        ))
         approvals = ApprovalService(db)
         action = await approvals.create_action(
             site_id=site["id"], action_type="ADD_OPPORTUNITY_TO_PRODUCTION", risk_level="HIGH",
@@ -140,7 +138,7 @@ async def test_review_with_unmet_criteria_cannot_accept_delivery(context, proble
         status="ACCEPTED", score=95, **{problem: [{"item": "缺少必要证据"}]},
     )
     assert review["status"] == "REVISION_REQUIRED"
-    assert await db.fetch_value("SELECT status FROM deliveries WHERE id = ?", (delivery["id"],)) == "REVISION_REQUIRED"
+    assert await db.fetch_value(select(TABLES["deliveries"].c.status).where(TABLES["deliveries"].c.id == delivery["id"])) == "REVISION_REQUIRED"
     assert (await service.get_task(task["id"]))["status"] == "REVISION_REQUIRED"
 
 
@@ -150,7 +148,7 @@ async def test_task_rejects_pending_opportunity_without_creating_records(context
     opportunity_id = opportunity_ids[0]
     approvals = ApprovalService(db)
     action = await db.fetch_one(
-        "SELECT id FROM approval_actions WHERE target_id = ?", (opportunity_id,)
+        select(actions.c.id).where(actions.c.target_id == opportunity_id)
     )
     assert action is not None
     await approvals.decide(
@@ -161,8 +159,8 @@ async def test_task_rejects_pending_opportunity_without_creating_records(context
             site_id=site["id"], title="Guide", task_type="ARTICLE", priority="HIGH",
             opportunity_ids=[opportunity_ids[1], opportunity_id], owner_actor_id=owner["id"],
         )
-    assert await db.fetch_value("SELECT COUNT(*) FROM execution_tasks") == 0
-    assert await db.fetch_value("SELECT COUNT(*) FROM task_opportunities") == 0
+    assert await db.fetch_value(select(func.count()).select_from(TABLES["execution_tasks"])) == 0
+    assert await db.fetch_value(select(func.count()).select_from(TABLES["task_opportunities"])) == 0
 
 
 @pytest.mark.asyncio
@@ -178,7 +176,27 @@ async def test_task_requires_latest_matching_approval(context) -> None:
             site_id=site["id"], title="Guide", task_type="ARTICLE", priority="HIGH",
             opportunity_ids=[opportunity_ids[0]], owner_actor_id=owner["id"],
         )
-    assert await db.fetch_value("SELECT COUNT(*) FROM execution_tasks") == 0
+    assert await db.fetch_value(select(func.count()).select_from(TABLES["execution_tasks"])) == 0
+
+
+@pytest.mark.asyncio
+async def test_new_application_supersedes_approval_after_clock_moves_back(context, monkeypatch):
+    from src.seo_agent.approvals import service as approvals_module
+
+    db, site, owner, _, ids, _ = context
+    before = await db.fetch_one(select(actions).where(actions.c.target_id == ids[0]))
+    monkeypatch.setattr(approvals_module, "_now", lambda: datetime(2000, 1, 1, tzinfo=UTC))
+    latest = await ApprovalService(db).create_action(
+        site_id=site["id"], action_type="ADD_OPPORTUNITY_TO_PRODUCTION", risk_level="HIGH",
+        target_type="opportunity", target_id=ids[0], requested_payload={},
+        approver_actor_id=owner["id"], idempotency_key="request-after-clock-correction",
+    )
+    assert latest["requested_at"] > before["requested_at"]
+    with pytest.raises(ValueError, match="审批"):
+        await TaskDeliveryService(db).create_task(
+            site_id=site["id"], title="Guide", task_type="ARTICLE", priority="HIGH",
+            opportunity_ids=[ids[0]], owner_actor_id=owner["id"],
+        )
 
 
 @pytest.mark.asyncio
@@ -190,26 +208,25 @@ async def test_task_rejects_unapproved_medium_and_low_opportunities(
 ) -> None:
     db, site, owner, _, opportunity_ids, _ = context
     await db.execute(
-        "UPDATE opportunities SET priority_level = ?, status = ? WHERE id = ?",
-        (priority, status, opportunity_ids[0]),
+        update(opportunities).where(opportunities.c.id == opportunity_ids[0])
+        .values(priority_level=priority, status=status),
     )
     await db.execute(
-        "UPDATE approval_actions SET archived_at = '2026-01-01' WHERE target_id = ?",
-        (opportunity_ids[0],),
+        update(actions).where(actions.c.target_id == opportunity_ids[0]).values(archived_at="2026-01-01"),
     )
     with pytest.raises(ValueError, match="审批"):
         await TaskDeliveryService(db).create_task(
             site_id=site["id"], title="Guide", task_type="ARTICLE", priority=priority,
             opportunity_ids=[opportunity_ids[0]], owner_actor_id=owner["id"],
         )
-    assert await db.fetch_value("SELECT COUNT(*) FROM execution_tasks") == 0
+    assert await db.fetch_value(select(func.count()).select_from(TABLES["execution_tasks"])) == 0
 
 
 @pytest.mark.asyncio
 async def test_task_accepts_edited_approval(context) -> None:
     db, site, owner, _, opportunity_ids, _ = context
     action = await db.fetch_one(
-        "SELECT id FROM approval_actions WHERE target_id = ?", (opportunity_ids[0],)
+        select(actions.c.id).where(actions.c.target_id == opportunity_ids[0])
     )
     assert action is not None
     approvals = ApprovalService(db)
@@ -233,50 +250,42 @@ async def test_task_rejects_approved_status_without_matching_action(context, cha
     db, site, owner, _, opportunity_ids, _ = context
     if change == "other_action":
         await db.execute(
-            "UPDATE approval_actions SET action_type = 'PUBLISH_CONTENT' WHERE target_id = ?",
-            (opportunity_ids[0],),
+            update(actions).where(actions.c.target_id == opportunity_ids[0]).values(action_type="PUBLISH_CONTENT"),
         )
     else:
         await db.execute(
-            "UPDATE approval_actions SET archived_at = '2026-01-01' WHERE target_id = ?",
-            (opportunity_ids[0],),
+            update(actions).where(actions.c.target_id == opportunity_ids[0]).values(archived_at="2026-01-01"),
         )
     with pytest.raises(ValueError, match="审批"):
         await TaskDeliveryService(db).create_task(
             site_id=site["id"], title="Guide", task_type="ARTICLE", priority="HIGH",
             opportunity_ids=[opportunity_ids[0]], owner_actor_id=owner["id"],
         )
-    assert await db.fetch_value("SELECT COUNT(*) FROM execution_tasks") == 0
+    assert await db.fetch_value(select(func.count()).select_from(TABLES["execution_tasks"])) == 0
 
 
 @pytest.mark.asyncio
 async def test_task_rolls_back_all_records_if_assignment_fails(context) -> None:
-    db, site, owner, _, opportunity_ids, _ = context
-    await db.execute(
-        "CREATE TRIGGER reject_task_assignment BEFORE INSERT ON task_assignments "
-        "BEGIN SELECT RAISE(ABORT, 'forced failure'); END"
-    )
-    with pytest.raises(aiosqlite.IntegrityError, match="forced failure"):
+    db, site, _, _, opportunity_ids, _ = context
+    # The assignment's owner FK fails after the draft task and its opportunity links were written.
+    with pytest.raises(IntegrityError):
         await TaskDeliveryService(db).create_task(
             site_id=site["id"], title="Guide", task_type="ARTICLE", priority="HIGH",
-            opportunity_ids=opportunity_ids, owner_actor_id=owner["id"],
+            opportunity_ids=opportunity_ids, owner_actor_id="missing-owner",
         )
     for table in ("execution_tasks", "task_opportunities", "task_assignments", "task_status_history"):
-        assert await db.fetch_value(f"SELECT COUNT(*) FROM {table}") == 0
+        assert await db.fetch_value(select(func.count()).select_from(TABLES[table])) == 0
 
 
 @pytest.mark.asyncio
 async def test_task_validation_waits_for_concurrent_approval_change(context) -> None:
     db, site, owner, _, opportunity_ids, _ = context
-    async with aiosqlite.connect(db.path) as connection:
-        await connection.execute("BEGIN IMMEDIATE")
-        await connection.execute(
-            "UPDATE opportunities SET status = 'WAITING_FOR_DECISION' WHERE id = ?",
-            (opportunity_ids[0],),
+    async with db.transaction() as tx:
+        await tx.execute(
+            update(opportunities).where(opportunities.c.id == opportunity_ids[0]).values(status="WAITING_FOR_DECISION"),
         )
-        await connection.execute(
-            "UPDATE approval_actions SET status = 'WAITING_FOR_APPROVAL' WHERE target_id = ?",
-            (opportunity_ids[0],),
+        await tx.execute(
+            update(actions).where(actions.c.target_id == opportunity_ids[0]).values(status="WAITING_FOR_APPROVAL"),
         )
         task = asyncio.create_task(TaskDeliveryService(db).create_task(
             site_id=site["id"], title="Guide", task_type="ARTICLE", priority="HIGH",
@@ -284,29 +293,27 @@ async def test_task_validation_waits_for_concurrent_approval_change(context) -> 
         ))
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(asyncio.shield(task), timeout=0.1)
-        await connection.commit()
-        with pytest.raises(ValueError, match="审批"):
-            await task
-    assert await db.fetch_value("SELECT COUNT(*) FROM execution_tasks") == 0
+    with pytest.raises(ValueError, match="审批"):
+        await task
+    assert await db.fetch_value(select(func.count()).select_from(TABLES["execution_tasks"])) == 0
 
 
 @pytest.mark.asyncio
 async def test_task_created_at_follows_concurrent_approval(context) -> None:
     db, site, owner, _, opportunity_ids, _ = context
     action = await db.fetch_one(
-        "SELECT id FROM approval_actions WHERE target_id = ?", (opportunity_ids[0],)
+        select(actions.c.id).where(actions.c.target_id == opportunity_ids[0])
     )
     assert action is not None
     await ApprovalService(db).decide(
         action_id=action["id"], actor_id=owner["id"], decision="DECISION_CORRECTED"
     )
-    async with aiosqlite.connect(db.path) as connection:
-        await connection.execute("BEGIN IMMEDIATE")
-        await connection.execute(
-            "UPDATE opportunities SET status = 'APPROVED' WHERE id = ?", (opportunity_ids[0],)
+    async with db.transaction() as tx:
+        await tx.execute(
+            update(opportunities).where(opportunities.c.id == opportunity_ids[0]).values(status="APPROVED")
         )
-        await connection.execute(
-            "UPDATE approval_actions SET status = 'APPROVED' WHERE id = ?", (action["id"],)
+        await tx.execute(
+            update(actions).where(actions.c.id == action["id"]).values(status="APPROVED")
         )
         task = asyncio.create_task(TaskDeliveryService(db).create_task(
             site_id=site["id"], title="Guide", task_type="ARTICLE", priority="HIGH",
@@ -315,8 +322,7 @@ async def test_task_created_at_follows_concurrent_approval(context) -> None:
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(asyncio.shield(task), timeout=0.1)
         approved_at = datetime.now(UTC)
-        await connection.commit()
-        created = await task
+    created = await task
     assert datetime.fromisoformat(created["created_at"]) >= approved_at
 
 
@@ -330,7 +336,7 @@ async def test_task_rejects_empty_or_duplicate_opportunities(context, use_duplic
             site_id=site["id"], title="Guide", task_type="ARTICLE", priority="HIGH",
             opportunity_ids=ids, owner_actor_id=owner["id"],
         )
-    assert await db.fetch_value("SELECT COUNT(*) FROM execution_tasks") == 0
+    assert await db.fetch_value(select(func.count()).select_from(TABLES["execution_tasks"])) == 0
 
 
 @pytest.mark.asyncio
@@ -346,22 +352,22 @@ async def test_task_rejects_cross_site_and_unknown_opportunities_without_partial
                 site_id=other["id"], title="Guide", task_type="ARTICLE", priority="HIGH",
                 opportunity_ids=[opportunity_id], owner_actor_id=owner["id"],
             )
-    assert await db.fetch_value("SELECT COUNT(*) FROM execution_tasks") == 0
-    assert await db.fetch_value("SELECT COUNT(*) FROM task_opportunities") == 0
+    assert await db.fetch_value(select(func.count()).select_from(TABLES["execution_tasks"])) == 0
+    assert await db.fetch_value(select(func.count()).select_from(TABLES["task_opportunities"])) == 0
 
 
 @pytest.mark.asyncio
 async def test_task_rejects_archived_opportunity(context) -> None:
     db, site, owner, _, opportunity_ids, _ = context
     await db.execute(
-        "UPDATE opportunities SET archived_at = '2026-01-01' WHERE id = ?", (opportunity_ids[0],)
+        update(opportunities).where(opportunities.c.id == opportunity_ids[0]).values(archived_at="2026-01-01")
     )
     with pytest.raises(KeyError):
         await TaskDeliveryService(db).create_task(
             site_id=site["id"], title="Guide", task_type="ARTICLE", priority="HIGH",
             opportunity_ids=[opportunity_ids[0]], owner_actor_id=owner["id"],
         )
-    assert await db.fetch_value("SELECT COUNT(*) FROM execution_tasks") == 0
+    assert await db.fetch_value(select(func.count()).select_from(TABLES["execution_tasks"])) == 0
 
 
 @pytest.mark.asyncio
@@ -374,7 +380,7 @@ async def test_create_task_api_returns_actionable_errors(context, monkeypatch) -
     db, site, owner, _, opportunity_ids, _ = context
     approvals = ApprovalService(db)
     action = await db.fetch_one(
-        "SELECT id FROM approval_actions WHERE target_id = ?", (opportunity_ids[0],)
+        select(actions.c.id).where(actions.c.target_id == opportunity_ids[0])
     )
     assert action is not None
     await approvals.decide(
@@ -397,7 +403,7 @@ async def test_create_task_api_returns_actionable_errors(context, monkeypatch) -
         await approvals.decide(action_id=action["id"], actor_id=owner["id"], decision="APPROVE")
         response = await client.post("/seo-agent/tasks", json=payload)
         assert response.status_code == 201
-    assert await db.fetch_value("SELECT COUNT(*) FROM execution_tasks") == 1
+    assert await db.fetch_value(select(func.count()).select_from(TABLES["execution_tasks"])) == 1
 
 
 @pytest.mark.asyncio
@@ -414,13 +420,13 @@ async def test_task_links_multiple_opportunities_and_owner(context) -> None:
     )
     assert (
         await db.fetch_value(
-            "SELECT COUNT(*) FROM task_opportunities WHERE task_id = ?", (task["id"],)
+            select(func.count()).select_from(TABLES["task_opportunities"]).where(TABLES["task_opportunities"].c.task_id == task["id"])
         )
         == 2
     )
     assert (
         await db.fetch_value(
-            "SELECT COUNT(*) FROM task_assignments WHERE task_id = ?", (task["id"],)
+            select(func.count()).select_from(TABLES["task_assignments"]).where(TABLES["task_assignments"].c.task_id == task["id"])
         )
         == 1
     )

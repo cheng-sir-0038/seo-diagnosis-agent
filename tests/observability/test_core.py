@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -12,8 +13,8 @@ from src.observability.storage import ObservabilityDatabase
 
 
 @pytest.mark.asyncio
-async def test_model_usage_preserves_total_and_missing_usage(tmp_path: Path) -> None:
-    database = ObservabilityDatabase(tmp_path / "observability.db")
+async def test_model_usage_preserves_total_and_missing_usage(pg_url: str) -> None:
+    database = ObservabilityDatabase(pg_url)
     await database.startup()
     client = ObservabilityClient(database, project_key="seo-agent")
     try:
@@ -29,15 +30,14 @@ async def test_model_usage_preserves_total_and_missing_usage(tmp_path: Path) -> 
                     )
         assert usage["total_tokens"] == 150
         assert missing["total_tokens"] is None
-        assert await database.fetch_value(
-            "SELECT COUNT(*) FROM obs_metric_points WHERE metric_name = 'model.tokens.total'"
-        ) == 1
+        summary = await client.metric_summary(metric_name="model.tokens.total")
+        assert summary[0]["point_count"] == 1
     finally:
         await client.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_failed_export_does_not_break_agent_recording(tmp_path: Path) -> None:
+async def test_failed_export_does_not_break_agent_recording(pg_url: str) -> None:
     class FailingExporter:
         async def export(self, envelope):
             raise OSError("destination unavailable")
@@ -45,7 +45,7 @@ async def test_failed_export_does_not_break_agent_recording(tmp_path: Path) -> N
         async def shutdown(self):
             pass
 
-    database = ObservabilityDatabase(tmp_path / "observability.db")
+    database = ObservabilityDatabase(pg_url)
     await database.startup()
     client = ObservabilityClient(database, project_key="seo-agent", exporters=[FailingExporter()])
     try:
@@ -57,8 +57,8 @@ async def test_failed_export_does_not_break_agent_recording(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_trace_run_span_model_tool_event_and_metrics_are_persisted(tmp_path: Path) -> None:
-    database = ObservabilityDatabase(tmp_path / "observability.db")
+async def test_trace_run_span_model_tool_event_and_metrics_are_persisted(pg_url: str) -> None:
+    database = ObservabilityDatabase(pg_url)
     await database.startup()
     try:
         client = ObservabilityClient(
@@ -97,7 +97,7 @@ async def test_trace_run_span_model_tool_event_and_metrics_are_persisted(tmp_pat
         assert counts["obs_model_calls"] == 1
         assert counts["obs_tool_calls"] == 1
         assert counts["obs_metric_points"] >= 3
-        tool = await database.fetch_one("SELECT * FROM obs_tool_calls")
+        tool = (await client.get_trace(trace.trace_id))["tool_calls"][0]
         assert tool is not None
         assert "secret" not in tool["arguments_json"]
         assert "[REDACTED]" in tool["arguments_json"]
@@ -109,8 +109,8 @@ async def test_trace_run_span_model_tool_event_and_metrics_are_persisted(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_repeated_issue_is_aggregated_and_resolved_issue_reopens(tmp_path: Path) -> None:
-    database = ObservabilityDatabase(tmp_path / "observability.db")
+async def test_repeated_issue_is_aggregated_and_resolved_issue_reopens(pg_url: str) -> None:
+    database = ObservabilityDatabase(pg_url)
     await database.startup()
     try:
         client = ObservabilityClient(database, project_key="seo-agent")
@@ -124,7 +124,7 @@ async def test_repeated_issue_is_aggregated_and_resolved_issue_reopens(tmp_path:
                             component="dataforseo.organic_keywords",
                             error_code="UPSTREAM_TIMEOUT",
                         )
-        issue = await database.fetch_one("SELECT * FROM obs_issues")
+        issue = (await client.list_issues())[0]
         assert issue is not None
         assert issue["occurrence_count"] == 2
         assert issue["affected_trace_count"] == 2
@@ -138,7 +138,7 @@ async def test_repeated_issue_is_aggregated_and_resolved_issue_reopens(tmp_path:
                         component="dataforseo.organic_keywords",
                         error_code="UPSTREAM_TIMEOUT",
                     )
-        reopened = await database.fetch_one("SELECT * FROM obs_issues WHERE id = ?", (issue["id"],))
+        reopened = (await client.list_issues(status="REOPENED"))[0]
         assert reopened is not None
         assert reopened["status"] == "REOPENED"
         assert reopened["occurrence_count"] == 3
@@ -147,9 +147,9 @@ async def test_repeated_issue_is_aggregated_and_resolved_issue_reopens(tmp_path:
 
 
 @pytest.mark.asyncio
-async def test_jsonl_exporter_receives_completed_entities(tmp_path: Path) -> None:
+async def test_jsonl_exporter_receives_completed_entities(pg_url: str, tmp_path: Path) -> None:
     output = tmp_path / "events.jsonl"
-    database = ObservabilityDatabase(tmp_path / "observability.db")
+    database = ObservabilityDatabase(pg_url)
     await database.startup()
     try:
         client = ObservabilityClient(
@@ -171,3 +171,37 @@ async def test_jsonl_exporter_receives_completed_entities(tmp_path: Path) -> Non
 def test_opentelemetry_exporter_is_constructible_without_endpoint() -> None:
     exporter = OpenTelemetryExporter(service_name="seo-agent", endpoint=None)
     assert exporter.enabled is False
+
+
+@pytest.mark.asyncio
+async def test_parallel_clients_share_project_event_sequence_and_issue_counts(pg_url: str) -> None:
+    first = ObservabilityClient(ObservabilityDatabase(pg_url), project_key="shared")
+    second = ObservabilityClient(ObservabilityDatabase(pg_url), project_key="shared")
+    try:
+        # Both clients get their own connection pool, as separate processes would.
+        await first.database.startup()
+        await second.database.startup()
+        await asyncio.gather(first.startup(), second.startup())
+        async with first.trace("shared.trace") as trace:
+            writers = (first, second) * 4
+            async with asyncio.TaskGroup() as group:
+                for index, writer in enumerate(writers):
+                    group.create_task(writer.record_event(
+                        trace_id=trace.trace_id, event_type=f"worker.{index}",
+                    ))
+                    group.create_task(writer.capture_issue(
+                        trace_id=trace.trace_id, message="one upstream failure",
+                        issue_type="timeout", component="read",
+                    ))
+        saved = await second.get_trace(trace.trace_id)
+        assert [event["sequence"] for event in saved["events"]] == list(range(1, 19))
+        event_types = [event["event_type"] for event in saved["events"]]
+        assert sorted(e for e in event_types if e.startswith("worker.")) == [
+            f"worker.{i}" for i in range(8)
+        ]
+        assert len(saved["issues"]) == 1
+        assert saved["issues"][0]["occurrence_count"] == 8
+        assert saved["issues"][0]["affected_trace_count"] == 1
+    finally:
+        await first.shutdown()
+        await second.shutdown()

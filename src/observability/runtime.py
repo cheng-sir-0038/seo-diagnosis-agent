@@ -36,7 +36,7 @@ def _build_exporters(database: ObservabilityDatabase):
     return exporters
 
 
-observability_database = ObservabilityDatabase(settings.observability_sqlite_path)
+observability_database = ObservabilityDatabase()
 observability_client = ObservabilityClient(
     observability_database,
     project_key=settings.observability_project_key,

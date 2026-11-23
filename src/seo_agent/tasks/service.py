@@ -1,20 +1,34 @@
 from __future__ import annotations
 
-# ruff: noqa: E501
 import hashlib
 import json
 import uuid
-from contextlib import nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-import aiosqlite
+from sqlalchemy import Table, func, insert, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.seo_agent.artifacts.renderers import MarkdownPrdRenderer, PdfPrdRenderer
 from src.seo_agent.db.database import SeoAgentDatabase
+from src.seo_agent.db.models import TABLES
 from src.seo_agent.notifications.service import NotificationService
 from src.seo_agent.tasks.models import TaskPrdContent
+
+tasks = TABLES["execution_tasks"]
+opportunities = TABLES["opportunities"]
+actions = TABLES["approval_actions"]
+links = TABLES["task_opportunities"]
+assignments = TABLES["task_assignments"]
+actors = TABLES["actors"]
+versions = TABLES["task_prd_versions"]
+dispatches = TABLES["task_dispatches"]
+deliveries = TABLES["deliveries"]
+reviews = TABLES["delivery_reviews"]
+artifacts = TABLES["task_prd_artifacts"]
+published = TABLES["publish_records"]
+status_history = TABLES["task_status_history"]
 
 
 def _now() -> str:
@@ -23,6 +37,18 @@ def _now() -> str:
 
 def _id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
+
+
+async def _record(
+    db: SeoAgentDatabase, table: Table, object_id: str, label: str, *, lock: bool = False,
+) -> dict[str, Any]:
+    query = select(table).where(table.c.id == object_id)
+    if lock:
+        query = query.with_for_update()
+    row = await db.fetch_one(query)
+    if row is None:
+        raise KeyError(f"{label}不存在: {object_id}")
+    return row
 
 
 class TaskDeliveryService:
@@ -50,167 +76,116 @@ class TaskDeliveryService:
         owner_actor_id: str,
         created_by_run_id: str | None = None,
         deadline_at: str | None = None,
-        connection: aiosqlite.Connection | None = None,
     ) -> dict[str, Any]:
         if not opportunity_ids:
             raise ValueError("至少选择一个机会")
         if len(set(opportunity_ids)) != len(opportunity_ids):
             raise ValueError("不能重复选择同一个机会")
-        if not self.database.started:
-            raise RuntimeError("SeoAgentDatabase 尚未启动")
-
-        task_id = _id("task")
-        owns_transaction = connection is None
-        if connection is not None and (
-            connection is not self.database._require_connection() or not connection.in_transaction
-        ):
-            raise ValueError("创建任务必须使用当前业务事务连接")
-        # Approval decisions use their own connection; take the same write lock while validating.
-        context = aiosqlite.connect(self.database.path) if owns_transaction else nullcontext(connection)
-        async with context as connection:
-            if owns_transaction:
-                connection.row_factory = aiosqlite.Row
-                await connection.execute("PRAGMA foreign_keys = ON")
-                await connection.execute("BEGIN IMMEDIATE")
+        async with self.database.transaction() as tx:
             await self.validate_opportunities(
-                site_id=site_id, opportunity_ids=opportunity_ids, connection=connection
+                site_id=site_id, opportunity_ids=opportunity_ids, database=tx,
             )
-
             now = _now()
-            await connection.execute(
-                "INSERT INTO execution_tasks(id, site_id, title, task_type, status, priority, "
-                "deadline_at, created_by_run_id, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, 'DRAFT', ?, ?, ?, ?, ?)",
-                (
-                    task_id, site_id, title, task_type, priority, deadline_at,
-                    created_by_run_id, now, now,
-                ),
-            )
-            for index, opportunity_id in enumerate(opportunity_ids):
-                await connection.execute(
-                    "INSERT INTO task_opportunities(id, task_id, opportunity_id, relation_type, "
-                    "is_primary, linked_by_run_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        _id("taskopp"), task_id, opportunity_id,
-                        "PRIMARY_TARGET" if index == 0 else "SECONDARY_TARGET", int(index == 0),
-                        created_by_run_id, now,
-                    ),
-                )
-            await connection.execute(
-                "INSERT INTO task_assignments(id, task_id, actor_id, assignment_role, status, "
-                "assigned_at, created_at) VALUES (?, ?, ?, 'OWNER', 'ASSIGNED', ?, ?)",
-                (_id("assignment"), task_id, owner_actor_id, now, now),
-            )
-            await self._record_task_status(
-                task_id, None, "DRAFT", "任务已创建", owner_actor_id, connection=connection
-            )
-            if owns_transaction:
-                await connection.commit()
-        return await self.get_task(task_id)
+            task_id = _id("task")
+            await tx.execute(insert(tasks).values(
+                id=task_id, site_id=site_id, title=title, task_type=task_type, status="DRAFT",
+                priority=priority, deadline_at=deadline_at, created_by_run_id=created_by_run_id,
+                created_at=now, updated_at=now,
+            ))
+            await tx.execute(insert(links).values([
+                dict(id=_id("taskopp"), task_id=task_id, opportunity_id=opportunity_id,
+                     relation_type="PRIMARY_TARGET" if i == 0 else "SECONDARY_TARGET",
+                     is_primary=int(i == 0), linked_by_run_id=created_by_run_id, created_at=now)
+                for i, opportunity_id in enumerate(opportunity_ids)
+            ]))
+            await tx.execute(insert(assignments).values(
+                id=_id("assignment"), task_id=task_id, actor_id=owner_actor_id,
+                assignment_role="OWNER", status="ASSIGNED", assigned_at=now, created_at=now,
+            ))
+            await tx.execute(insert(status_history).values(
+                id=_id("taskstatus"), task_id=task_id, from_status=None, to_status="DRAFT",
+                reason="任务已创建", changed_by_actor_id=owner_actor_id, created_at=now,
+            ))
+            return await _record(tx, tasks, task_id, "任务")
 
     async def validate_opportunities(
-        self, *, site_id: str, opportunity_ids: list[str],
-        connection: aiosqlite.Connection | None = None,
+        self, *, site_id: str, opportunity_ids: list[str], database: SeoAgentDatabase | None = None,
     ) -> list[dict[str, Any]]:
         if not opportunity_ids or len(set(opportunity_ids)) != len(opportunity_ids):
             raise ValueError("必须选择不重复的机会")
-        connection = connection or self.database._require_connection()
-        opportunities = []
+        db = database or self.database
+        # Lock parents in the same order even if two callers select the opportunities in reverse.
+        query = select(opportunities).where(
+            opportunities.c.id.in_(opportunity_ids), opportunities.c.site_id == site_id,
+            opportunities.c.archived_at.is_(None),
+        ).order_by(opportunities.c.id)
+        if db.in_transaction:
+            query = query.with_for_update()
+        records = {row["id"]: row for row in await db.fetch_all(query)}
+        if len(records) != len(opportunity_ids):
+            raise KeyError("机会不存在或不属于当前站点")
+        result = []
         for opportunity_id in opportunity_ids:
-            async with connection.execute(
-                "SELECT * FROM opportunities "
-                "WHERE id = ? AND site_id = ? AND archived_at IS NULL",
-                (opportunity_id, site_id),
-            ) as cursor:
-                opportunity = await cursor.fetchone()
-            if opportunity is None:
-                raise KeyError("机会不存在或不属于当前站点")
-            async with connection.execute(
-                "SELECT id, status FROM approval_actions WHERE site_id = ? "
-                "AND target_type = 'opportunity' AND target_id = ? "
-                "AND action_type = 'ADD_OPPORTUNITY_TO_PRODUCTION' "
-                "AND archived_at IS NULL ORDER BY requested_at DESC, rowid DESC LIMIT 1",
-                (site_id, opportunity_id),
-            ) as cursor:
-                action = await cursor.fetchone()
-            if (
-                opportunity["status"] != "APPROVED"
-                or action is None
-                or action["status"] not in {"APPROVED", "EDITED_AND_APPROVED"}
-            ):
+            latest = select(actions.c.id, actions.c.status).where(
+                actions.c.site_id == site_id, actions.c.target_type == "opportunity",
+                actions.c.target_id == opportunity_id,
+                actions.c.action_type == "ADD_OPPORTUNITY_TO_PRODUCTION",
+                actions.c.archived_at.is_(None),
+            ).order_by(actions.c.requested_at.desc(), actions.c.id.desc()).limit(1)
+            if db.in_transaction:
+                latest = latest.with_for_update()
+            action = await db.fetch_one(latest)
+            row = records[opportunity_id]
+            if (row["status"] != "APPROVED" or action is None
+                    or action["status"] not in {"APPROVED", "EDITED_AND_APPROVED"}):
                 raise ValueError("关联机会尚未通过审批")
-            opportunities.append({
-                **dict(opportunity), "approval_action_id": action["id"],
-                "approval_status": action["status"],
-            })
-        return opportunities
+            result.append({**row, "approval_action_id": action["id"],
+                           "approval_status": action["status"]})
+        return result
 
     async def get_task(self, task_id: str) -> dict[str, Any]:
-        row = await self.database.fetch_one(
-            "SELECT * FROM execution_tasks WHERE id = ?", (task_id,)
-        )
-        if row is None:
-            raise KeyError(f"任务不存在: {task_id}")
-        return row
+        return await _record(self.database, tasks, task_id, "任务")
 
     async def list_tasks(
-        self,
-        site_id: str,
-        *,
-        status: str | None = None,
-        limit: int = 100,
+        self, site_id: str, *, status: str | None = None, limit: int = 100,
     ) -> list[dict[str, Any]]:
+        query = select(tasks).where(tasks.c.site_id == site_id, tasks.c.archived_at.is_(None))
         if status:
-            return await self.database.fetch_all(
-                "SELECT * FROM execution_tasks WHERE site_id = ? AND status = ? "
-                "AND archived_at IS NULL ORDER BY created_at DESC LIMIT ?",
-                (site_id, status, max(1, min(limit, 500))),
-            )
-        return await self.database.fetch_all(
-            "SELECT * FROM execution_tasks WHERE site_id = ? AND archived_at IS NULL "
-            "ORDER BY created_at DESC LIMIT ?",
-            (site_id, max(1, min(limit, 500))),
-        )
+            query = query.where(tasks.c.status == status)
+        return await self.database.fetch_all(query.order_by(tasks.c.created_at.desc())
+                                             .limit(max(1, min(limit, 500))))
 
     async def get_task_detail(self, task_id: str) -> dict[str, Any]:
         task = await self.get_task(task_id)
         task["opportunities"] = await self.database.fetch_all(
-            "SELECT o.*, r.relation_type, r.is_primary FROM task_opportunities r "
-            "JOIN opportunities o ON o.id = r.opportunity_id WHERE r.task_id = ? "
-            "ORDER BY r.is_primary DESC, o.current_score DESC",
-            (task_id,),
+            select(opportunities, links.c.relation_type, links.c.is_primary)
+            .join(links, opportunities.c.id == links.c.opportunity_id)
+            .where(links.c.task_id == task_id)
+            .order_by(links.c.is_primary.desc(), opportunities.c.current_score.desc())
         )
         task["assignments"] = await self.database.fetch_all(
-            "SELECT a.*, x.name, x.email, x.actor_type FROM task_assignments a "
-            "JOIN actors x ON x.id = a.actor_id WHERE a.task_id = ? ORDER BY a.created_at",
-            (task_id,),
+            select(assignments, actors.c.name, actors.c.email, actors.c.actor_type)
+            .join(actors, actors.c.id == assignments.c.actor_id)
+            .where(assignments.c.task_id == task_id).order_by(assignments.c.created_at)
         )
-        task["prd_versions"] = await self.database.fetch_all(
-            "SELECT * FROM task_prd_versions WHERE task_id = ? ORDER BY version_no DESC",
-            (task_id,),
-        )
-        task["dispatches"] = await self.database.fetch_all(
-            "SELECT * FROM task_dispatches WHERE task_id = ? ORDER BY created_at DESC",
-            (task_id,),
-        )
-        deliveries = await self.database.fetch_all(
-            "SELECT * FROM deliveries WHERE task_id = ? ORDER BY version_no DESC",
-            (task_id,),
-        )
-        for delivery in deliveries:
-            delivery["reviews"] = await self.database.fetch_all(
-                "SELECT * FROM delivery_reviews WHERE delivery_id = ? ORDER BY created_at DESC",
-                (delivery["id"],),
+        for key, table, order in (
+            ("prd_versions", versions, versions.c.version_no.desc()),
+            ("dispatches", dispatches, dispatches.c.created_at.desc()),
+            ("deliveries", deliveries, deliveries.c.version_no.desc()),
+            ("publish_records", published, published.c.created_at.desc()),
+            ("status_history", status_history, status_history.c.created_at),
+        ):
+            task[key] = await self.database.fetch_all(
+                select(table).where(table.c.task_id == task_id).order_by(order)
             )
-        task["deliveries"] = deliveries
-        task["publish_records"] = await self.database.fetch_all(
-            "SELECT * FROM publish_records WHERE task_id = ? ORDER BY created_at DESC",
-            (task_id,),
-        )
-        task["status_history"] = await self.database.fetch_all(
-            "SELECT * FROM task_status_history WHERE task_id = ? ORDER BY created_at",
-            (task_id,),
-        )
+        by_delivery = {item["id"]: item for item in task["deliveries"]}
+        for item in by_delivery.values():
+            item["reviews"] = []
+        if by_delivery:
+            for review in await self.database.fetch_all(select(reviews).where(
+                reviews.c.delivery_id.in_(by_delivery.keys()),
+            ).order_by(reviews.c.created_at.desc())):
+                by_delivery[review["delivery_id"]]["reviews"].append(review)
         return task
 
     async def create_prd_version(
@@ -226,95 +201,71 @@ class TaskDeliveryService:
         prompt_version_id: str | None = None,
         source_trace_id: str | None = None,
     ) -> dict[str, Any]:
-        await self.get_task(task_id)
-        current = await self.database.fetch_value(
-            "SELECT COALESCE(MAX(version_no), 0) FROM task_prd_versions WHERE task_id = ?",
-            (task_id,),
-        )
-        version_no = int(current or 0) + 1
-        prd_id = _id("prd")
         markdown = self.markdown_renderer.render(title, content)
-        await self.database.execute(
-            "INSERT INTO task_prd_versions(id, task_id, version_no, status, title, "
-            "structured_content_json, markdown_content, prompt_version_id, source_trace_id, "
-            "generated_by_run_id, source_version_id, change_summary, created_by_actor_id, created_at) "
-            "VALUES (?, ?, ?, 'DRAFT', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                prd_id,
-                task_id,
-                version_no,
-                title,
-                content.model_dump_json(),
-                markdown,
-                prompt_version_id,
-                source_trace_id,
-                generated_by_run_id,
-                source_version_id,
-                change_summary,
-                created_by_actor_id,
-                _now(),
-            ),
-        )
-        await self.database.execute(
-            "UPDATE execution_tasks SET current_prd_version_id = ?, updated_at = ? WHERE id = ?",
-            (prd_id, _now(), task_id),
-        )
-        return await self.get_prd_version(prd_id)
+        async with self.database.transaction() as tx:
+            await _record(tx, tasks, task_id, "任务", lock=True)
+            current = await tx.fetch_value(select(func.max(versions.c.version_no)).where(
+                versions.c.task_id == task_id,
+            ))
+            prd_id = _id("prd")
+            now = _now()
+            await tx.execute(insert(versions).values(
+                id=prd_id, task_id=task_id, version_no=(current or 0) + 1, status="DRAFT",
+                title=title, structured_content_json=content.model_dump_json(),
+                markdown_content=markdown, prompt_version_id=prompt_version_id,
+                source_trace_id=source_trace_id, generated_by_run_id=generated_by_run_id,
+                source_version_id=source_version_id, change_summary=change_summary,
+                created_by_actor_id=created_by_actor_id, created_at=now,
+            ))
+            await tx.execute(update(tasks).where(tasks.c.id == task_id).values(
+                current_prd_version_id=prd_id, updated_at=now,
+            ))
+            return await _record(tx, versions, prd_id, "PRD 版本")
 
     async def get_prd_version(self, prd_version_id: str) -> dict[str, Any]:
-        row = await self.database.fetch_one(
-            "SELECT * FROM task_prd_versions WHERE id = ?", (prd_version_id,)
-        )
-        if row is None:
-            raise KeyError(f"PRD 版本不存在: {prd_version_id}")
-        return row
+        return await _record(self.database, versions, prd_version_id, "PRD 版本")
 
     async def render_prd_artifacts(self, prd_version_id: str) -> list[dict[str, Any]]:
-        prd = await self.get_prd_version(prd_version_id)
-        content = TaskPrdContent.model_validate_json(prd["structured_content_json"])
-        task_dir = self.artifact_root / prd["task_id"] / f"prd-v{prd['version_no']}"
-        task_dir.mkdir(parents=True, exist_ok=True)
-        outputs: list[tuple[str, str, str, bytes]] = []
-        markdown_bytes = prd["markdown_content"].encode("utf-8")
-        outputs.append(("markdown", "prd.md", "text/markdown", markdown_bytes))
-        outputs.append(
-            ("pdf", "prd.pdf", "application/pdf", self.pdf_renderer.render(prd["title"], content))
-        )
-        created: list[dict[str, Any]] = []
-        for renderer_key, filename, content_type, payload in outputs:
-            checksum = hashlib.sha256(payload).hexdigest()
-            path = task_dir / filename
-            path.write_bytes(payload)
-            existing = await self.database.fetch_one(
-                "SELECT * FROM task_prd_artifacts WHERE prd_version_id = ? AND renderer_key = ? AND checksum = ?",
-                (prd_version_id, renderer_key, checksum),
-            )
-            if existing is not None:
-                created.append(existing)
-                continue
-            artifact_id = _id("artifact")
-            now = _now()
-            await self.database.execute(
-                "INSERT INTO task_prd_artifacts(id, prd_version_id, renderer_key, file_name, file_path, "
-                "content_type, checksum, generated_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    artifact_id,
-                    prd_version_id,
-                    renderer_key,
-                    filename,
-                    str(path),
-                    content_type,
-                    checksum,
-                    now,
-                    now,
-                ),
-            )
-            row = await self.database.fetch_one(
-                "SELECT * FROM task_prd_artifacts WHERE id = ?", (artifact_id,)
-            )
-            assert row is not None
-            created.append(row)
-        return created
+        async with self.database.transaction() as tx:
+            prd = await _record(tx, versions, prd_version_id, "PRD 版本", lock=True)
+            content = TaskPrdContent.model_validate_json(prd["structured_content_json"])
+            task_dir = self.artifact_root / prd["task_id"] / f"prd-v{prd['version_no']}"
+            task_dir.mkdir(parents=True, exist_ok=True)
+            created = []
+            for key, name, media_type in (
+                ("markdown", "prd.md", "text/markdown"), ("pdf", "prd.pdf", "application/pdf"),
+            ):
+                path = task_dir / name
+                matching = select(artifacts).where(
+                    artifacts.c.prd_version_id == prd_version_id, artifacts.c.renderer_key == key,
+                )
+                if path.is_file():
+                    checksum = hashlib.sha256(path.read_bytes()).hexdigest()
+                    saved = await tx.fetch_one(matching.where(artifacts.c.checksum == checksum))
+                    if saved is not None:
+                        created.append(saved)
+                        continue
+                data = (prd["markdown_content"].encode() if key == "markdown" else
+                        self.pdf_renderer.render(prd["title"], content))
+                checksum = hashlib.sha256(data).hexdigest()
+                tmp = path.with_name(f".{name}.{uuid.uuid4().hex}")
+                try:
+                    tmp.write_bytes(data)
+                    tmp.replace(path)
+                finally:
+                    tmp.unlink(missing_ok=True)
+                now = _now()
+                await tx.execute(pg_insert(artifacts).values(
+                    id=_id("artifact"), prd_version_id=prd_version_id, renderer_key=key,
+                    file_name=name, file_path=str(path), content_type=media_type, checksum=checksum,
+                    generated_at=now, created_at=now,
+                ).on_conflict_do_nothing(index_elements=[
+                    artifacts.c.prd_version_id, artifacts.c.renderer_key, artifacts.c.checksum,
+                ]))
+                row = await tx.fetch_one(matching.where(artifacts.c.checksum == checksum))
+                assert row is not None
+                created.append(row)
+            return created
 
     async def dispatch_task(
         self,
@@ -325,52 +276,46 @@ class TaskDeliveryService:
         idempotency_key: str,
         dispatcher_adapter: str = "internal_human",
     ) -> dict[str, Any]:
-        existing = await self.database.fetch_one(
-            "SELECT * FROM task_dispatches WHERE idempotency_key = ?", (idempotency_key,)
-        )
-        if existing is not None:
-            return existing
-        task = await self.get_task(task_id)
-        await self.get_prd_version(prd_version_id)
-        dispatch_id = _id("dispatch")
-        now = _now()
-        await self.database.execute(
-            "INSERT OR IGNORE INTO task_assignments(id, task_id, actor_id, assignment_role, status, "
-            "assigned_at, created_at) VALUES (?, ?, ?, 'EXECUTOR', 'ASSIGNED', ?, ?)",
-            (_id("assignment"), task_id, recipient_actor_id, now, now),
-        )
-        await self.database.execute(
-            "INSERT INTO task_dispatches(id, task_id, prd_version_id, dispatcher_adapter, "
-            "recipient_actor_id, status, idempotency_key, dispatched_at, created_at) "
-            "VALUES (?, ?, ?, ?, ?, 'DISPATCHED', ?, ?, ?)",
-            (
-                dispatch_id,
-                task_id,
-                prd_version_id,
-                dispatcher_adapter,
-                recipient_actor_id,
-                idempotency_key,
-                now,
-                now,
-            ),
-        )
-        await self._set_task_status(task_id, "DISPATCHED", "任务已派发", recipient_actor_id)
-        if self.notifications is not None:
-            await self.notifications.create_event(
-                site_id=task["site_id"],
-                event_key="task_progressed",
-                business_object_type="execution_task",
-                business_object_id=task_id,
-                title=f"新任务：{task['title']}",
-                content={"summary": "任务已经派发，请查看 PRD"},
-                priority=task["priority"],
-                idempotency_key=f"task-dispatch:{dispatch_id}",
-            )
-        row = await self.database.fetch_one(
-            "SELECT * FROM task_dispatches WHERE id = ?", (dispatch_id,)
-        )
-        assert row is not None
-        return row
+        async with self.database.transaction() as tx:
+            task = await _record(tx, tasks, task_id, "任务", lock=True)
+            prd = await _record(tx, versions, prd_version_id, "PRD 版本")
+            if prd["task_id"] != task_id:
+                raise ValueError("PRD 版本不属于当前任务")
+            now = _now()
+            dispatch_id = _id("dispatch")
+            await tx.execute(pg_insert(dispatches).values(
+                id=dispatch_id, task_id=task_id, prd_version_id=prd_version_id,
+                dispatcher_adapter=dispatcher_adapter, recipient_actor_id=recipient_actor_id,
+                status="DISPATCHED", idempotency_key=idempotency_key, dispatched_at=now,
+                created_at=now,
+            ).on_conflict_do_nothing(index_elements=[dispatches.c.idempotency_key]))
+            row = await tx.fetch_one(select(dispatches).where(
+                dispatches.c.idempotency_key == idempotency_key,
+            ))
+            assert row is not None
+            if row["id"] != dispatch_id:
+                if (row["task_id"], row["prd_version_id"], row["recipient_actor_id"],
+                    row["dispatcher_adapter"]) != (
+                    task_id, prd_version_id, recipient_actor_id, dispatcher_adapter,
+                ):
+                    raise ValueError("幂等键已用于不同的任务派发")
+                return row
+            await tx.execute(pg_insert(assignments).values(
+                id=_id("assignment"), task_id=task_id, actor_id=recipient_actor_id,
+                assignment_role="EXECUTOR", status="ASSIGNED", assigned_at=now, created_at=now,
+            ).on_conflict_do_nothing(index_elements=[
+                assignments.c.task_id, assignments.c.actor_id, assignments.c.assignment_role,
+            ]))
+            await self._set_task_status(tx, task, "DISPATCHED", "任务已派发", recipient_actor_id)
+            if self.notifications is not None:
+                await NotificationService(tx, self.notifications.provider).create_event(
+                    site_id=task["site_id"], event_key="task_progressed",
+                    business_object_type="execution_task", business_object_id=task_id,
+                    title=f"新任务：{task['title']}",
+                    content={"summary": "任务已经派发，请查看 PRD"},
+                    priority=task["priority"], idempotency_key=f"task-dispatch:{dispatch_id}",
+                )
+            return row
 
     async def submit_delivery(
         self,
@@ -383,34 +328,27 @@ class TaskDeliveryService:
         submitted_by_actor_id: str,
         parent_delivery_id: str | None = None,
     ) -> dict[str, Any]:
-        current = await self.database.fetch_value(
-            "SELECT COALESCE(MAX(version_no), 0) FROM deliveries WHERE task_id = ?", (task_id,)
-        )
-        version_no = int(current or 0) + 1
-        delivery_id = _id("delivery")
-        now = _now()
-        await self.database.execute(
-            "INSERT INTO deliveries(id, task_id, prd_version_id, version_no, parent_delivery_id, "
-            "status, title, summary, structured_content_json, submitted_by_actor_id, submitted_at, "
-            "created_at) VALUES (?, ?, ?, ?, ?, 'SUBMITTED', ?, ?, ?, ?, ?, ?)",
-            (
-                delivery_id,
-                task_id,
-                prd_version_id,
-                version_no,
-                parent_delivery_id,
-                title,
-                summary,
-                json.dumps(structured_content, ensure_ascii=False),
-                submitted_by_actor_id,
-                now,
-                now,
-            ),
-        )
-        await self._set_task_status(task_id, "DELIVERED", "执行者已提交交付", submitted_by_actor_id)
-        row = await self.database.fetch_one("SELECT * FROM deliveries WHERE id = ?", (delivery_id,))
-        assert row is not None
-        return row
+        async with self.database.transaction() as tx:
+            task = await _record(tx, tasks, task_id, "任务", lock=True)
+            prd = await _record(tx, versions, prd_version_id, "PRD 版本")
+            if prd["task_id"] != task_id:
+                raise ValueError("PRD 版本不属于当前任务")
+            current = await tx.fetch_value(select(func.max(deliveries.c.version_no)).where(
+                deliveries.c.task_id == task_id,
+            ))
+            delivery_id = _id("delivery")
+            now = _now()
+            await tx.execute(insert(deliveries).values(
+                id=delivery_id, task_id=task_id, prd_version_id=prd_version_id,
+                version_no=(current or 0) + 1, parent_delivery_id=parent_delivery_id,
+                status="SUBMITTED", title=title, summary=summary,
+                structured_content_json=json.dumps(structured_content, ensure_ascii=False),
+                submitted_by_actor_id=submitted_by_actor_id, submitted_at=now, created_at=now,
+            ))
+            await self._set_task_status(
+                tx, task, "DELIVERED", "执行者已提交交付", submitted_by_actor_id,
+            )
+            return await _record(tx, deliveries, delivery_id, "交付")
 
     async def review_delivery(
         self,
@@ -428,76 +366,45 @@ class TaskDeliveryService:
         prompt_version_id: str | None = None,
         source_trace_id: str | None = None,
     ) -> dict[str, Any]:
-        delivery = await self.database.fetch_one(
-            "SELECT * FROM deliveries WHERE id = ?", (delivery_id,)
-        )
-        if delivery is None:
-            raise KeyError(f"交付不存在: {delivery_id}")
-        if status == "ACCEPTED" and (failed_items or missing_items):
-            status = "REVISION_REQUIRED"
-        review_id = _id("review")
-        now = _now()
-        await self.database.execute(
-            "INSERT INTO delivery_reviews(id, delivery_id, prd_version_id, reviewer_type, "
-            "reviewer_actor_id, status, score, passed_items_json, failed_items_json, "
-            "missing_items_json, revision_instructions_json, prompt_version_id, source_trace_id, "
-            "reviewed_by_run_id, reviewed_at, created_at) "
-            "VALUES (?, ?, ?, 'SEO_AGENT', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                review_id,
-                delivery_id,
-                prd_version_id,
-                reviewer_actor_id,
-                status,
-                score,
-                json.dumps(passed_items or [], ensure_ascii=False),
-                json.dumps(failed_items or [], ensure_ascii=False),
-                json.dumps(missing_items or [], ensure_ascii=False),
-                json.dumps(revision_instructions or [], ensure_ascii=False),
-                prompt_version_id,
-                source_trace_id,
-                reviewed_by_run_id,
-                now,
-                now,
-            ),
-        )
-        await self.database.execute(
-            "UPDATE deliveries SET status = ? WHERE id = ?", (status, delivery_id)
-        )
-        task_status = "DELIVERY_ACCEPTED" if status == "ACCEPTED" else status
-        await self._set_task_status(
-            delivery["task_id"], task_status, "交付验收完成", reviewer_actor_id
-        )
-        row = await self.database.fetch_one(
-            "SELECT * FROM delivery_reviews WHERE id = ?", (review_id,)
-        )
-        assert row is not None
-        return row
+        async with self.database.transaction() as tx:
+            delivery = await _record(tx, deliveries, delivery_id, "交付")
+            if prd_version_id != delivery["prd_version_id"]:
+                raise ValueError("PRD 版本与本次交付不匹配")
+            task = await _record(tx, tasks, delivery["task_id"], "任务", lock=True)
+            if status == "ACCEPTED" and (failed_items or missing_items):
+                status = "REVISION_REQUIRED"
+            review_id = _id("review")
+            now = _now()
+            await tx.execute(insert(reviews).values(
+                id=review_id, delivery_id=delivery_id, prd_version_id=prd_version_id,
+                reviewer_type="SEO_AGENT", reviewer_actor_id=reviewer_actor_id, status=status,
+                score=score, passed_items_json=json.dumps(passed_items or [], ensure_ascii=False),
+                failed_items_json=json.dumps(failed_items or [], ensure_ascii=False),
+                missing_items_json=json.dumps(missing_items or [], ensure_ascii=False),
+                revision_instructions_json=json.dumps(
+                    revision_instructions or [], ensure_ascii=False,
+                ),
+                reviewed_by_run_id=reviewed_by_run_id, prompt_version_id=prompt_version_id,
+                source_trace_id=source_trace_id, reviewed_at=now, created_at=now,
+            ))
+            await tx.execute(
+                update(deliveries).where(deliveries.c.id == delivery_id).values(status=status)
+            )
+            await self._set_task_status(
+                tx, task, "DELIVERY_ACCEPTED" if status == "ACCEPTED" else status,
+                "交付验收完成", reviewer_actor_id,
+            )
+            return await _record(tx, reviews, review_id, "交付审核")
 
+    @staticmethod
     async def _set_task_status(
-        self, task_id: str, status: str, reason: str, actor_id: str | None
+        tx: SeoAgentDatabase, task: dict, status: str, reason: str, actor_id: str | None,
     ) -> None:
-        task = await self.get_task(task_id)
         now = _now()
-        await self.database.execute(
-            "UPDATE execution_tasks SET status = ?, updated_at = ? WHERE id = ?",
-            (status, now, task_id),
-        )
-        await self._record_task_status(task_id, task["status"], status, reason, actor_id)
-
-    async def _record_task_status(
-        self,
-        task_id: str,
-        from_status: str | None,
-        to_status: str,
-        reason: str,
-        actor_id: str | None,
-        *,
-        connection: aiosqlite.Connection | None = None,
-    ) -> None:
-        execute = connection.execute if connection else self.database.execute
-        await execute(
-            "INSERT INTO task_status_history(id, task_id, from_status, to_status, reason, "
-            "changed_by_actor_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (_id("taskstatus"), task_id, from_status, to_status, reason, actor_id, _now()),
-        )
+        await tx.execute(update(tasks).where(tasks.c.id == task["id"]).values(
+            status=status, updated_at=now,
+        ))
+        await tx.execute(insert(status_history).values(
+            id=_id("taskstatus"), task_id=task["id"], from_status=task["status"], to_status=status,
+            reason=reason, changed_by_actor_id=actor_id, created_at=now,
+        ))

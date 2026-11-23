@@ -1,16 +1,14 @@
 import { RightOutlined } from '@ant-design/icons'
 import { useState } from 'react'
 
-import type { ToolRun } from '../types/agent'
+import { specialistNames, type ToolRun } from '../types/agent'
+import { toolResultLabel } from './toolLabels'
 import { RawJsonResult } from './renderers/RawJsonResult'
-import { isPresentationBase, resolveLocalizedText, unwrapToolResult } from './renderers/contracts'
 
 const toolStatus = { completed: '已完成', failed: '失败', running: '执行中' }
 
 function ToolRunDetails({ tool }: { tool: ToolRun }) {
   const [open, setOpen] = useState(false)
-  const result = unwrapToolResult(tool.result)
-  const title = isPresentationBase(result) ? resolveLocalizedText(result.title, tool.name) : tool.name
   const args = tool.arguments
   const parameters = args && typeof args === 'object' && !Array.isArray(args) ? Object.entries(args) : []
   const milliseconds = tool.latencyMs
@@ -21,8 +19,9 @@ function ToolRunDetails({ tool }: { tool: ToolRun }) {
   return (
     <div className="chat-run-tool">
       <div className="chat-run-tool-heading">
-        <strong>{title}</strong>
+        <strong>{toolResultLabel(tool)}</strong>
         <div className="chat-run-tool-meta">
+          {tool.agent ? <span>{specialistNames[tool.agent]}</span> : null}
           <span className={`chat-run-tool-status ${tool.status}`}>{toolStatus[tool.status]}</span>
           {duration ? <span>{duration}</span> : null}
         </div>

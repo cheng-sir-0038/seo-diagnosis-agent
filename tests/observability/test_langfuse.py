@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 
 import pytest
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
@@ -16,7 +15,7 @@ from src.observability.storage import ObservabilityDatabase
 
 @pytest.mark.asyncio
 async def test_langfuse_cloud_export_uses_otlp_and_project_credentials(
-    tmp_path: Path, monkeypatch
+    pg_url: str, monkeypatch
 ) -> None:
     requests: list[tuple[str, str, str, bytes]] = []
 
@@ -40,7 +39,7 @@ async def test_langfuse_cloud_export_uses_otlp_and_project_credentials(
     monkeypatch.setattr(runtime.settings, "langfuse_public_key", "pk-test")
     monkeypatch.setattr(runtime.settings, "langfuse_secret_key", "sk-test")
     monkeypatch.setattr(runtime.settings, "observability_jsonl_enabled", False)
-    database = ObservabilityDatabase(tmp_path / "observability.db")
+    database = ObservabilityDatabase(pg_url)
     client = ObservabilityClient(
         database, project_key="seo-agent", exporters=runtime._build_exporters(database)
     )
@@ -68,7 +67,7 @@ async def test_langfuse_cloud_export_uses_otlp_and_project_credentials(
         assert len({span.trace_id for span in spans}) == 1
         assert b"private-example" in body
         assert b"fake-header-secret" not in body
-        stored_input = await database.fetch_value("SELECT input_json FROM obs_traces")
+        stored_input = (await client.get_trace(trace.trace_id))["input_json"]
         assert "fake-header-secret" not in stored_input
     finally:
         await client.shutdown()
@@ -77,10 +76,10 @@ async def test_langfuse_cloud_export_uses_otlp_and_project_credentials(
         thread.join()
 
 
-def test_incomplete_langfuse_credentials_do_not_enable_export(tmp_path: Path, monkeypatch) -> None:
+def test_incomplete_langfuse_credentials_do_not_enable_export(monkeypatch) -> None:
     monkeypatch.setattr(runtime.settings, "langfuse_public_key", "pk-test")
     monkeypatch.setattr(runtime.settings, "langfuse_secret_key", "")
     monkeypatch.setattr(runtime.settings, "observability_otlp_endpoint", "")
     monkeypatch.setattr(runtime.settings, "observability_jsonl_enabled", False)
-    exporters = runtime._build_exporters(ObservabilityDatabase(tmp_path / "observability.db"))
+    exporters = runtime._build_exporters(ObservabilityDatabase())
     assert exporters[-1].enabled is False

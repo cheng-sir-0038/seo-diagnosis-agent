@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from src.agent.workspace.routing import ROUTE_PROMPT_KEY, ROUTING_PROMPT, RouteDecision
 from src.models.geo import GeoContentDraft, GeoQuestionSelection
 from src.models.page_suggestions import PageSeoDraft
 from src.models.share_image import ShareImageBrief
@@ -12,6 +13,13 @@ from src.seo_agent.opportunities.models import OpportunityDiscoveryOutput
 from src.seo_agent.tasks.models import TaskPrdContent
 
 SEO_PROMPT_DEFINITIONS: dict[str, dict[str, Any]] = {
+    ROUTE_PROMPT_KEY: {
+        "name": "工作台业务分派",
+        "purpose": "根据业务意图、对话上下文和用户提供的目标选择专员",
+        "system_template": ROUTING_PROMPT,
+        "user_template": "{{input}}",
+        "output_schema": RouteDecision.model_json_schema(),
+    },
     "seo.geo.question_researcher": {
         "name": "GEO 选题研究员",
         "purpose": "从搜索样本中挑一个和目标页业务相关的问题",
@@ -171,14 +179,10 @@ class SeoPromptSeeder:
                 change_summary="内置 V1 提示词迁移",
                 created_by="seo-prompt-seeder",
             )
-            deployments = await self.registry.list_deployments(prompt["id"])
-            if not any(item["environment"] == self.environment for item in deployments):
-                await self.registry.promote(
-                    prompt["id"],
-                    initial["id"],
-                    environment=self.environment,
-                    reason="初始化生产提示词",
-                )
+            await self.registry.deploy_if_missing(
+                prompt["id"], initial["id"],
+                environment=self.environment, reason="初始化生产提示词",
+            )
             resolved[prompt_key] = await self.registry.resolve_version(
                 prompt_key,
                 environment=self.environment,

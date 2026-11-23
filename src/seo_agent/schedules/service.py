@@ -5,7 +5,13 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
+from sqlalchemy import insert, select, update
+
 from src.seo_agent.db.database import SeoAgentDatabase
+from src.seo_agent.db.models import (
+    ScheduleRunRow,
+    WorkScheduleRow,
+)
 
 
 def _id(prefix: str) -> str:
@@ -35,49 +41,53 @@ class WorkScheduleService:
         schedule_id = _id("schedule")
         now = _now()
         await self.database.execute(
-            "INSERT INTO work_schedules(id, site_id, schedule_type, name, frequency, weekday, "
-            "execution_time, timezone, enabled, config_json, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
-            (
-                schedule_id,
-                site_id,
-                schedule_type,
-                name,
-                frequency,
-                weekday,
-                execution_time,
-                timezone,
-                json.dumps(config or {}, ensure_ascii=False),
-                now,
-                now,
-            ),
+            insert(WorkScheduleRow).values(
+                id=schedule_id,
+                site_id=site_id,
+                schedule_type=schedule_type,
+                name=name,
+                frequency=frequency,
+                weekday=weekday,
+                execution_time=execution_time,
+                timezone=timezone,
+                enabled=1,
+                config_json=json.dumps(config or {}, ensure_ascii=False),
+                created_at=now,
+                updated_at=now,
+            )
         )
         row = await self.database.fetch_one(
-            "SELECT * FROM work_schedules WHERE id = ?", (schedule_id,)
+            select(WorkScheduleRow.__table__).where(WorkScheduleRow.id == schedule_id)
         )
         assert row is not None
         return row
 
     async def list_schedules(self, site_id: str) -> list[dict[str, Any]]:
         return await self.database.fetch_all(
-            "SELECT * FROM work_schedules WHERE site_id = ? AND archived_at IS NULL "
-            "ORDER BY created_at",
-            (site_id,),
+            select(WorkScheduleRow.__table__)
+            .where(WorkScheduleRow.site_id == site_id, WorkScheduleRow.archived_at.is_(None))
+            .order_by(WorkScheduleRow.created_at)
         )
 
     async def list_runs(self, schedule_id: str, limit: int = 50) -> list[dict[str, Any]]:
         return await self.database.fetch_all(
-            "SELECT * FROM schedule_runs WHERE schedule_id = ? ORDER BY created_at DESC LIMIT ?",
-            (schedule_id, max(1, min(limit, 200))),
+            select(ScheduleRunRow.__table__)
+            .where(ScheduleRunRow.schedule_id == schedule_id)
+            .order_by(ScheduleRunRow.created_at.desc())
+            .limit(max(1, min(limit, 200)))
         )
 
     async def set_enabled(self, schedule_id: str, enabled: bool) -> dict[str, Any]:
         await self.database.execute(
-            "UPDATE work_schedules SET enabled = ?, updated_at = ? WHERE id = ?",
-            (int(enabled), _now(), schedule_id),
+            update(WorkScheduleRow)
+            .where(WorkScheduleRow.id == schedule_id)
+            .values(
+                enabled=int(enabled),
+                updated_at=_now(),
+            )
         )
         row = await self.database.fetch_one(
-            "SELECT * FROM work_schedules WHERE id = ?", (schedule_id,)
+            select(WorkScheduleRow.__table__).where(WorkScheduleRow.id == schedule_id)
         )
         if row is None:
             raise KeyError(f"工作计划不存在: {schedule_id}")

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from pathlib import Path
+import asyncio
 
 import pytest
+from sqlalchemy import inspect
 
 from src.seo_agent.adapters.base import AdapterHealth, AdapterStatus, BaseAdapter
 from src.seo_agent.adapters.registry import AdapterDefinition, AdapterRegistry
@@ -24,14 +25,18 @@ class ReadyAdapter(BaseAdapter):
 
 
 @pytest.mark.asyncio
-async def test_database_creates_complete_foundation_schema(tmp_path: Path) -> None:
-    database = SeoAgentDatabase(tmp_path / "seo-agent.db")
+async def test_database_creates_complete_foundation_schema(pg_url: str) -> None:
+    database = SeoAgentDatabase(pg_url)
     await database.startup()
     try:
-        rows = await database.fetch_all(
-            "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
-        )
-        tables = {row["name"] for row in rows}
+        async with database.orm_session() as session:
+            connection = await session.connection()
+            tables, refs = await connection.run_sync(
+                lambda conn: (
+                    set(inspect(conn).get_table_names()),
+                    inspect(conn).get_foreign_keys("agent_runtime_tasks"),
+                )
+            )
         assert {
             "sites",
             "actors",
@@ -55,8 +60,7 @@ async def test_database_creates_complete_foundation_schema(tmp_path: Path) -> No
             "monitoring_plans",
             "notification_subscriptions",
         } <= tables
-        foreign_keys = await database.fetch_value("PRAGMA foreign_keys")
-        assert foreign_keys == 1
+        assert {"sites", "workflow_threads"} <= {ref["referred_table"] for ref in refs}
     finally:
         await database.shutdown()
 
@@ -87,8 +91,8 @@ def test_adapter_registry_resolves_real_and_placeholder_definitions() -> None:
 
 
 @pytest.mark.asyncio
-async def test_system_service_persists_site_thread_run_and_work_record(tmp_path: Path) -> None:
-    database = SeoAgentDatabase(tmp_path / "seo-agent.db")
+async def test_system_service_persists_site_thread_run_and_work_record(pg_url: str) -> None:
+    database = SeoAgentDatabase(pg_url)
     await database.startup()
     service = SeoAgentSystemService(database)
     try:
@@ -111,16 +115,23 @@ async def test_system_service_persists_site_thread_run_and_work_record(tmp_path:
             business_object_id=site["id"],
         )
         run = await service.start_run(thread_id=thread["thread_id"], trigger_type="MANUAL")
-        record = await service.append_work_record(
-            site_id=site["id"],
-            title="M1 started",
-            summary="Foundation run",
-            record_type="foundation_started",
-            actor_id=actor["id"],
-            agent_run_id=run["id"],
-            idempotency_key="foundation:1",
-        )
+
+        async def log_run():
+            return await service.append_work_record(
+                site_id=site["id"],
+                title="M1 started",
+                summary="Foundation run",
+                record_type="foundation_started",
+                actor_id=actor["id"],
+                agent_run_id=run["id"],
+                idempotency_key="foundation:1",
+            )
+
+        record, retried = await asyncio.gather(log_run(), log_run())
+        assert record["id"] == retried["id"]
         assert (await service.get_site(site["id"]))["domain"] == "example.com"
+        assert (await service.find_site_by_host("WWW.EXAMPLE.COM."))["id"] == site["id"]
+        assert await service.find_site_by_host("elsewhere.example") is None
         assert (await service.get_thread(thread["thread_id"]))["id"] == thread["id"]
         assert record["id"]
         assert len(await service.list_work_records(site["id"])) == 1
@@ -129,8 +140,8 @@ async def test_system_service_persists_site_thread_run_and_work_record(tmp_path:
 
 
 @pytest.mark.asyncio
-async def test_langgraph_sqlite_checkpoint_persists_thread_state(tmp_path: Path) -> None:
-    manager = CheckpointManager(tmp_path / "checkpoints.db")
+async def test_langgraph_postgres_checkpoint_persists_thread_state(pg_url: str) -> None:
+    manager = CheckpointManager(pg_url)
     await manager.startup()
     try:
         graph = build_foundation_graph(manager.saver)
@@ -219,13 +230,13 @@ async def test_structured_deepseek_request_uses_supported_thinking_mode(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_seo_agent_system_api_uses_real_sqlite_store(tmp_path: Path, monkeypatch) -> None:
+async def test_seo_agent_system_api_uses_postgres(pg_url: str, monkeypatch) -> None:
     from httpx import ASGITransport, AsyncClient
 
     from src.api.routes import seo_agent_system as route
     from src.server import app
 
-    database = SeoAgentDatabase(tmp_path / "api.db")
+    database = SeoAgentDatabase(pg_url)
     await database.startup()
     service = SeoAgentSystemService(database)
     monkeypatch.setattr(route, "seo_agent_database", database)
@@ -243,8 +254,13 @@ async def test_seo_agent_system_api_uses_real_sqlite_store(tmp_path: Path, monke
                     "timezone": "UTC",
                 },
             )
+            duplicate = await client.post(
+                "/api/v1/seo-agent/system/sites",
+                json={"name": "Another name", "domain": "API.EXAMPLE.COM"},
+            )
             listed = await client.get("/api/v1/seo-agent/system/sites")
         assert created.status_code == 201
+        assert duplicate.status_code == 409
         assert listed.status_code == 200
         assert listed.json()[0]["domain"] == "api.example.com"
     finally:

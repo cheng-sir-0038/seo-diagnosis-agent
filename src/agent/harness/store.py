@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import json
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
+
+from sqlalchemy import func, select, update
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.engine import Row
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.agent.harness.summary import build_survival_summary
 from src.agent.models import (
@@ -15,6 +20,15 @@ from src.agent.models import (
     RunStatus,
 )
 from src.seo_agent.db.database import SeoAgentDatabase
+from src.seo_agent.db.models import (
+    AgentRunCheckpointRow,
+    AgentRunEventRow,
+    AgentRunRow,
+    AgentRuntimeTaskRow,
+    AgentSurvivalSummaryRow,
+    SiteRow,
+    WorkflowThreadRow,
+)
 
 
 def _now() -> str:
@@ -23,6 +37,10 @@ def _now() -> str:
 
 def _id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
+
+
+def _dump(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False)
 
 
 @dataclass(frozen=True)
@@ -39,7 +57,7 @@ class AgentChatHarnessStore:
     async def create_task_run(
         self,
         *,
-        site_id: str,
+        site_id: str | None = None,
         conversation_id: str | None,
         title: str,
         user_intent: str,
@@ -49,102 +67,154 @@ class AgentChatHarnessStore:
         prompt_version: str | None = None,
         prompt_hash: str | None = None,
         available_tools: list[str] | None = None,
+        dispatch_state: dict[str, Any] | None = None,
     ) -> CreatedAgentTaskRun:
-        await self._require_site(site_id)
         task_id = _id("agtask")
-        thread_key = f"chat_{site_id}_{conversation_id}" if conversation_id else _id("chat")
-        thread = await self.database.fetch_one(
-            "SELECT * FROM workflow_threads WHERE thread_id = ?",
-            (thread_key,),
-        )
-        now = _now()
-        if thread is None:
-            internal_thread_id = _id("wft")
-            await self.database.execute(
-                "INSERT INTO workflow_threads(id, site_id, thread_id, workflow_type, "
-                "graph_version, "
-                "policy_version, business_object_type, business_object_id, status, current_stage, "
-                "created_at) VALUES (?, ?, ?, 'SEO_CHAT', 'chat-v1', 'chat-v1', "
-                "'AGENT_RUNTIME_TASK', ?, 'ACTIVE', 'created', ?)",
-                (internal_thread_id, site_id, thread_key, task_id, now),
+        if not conversation_id:
+            thread_key = _id("chat")
+        elif site_id is None:
+            thread_key = f"conversation:{conversation_id}"
+        else:
+            thread_key = f"chat_{site_id}_{conversation_id}"
+        workflow_type = "AGENT_CHAT" if site_id is None else "SEO_CHAT"
+        async with self.database.orm_session(write=True) as session:
+            if site_id is not None and await session.get(SiteRow, site_id) is None:
+                raise KeyError(f"站点不存在: {site_id}")
+            await session.execute(
+                insert(WorkflowThreadRow)
+                .values(
+                    id=_id("wft"),
+                    site_id=site_id,
+                    thread_id=thread_key,
+                    workflow_type=workflow_type,
+                    graph_version="chat-v1",
+                    policy_version="chat-v1",
+                    business_object_type="CONVERSATION",
+                    business_object_id=conversation_id or task_id,
+                    status="ACTIVE",
+                    current_stage="created",
+                    created_at=_now(),
+                )
+                .on_conflict_do_nothing(index_elements=[WorkflowThreadRow.thread_id])
             )
-            thread = await self.database.fetch_one(
-                "SELECT * FROM workflow_threads WHERE thread_id = ?", (thread_key,)
+            thread = (
+                await session.scalars(
+                    select(WorkflowThreadRow)
+                    .where(WorkflowThreadRow.thread_id == thread_key)
+                    .with_for_update()
+                )
+            ).one()
+            if thread.site_id != site_id or thread.workflow_type != workflow_type:
+                raise ValueError("此会话编号已用于其他业务范围")
+            thread.status = "ACTIVE"
+            thread.current_stage = "created"
+            thread.completed_at = None
+            thread.business_object_type = "CONVERSATION"
+            thread.business_object_id = conversation_id or task_id
+            now = _now()
+            saved = AgentRunRow(
+                id=_id("run"),
+                workflow_thread_id=thread.id,
+                trigger_type="CHAT",
+                status="PENDING",
+                current_stage="created",
+                model_provider=model_provider,
+                model_name=model_name,
+                token_usage_json="{}",
+                started_at=now,
+                created_at=now,
             )
-        assert thread is not None
-        await self.database.execute(
-            "UPDATE workflow_threads SET status = 'ACTIVE', current_stage = 'created', "
-            "completed_at = NULL, business_object_type = 'CONVERSATION', "
-            "business_object_id = ? WHERE id = ?",
-            (conversation_id or task_id, thread["id"]),
-        )
-        run_id = _id("run")
-        await self.database.execute(
-            "INSERT INTO agent_runs(id, workflow_thread_id, trigger_type, status, current_stage, "
-            "model_provider, model_name, token_usage_json, started_at, created_at) "
-            "VALUES (?, ?, 'CHAT', 'PENDING', 'created', ?, ?, '{}', ?, ?)",
-            (run_id, thread["id"], model_provider, model_name, now, now),
-        )
-        await self.database.execute(
-            "INSERT INTO agent_runtime_tasks(id, site_id, conversation_id, workflow_thread_id, "
-            "title, user_intent, status, status_group, current_stage, current_run_id, "
-            "survival_summary_json, prompt_version, prompt_hash, available_tools_json, "
-            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'PENDING', 'pending', "
-            "'created', ?, '{}', ?, ?, ?, ?, ?)",
-            (
-                task_id,
-                site_id,
-                conversation_id,
-                thread["id"],
-                title[:200] or "SEO 诊断任务",
-                user_intent,
-                run_id,
-                prompt_version,
-                prompt_hash,
-                json.dumps(available_tools or [], ensure_ascii=False),
-                now,
-                now,
-            ),
-        )
-        # Initial checkpoint makes a newly created task durable before scheduling.
-        run = AgentRun(
-            id=run_id,
-            messages=[dict(item) for item in messages],
-            task_id=task_id,
-            thread_id=thread_key,
-            site_id=site_id,
-            conversation_id=conversation_id,
-        )
-        await self.save_checkpoint(
-            run,
-            messages=run.messages,
-            iteration=0,
-            tool_count=0,
-            pending_tool_calls=[],
-            stage="created",
-            token_usage={},
-        )
-        return CreatedAgentTaskRun(task_id=task_id, thread_id=thread_key, run_id=run_id)
+            session.add(saved)
+            await session.flush()
+            task = AgentRuntimeTaskRow(
+                id=task_id,
+                site_id=site_id,
+                conversation_id=conversation_id,
+                workflow_thread_id=thread.id,
+                title=title[:200] or "对话任务",
+                user_intent=user_intent,
+                status="PENDING",
+                status_group="pending",
+                current_stage="created",
+                current_run_id=saved.id,
+                survival_summary_json="{}",
+                prompt_version=prompt_version,
+                prompt_hash=prompt_hash,
+                available_tools_json=_dump(available_tools or []),
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(task)
+            await session.flush()
+            run = AgentRun(
+                id=saved.id,
+                messages=messages,
+                task_id=task_id,
+                thread_id=thread_key,
+                site_id=site_id,
+                conversation_id=conversation_id,
+                dispatch_state=dict(dispatch_state or {}),
+            )
+            await _write_checkpoint(
+                session,
+                saved,
+                task,
+                run,
+                "created",
+                messages=messages,
+                iteration=0,
+                tool_count=0,
+                pending_tool_calls=[],
+                token_usage={},
+            )
+            return CreatedAgentTaskRun(task_id=task_id, thread_id=thread_key, run_id=run.id)
 
     async def persist_event(self, run: AgentRun, event: AgentEvent) -> None:
-        # Token deltas remain in the live SSE stream. Durable storage keeps stable
-        # boundaries only; message.completed and checkpoints preserve the answer.
+        # Token deltas are streamed live. The completed message is stored with its checkpoint.
         if event.type == "message.delta":
             return
-        await self.database.execute(
-            "INSERT OR IGNORE INTO agent_run_events(id, agent_run_id, sequence, event_type, "
-            "payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                event.event_id,
-                run.id,
-                event.sequence,
-                event.type,
-                json.dumps(event.payload, ensure_ascii=False),
-                event.created_at.isoformat(),
-            ),
+        async with self.database.orm_session(write=True) as session:
+            saved, task, _ = await _run_records(session, run.id, lock=True)
+            await _write_event(session, saved, task, run, event)
+
+    async def save_waiting(
+        self,
+        run: AgentRun,
+        *,
+        messages: list[dict[str, Any]],
+        events: tuple[AgentEvent, AgentEvent],
+    ) -> dict[str, Any]:
+        message, wait = events
+        if message.type != "message.completed" or wait.type != "run.waiting_for_input":
+            raise ValueError("等待事件必须包含回复和补充请求")
+        if any(
+            e.run_id != run.id or e.sequence != run.sequence + i for i, e in enumerate(events, 1)
+        ):
+            raise ValueError("等待事件必须属于当前运行并按顺序发布")
+        if not run.human_input or wait.payload.get("request_id") != run.human_input.request_id:
+            raise ValueError("等待事件必须对应当前的补充问题")
+        waiting = replace(
+            run,
+            status=RunStatus.WAITING_FOR_INPUT,
+            messages=messages,
+            events=[*run.events, *events],
         )
-        stage = str(event.payload.get("stage") or event.type)
-        await self._update_status_from_run(run, stage=stage)
+        async with self.database.orm_session(write=True) as session:
+            saved, task, _ = await _run_records(session, run.id, lock=True)
+            for event in events:
+                await _write_event(session, saved, task, waiting, event)
+            return await _write_checkpoint(
+                session,
+                saved,
+                task,
+                waiting,
+                "waiting_for_input",
+                messages=messages,
+                iteration=run.iteration,
+                tool_count=run.tool_count,
+                pending_tool_calls=run.pending_tool_calls,
+                token_usage=run.token_usage,
+            )
 
     async def save_checkpoint(
         self,
@@ -157,178 +227,69 @@ class AgentChatHarnessStore:
         stage: str,
         token_usage: dict[str, int],
     ) -> dict[str, Any]:
-        summary = build_survival_summary(
-            messages=messages,
-            events=run.events,
-            stage=stage,
-            token_usage=token_usage,
-        )
-        summary.human_input = run.human_input.model_dump(mode="json") if run.human_input else None
-        checkpoint_no = int(
-            await self.database.fetch_value(
-                "SELECT COALESCE(MAX(checkpoint_no), 0) + 1 FROM agent_run_checkpoints "
-                "WHERE agent_run_id = ?",
-                (run.id,),
-            )
-            or 1
-        )
-        checkpoint_id = _id("agcp")
-        now = _now()
-        await self.database.execute(
-            "INSERT INTO agent_run_checkpoints(id, agent_run_id, checkpoint_no, stage, iteration, "
-            "tool_count, messages_json, pending_tool_calls_json, token_usage_json, "
-            "survival_summary_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                checkpoint_id,
-                run.id,
-                checkpoint_no,
+        async with self.database.orm_session(write=True) as session:
+            saved, task, _ = await _run_records(session, run.id, lock=True)
+            summary = await _write_checkpoint(
+                session,
+                saved,
+                task,
+                run,
                 stage,
-                iteration,
-                tool_count,
-                json.dumps(messages, ensure_ascii=False),
-                json.dumps(pending_tool_calls, ensure_ascii=False),
-                json.dumps(token_usage, ensure_ascii=False),
-                summary.model_dump_json(),
-                now,
-            ),
-        )
-        if run.task_id:
-            await self.database.execute(
-                "INSERT INTO agent_survival_summaries(id, agent_runtime_task_id, agent_run_id, "
-                "checkpoint_id, summary_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    _id("agsum"),
-                    run.task_id,
-                    run.id,
-                    checkpoint_id,
-                    summary.model_dump_json(),
-                    now,
-                ),
+                messages=messages,
+                iteration=iteration,
+                tool_count=tool_count,
+                pending_tool_calls=pending_tool_calls,
+                token_usage=token_usage,
             )
-        await self.database.execute(
-            "UPDATE workflow_threads SET current_stage = ?, current_checkpoint_id = ?, "
-            "last_resumed_at = ? WHERE thread_id = ?",
-            (stage, checkpoint_id, now, run.thread_id),
-        )
         run.messages = [dict(item) for item in messages]
-        run.iteration = iteration
-        run.tool_count = tool_count
+        run.iteration, run.tool_count = iteration, tool_count
         run.pending_tool_calls = [dict(item) for item in pending_tool_calls]
-        run.token_usage = dict(token_usage)
-        run.survival_summary = summary.model_dump(mode="json")
-        await self._update_status_from_run(run, stage=stage, summary=run.survival_summary)
-        return run.survival_summary
+        run.token_usage, run.survival_summary = dict(token_usage), summary
+        return summary
 
     async def finalize_run(self, run: AgentRun) -> None:
-        status = _db_run_status(run.status)
-        group = _status_group(status)
-        now = _now()
-        completed_at = now if group == "ended" else None
-        await self.database.execute(
-            "UPDATE agent_runs SET status = ?, current_stage = ?, token_usage_json = ?, "
-            "completed_at = ?, stop_reason = ?, error_message = ? WHERE id = ?",
-            (
-                status,
-                run.status.value,
-                json.dumps(run.token_usage, ensure_ascii=False),
-                completed_at,
-                run.status.value if group == "ended" else None,
-                run.error,
-                run.id,
-            ),
-        )
-        if run.task_id:
-            await self.database.execute(
-                "UPDATE agent_runtime_tasks SET status = ?, status_group = ?, current_stage = ?, "
-                "survival_summary_json = ?, error_message = ?, updated_at = ?, completed_at = ? "
-                "WHERE id = ?",
-                (
-                    status,
-                    group,
-                    run.status.value,
-                    json.dumps(run.survival_summary, ensure_ascii=False),
-                    run.error,
-                    now,
-                    completed_at,
-                    run.task_id,
-                ),
-            )
-        if run.thread_id and group == "ended":
-            await self.database.execute(
-                "UPDATE workflow_threads SET current_stage = ?, status = 'COMPLETED', "
-                "completed_at = ? WHERE thread_id = ?",
-                (run.status.value, now, run.thread_id),
-            )
+        async with self.database.orm_session(write=True) as session:
+            saved, task, _ = await _run_records(session, run.id, lock=True)
+            _set_stage(saved, task, run, run.status.value, run.token_usage, run.survival_summary)
+            ended = task.status_group == "ended"
+            saved.completed_at = task.completed_at = _now() if ended else None
+            saved.stop_reason = run.status.value if ended else None
+            saved.error_message = task.error_message = run.error
+            if ended:
+                await session.execute(
+                    update(WorkflowThreadRow)
+                    .where(WorkflowThreadRow.id == saved.workflow_thread_id)
+                    .values(
+                        current_stage=run.status.value,
+                        status="COMPLETED",
+                        completed_at=saved.completed_at,
+                    )
+                )
 
-    async def restore_run(
-        self,
-        run_id: str,
-        *,
-        mark_recovering: bool = True,
-    ) -> AgentRun:
-        detail = await self.get_run(run_id)
-        checkpoint = detail.get("checkpoint")
-        if not isinstance(checkpoint, dict):
-            raise KeyError(f"Run 没有 checkpoint: {run_id}")
-        events = [
-            AgentEvent(
-                event_id=item["id"],
-                run_id=run_id,
-                type=item["event_type"],
-                sequence=int(item["sequence"]),
-                created_at=datetime.fromisoformat(item["created_at"]),
-                payload=item["payload"],
-            )
-            for item in detail["events"]
-        ]
-        restored_status = (
-            RunStatus.RECOVERING if mark_recovering else _run_status_from_db(str(detail["status"]))
-        )
-        run = AgentRun(
-            id=run_id,
-            messages=checkpoint["messages"],
-            status=restored_status,
-            events=events,
-            created_at=datetime.fromisoformat(detail["created_at"]),
-            sequence=max((event.sequence for event in events), default=0),
-            task_id=detail["task_id"],
-            thread_id=detail["thread_id"],
-            site_id=detail["site_id"],
-            conversation_id=detail.get("conversation_id"),
-            iteration=int(checkpoint["iteration"]),
-            tool_count=int(checkpoint["tool_count"]),
-            pending_tool_calls=checkpoint["pending_tool_calls"],
-            token_usage=checkpoint["token_usage"],
-            survival_summary=checkpoint["survival_summary"],
-            finished_at=(
-                datetime.fromisoformat(detail["completed_at"])
-                if detail.get("completed_at")
-                else None
-            ),
-            error=detail.get("error_message"),
-            human_input=HumanInputState.model_validate(checkpoint["survival_summary"]["human_input"])
-            if checkpoint["survival_summary"].get("human_input") else None,
-        )
-        if mark_recovering:
-            await self.database.execute(
-                "UPDATE agent_runs SET status = 'RECOVERING', "
-                "current_stage = 'recovering' WHERE id = ?",
-                (run_id,),
-            )
-            await self.database.execute(
-                "UPDATE agent_runtime_tasks SET status = 'RECOVERING', "
-                "status_group = 'running', current_stage = 'recovering', "
-                "updated_at = ? WHERE id = ?",
-                (_now(), run.task_id),
-            )
-        return run
+    async def restore_run(self, run_id: str, *, mark_recovering: bool = True) -> AgentRun:
+        async with self.database.orm_session(write=mark_recovering) as session:
+            saved, task, thread_key = await _run_records(session, run_id, lock=mark_recovering)
+            run = _restore_run(await _run_detail(session, saved, task, thread_key))
+            if mark_recovering:
+                _begin_recovery(saved, task, run)
+            return run
+
+    async def claim_retry(self, run_id: str) -> AgentRun:
+        async with self.database.orm_session(write=True) as session:
+            saved, task, thread_key = await _run_records(session, run_id, lock=True)
+            if saved.status not in {"FAILED", "RECOVERY_BLOCKED"}:
+                raise ValueError("只有失败或恢复受阻的运行可以重试")
+            run = _restore_run(await _run_detail(session, saved, task, thread_key))
+            _begin_recovery(saved, task, run)
+            return run
 
     async def submit_input(
         self, run_id: str, answer: HumanInputAnswer
     ) -> tuple[AgentRun, bool, int]:
-        async with self.database.transaction() as session:
-            store = AgentChatHarnessStore(session)
-            run = await store.restore_run(run_id, mark_recovering=False)
+        async with self.database.orm_session(write=True) as session:
+            # Serialize the receipt check and checkpoint on the run, across processes.
+            saved, task, thread_key = await _run_records(session, run_id, lock=True)
+            run = _restore_run(await _run_detail(session, saved, task, thread_key))
             for event in run.events:
                 if (
                     event.type == "input.submitted"
@@ -347,155 +308,392 @@ class AgentChatHarnessStore:
                 raise ValueError("补充请求已经变化，请刷新后回答当前问题")
             if answer.action == "use_available" and not pending.allow_use_available:
                 raise ValueError("当前步骤必须补充必要信息，不能直接跳过")
-            pending.answer = answer.answer
-            pending.action = answer.action
+            pending.answer, pending.action = answer.answer, answer.action
             run.messages.append({"role": "user", "content": answer.answer})
             run.status = RunStatus.RECOVERING
             event = run.emit("input.submitted", answer.model_dump(mode="json"))
-            await store.persist_event(run, event)
-            await store.save_checkpoint(
-                run, messages=run.messages, iteration=run.iteration, tool_count=run.tool_count,
-                pending_tool_calls=run.pending_tool_calls, stage="input_submitted",
+            await _write_event(session, saved, task, run, event)
+            run.survival_summary = await _write_checkpoint(
+                session,
+                saved,
+                task,
+                run,
+                "input_submitted",
+                messages=run.messages,
+                iteration=run.iteration,
+                tool_count=run.tool_count,
+                pending_tool_calls=run.pending_tool_calls,
                 token_usage=run.token_usage,
             )
             return run, False, event.sequence
 
     async def list_recoverable_runs(self) -> list[str]:
-        rows = await self.database.fetch_all(
-            "SELECT id FROM agent_runs WHERE trigger_type = 'CHAT' "
-            "AND status IN ('PENDING', 'RUNNING', 'RECOVERING') ORDER BY created_at"
-        )
-        return [str(row["id"]) for row in rows]
-
-    async def mark_recovery_blocked(self, run_id: str, message: str) -> None:
-        now = _now()
-        detail = await self.get_run(run_id)
-        await self.database.execute(
-            "UPDATE agent_runs SET status = 'RECOVERY_BLOCKED', "
-            "current_stage = 'recovery_blocked', "
-            "error_message = ? WHERE id = ?",
-            (message[:1000], run_id),
-        )
-        await self.database.execute(
-            "UPDATE agent_runtime_tasks SET status = 'RECOVERY_BLOCKED', status_group = 'running', "
-            "current_stage = 'recovery_blocked', error_message = ?, updated_at = ? WHERE id = ?",
-            (message[:1000], now, detail["task_id"]),
-        )
-
-    async def get_task(self, task_id: str) -> dict[str, Any]:
-        row = await self.database.fetch_one(
-            "SELECT t.*, w.thread_id FROM agent_runtime_tasks t "
-            "JOIN workflow_threads w ON w.id = t.workflow_thread_id WHERE t.id = ?",
-            (task_id,),
-        )
-        if row is None:
-            raise KeyError(f"Agent Task 不存在: {task_id}")
-        return _decode_task(row)
-
-    async def list_tasks(
-        self,
-        *,
-        site_id: str | None = None,
-        status_group: str | None = None,
-        limit: int = 100,
-    ) -> list[dict[str, Any]]:
-        clauses: list[str] = []
-        params: list[Any] = []
-        if site_id:
-            clauses.append("t.site_id = ?")
-            params.append(site_id)
-        if status_group:
-            clauses.append("t.status_group = ?")
-            params.append(status_group)
-        where = " WHERE " + " AND ".join(clauses) if clauses else ""
-        params.append(max(1, min(limit, 500)))
-        rows = await self.database.fetch_all(
-            "SELECT t.*, w.thread_id FROM agent_runtime_tasks t "
-            "JOIN workflow_threads w ON w.id = t.workflow_thread_id"
-            + where
-            + " ORDER BY t.updated_at DESC LIMIT ?",
-            tuple(params),
-        )
-        return [_decode_task(row) for row in rows]
-
-    async def get_run(self, run_id: str) -> dict[str, Any]:
-        row = await self.database.fetch_one(
-            "SELECT r.*, t.id AS task_id, t.site_id, t.conversation_id, t.status AS task_status, "
-            "w.thread_id FROM agent_runs r "
-            "JOIN workflow_threads w ON w.id = r.workflow_thread_id "
-            "JOIN agent_runtime_tasks t ON t.current_run_id = r.id WHERE r.id = ?",
-            (run_id,),
-        )
-        if row is None:
-            raise KeyError(f"Agent Run 不存在: {run_id}")
-        events = await self.database.fetch_all(
-            "SELECT * FROM agent_run_events WHERE agent_run_id = ? ORDER BY sequence", (run_id,)
-        )
-        checkpoint_row = await self.database.fetch_one(
-            "SELECT * FROM agent_run_checkpoints WHERE agent_run_id = ? "
-            "ORDER BY checkpoint_no DESC LIMIT 1",
-            (run_id,),
-        )
-        return {
-            **row,
-            "token_usage": _json(row.get("token_usage_json"), {}),
-            "events": [
-                {**event, "payload": _json(event.get("payload_json"), {})} for event in events
-            ],
-            "checkpoint": _decode_checkpoint(checkpoint_row) if checkpoint_row else None,
-        }
-
-    async def _require_site(self, site_id: str) -> None:
-        if await self.database.fetch_one("SELECT id FROM sites WHERE id = ?", (site_id,)) is None:
-            raise KeyError(f"站点不存在: {site_id}")
-
-    async def _update_status_from_run(
-        self,
-        run: AgentRun,
-        *,
-        stage: str,
-        summary: dict[str, Any] | None = None,
-    ) -> None:
-        status = _db_run_status(run.status)
-        group = _status_group(status)
-        now = _now()
-        await self.database.execute(
-            "UPDATE agent_runs SET status = ?, current_stage = ?, "
-            "token_usage_json = ? WHERE id = ?",
-            (status, stage, json.dumps(run.token_usage, ensure_ascii=False), run.id),
-        )
-        if run.task_id:
-            await self.database.execute(
-                "UPDATE agent_runtime_tasks SET status = ?, status_group = ?, current_stage = ?, "
-                "survival_summary_json = ?, updated_at = ? WHERE id = ?",
-                (
-                    status,
-                    group,
-                    stage,
-                    json.dumps(summary or run.survival_summary, ensure_ascii=False),
-                    now,
-                    run.task_id,
-                ),
+        async with self.database.orm_session() as session:
+            return list(
+                await session.scalars(
+                    select(AgentRunRow.id)
+                    .where(
+                        AgentRunRow.trigger_type == "CHAT",
+                        AgentRunRow.status.in_(("PENDING", "RUNNING", "RECOVERING")),
+                    )
+                    .order_by(AgentRunRow.created_at, AgentRunRow.id)
+                )
             )
 
+    async def mark_recovery_blocked(self, run_id: str, message: str) -> None:
+        async with self.database.orm_session(write=True) as session:
+            saved, task, _ = await _run_records(session, run_id, lock=True)
+            saved.status = task.status = "RECOVERY_BLOCKED"
+            saved.current_stage = task.current_stage = "recovery_blocked"
+            saved.error_message = task.error_message = message[:1000]
+            task.status_group, task.updated_at = "running", _now()
 
-def _decode_task(row: dict[str, Any]) -> dict[str, Any]:
+    async def get_task(self, task_id: str) -> dict[str, Any]:
+        async with self.database.orm_session() as session:
+            row = (
+                await session.execute(_TASKS_WITH_THREAD.where(AgentRuntimeTaskRow.id == task_id))
+            ).one_or_none()
+            if row is None:
+                raise KeyError(f"Agent Task 不存在: {task_id}")
+            return _decode_task(*row)
+
+    async def list_tasks(
+        self, *, site_id: str | None = None, status_group: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        query = _TASKS_WITH_THREAD.order_by(AgentRuntimeTaskRow.updated_at.desc())
+        if site_id:
+            query = query.where(AgentRuntimeTaskRow.site_id == site_id)
+        if status_group:
+            query = query.where(AgentRuntimeTaskRow.status_group == status_group)
+        async with self.database.orm_session() as session:
+            rows = await session.execute(query.limit(max(1, min(limit, 500))))
+            return [_decode_task(*row) for row in rows]
+
+    async def latest_dispatch_state(
+        self, conversation_id: str, *, include_dialog: bool = True
+    ) -> dict[str, Any]:
+        async with self.database.orm_session() as session:
+            checkpoint = await _completed_conversation_checkpoint(session, conversation_id)
+            if checkpoint is None:
+                return {}
+            checkpoint_id, run_id, dispatch_state_json = checkpoint
+            state = _json(dispatch_state_json, {})
+            if state.get("active_agent"):
+                state["source_run_id"] = run_id
+                if include_dialog:
+                    state["server_dialog"] = await _checkpoint_dialog(session, checkpoint_id)
+            return state
+
+    async def completed_dialog(
+        self, run_id: str, conversation_id: str, agent: str
+    ) -> list[dict[str, str]]:
+        """Load text only after verifying the pinned run, conversation and specialist."""
+        if not run_id or not conversation_id or not agent:
+            return []
+        async with self.database.orm_session() as session:
+            checkpoint = await _completed_conversation_checkpoint(session, conversation_id, run_id)
+            if checkpoint is None:
+                return []
+            checkpoint_id, _, dispatch_state_json = checkpoint
+            if _json(dispatch_state_json, {}).get("active_agent") != agent:
+                return []
+            return await _checkpoint_dialog(session, checkpoint_id)
+
+    async def get_run(self, run_id: str) -> dict[str, Any]:
+        async with self.database.orm_session() as session:
+            saved, task, thread_key = await _run_records(session, run_id)
+            return await _run_detail(session, saved, task, thread_key)
+
+
+_TASKS_WITH_THREAD = select(AgentRuntimeTaskRow, WorkflowThreadRow.thread_id).join(
+    WorkflowThreadRow, WorkflowThreadRow.id == AgentRuntimeTaskRow.workflow_thread_id
+)
+
+
+async def _run_records(
+    session: AsyncSession, run_id: str, *, lock: bool = False
+) -> tuple[AgentRunRow, AgentRuntimeTaskRow, str]:
+    query = (
+        select(AgentRunRow, AgentRuntimeTaskRow, WorkflowThreadRow.thread_id)
+        .join_from(
+            AgentRunRow, WorkflowThreadRow, AgentRunRow.workflow_thread_id == WorkflowThreadRow.id
+        )
+        .join(AgentRuntimeTaskRow, AgentRuntimeTaskRow.current_run_id == AgentRunRow.id)
+        .where(AgentRunRow.id == run_id)
+    )
+    if lock:
+        query = query.with_for_update(of=AgentRunRow)
+    row = (await session.execute(query)).one_or_none()
+    if row is None:
+        raise KeyError(f"Agent Run 不存在: {run_id}")
+    return row[0], row[1], row[2]
+
+
+def _set_stage(
+    saved: AgentRunRow,
+    task: AgentRuntimeTaskRow,
+    run: AgentRun,
+    stage: str,
+    token_usage: dict[str, int],
+    summary: dict[str, Any],
+) -> None:
+    saved.status = task.status = run.status.value.upper()
+    saved.current_stage = task.current_stage = stage
+    saved.token_usage_json = _dump(token_usage)
+    task.status_group, task.updated_at = _status_group(saved.status), _now()
+    task.survival_summary_json = _dump(summary)
+
+
+def _begin_recovery(saved: AgentRunRow, task: AgentRuntimeTaskRow, run: AgentRun) -> None:
+    run.status = RunStatus.RECOVERING
+    run.error = saved.error_message = task.error_message = None
+    run.finished_at = saved.completed_at = task.completed_at = None
+    saved.stop_reason = None
+    _set_stage(saved, task, run, "recovering", run.token_usage, run.survival_summary)
+
+
+async def _write_event(
+    session: AsyncSession,
+    saved: AgentRunRow,
+    task: AgentRuntimeTaskRow,
+    run: AgentRun,
+    event: AgentEvent,
+) -> None:
+    inserted = await session.scalar(
+        insert(AgentRunEventRow)
+        .values(
+            id=event.event_id,
+            agent_run_id=run.id,
+            sequence=event.sequence,
+            event_type=event.type,
+            payload_json=_dump(event.payload),
+            created_at=event.created_at.isoformat(),
+        )
+        .on_conflict_do_nothing()
+        .returning(AgentRunEventRow.id)
+    )
+    if inserted is not None:
+        _set_stage(
+            saved,
+            task,
+            run,
+            str(event.payload.get("stage") or event.type),
+            run.token_usage,
+            run.survival_summary,
+        )
+
+
+async def _write_checkpoint(
+    session: AsyncSession,
+    saved: AgentRunRow,
+    task: AgentRuntimeTaskRow,
+    run: AgentRun,
+    stage: str,
+    *,
+    messages: list[dict[str, Any]],
+    iteration: int,
+    tool_count: int,
+    pending_tool_calls: list[dict[str, Any]],
+    token_usage: dict[str, int],
+) -> dict[str, Any]:
+    summary = build_survival_summary(
+        messages=messages,
+        events=run.events,
+        stage=stage,
+        token_usage=token_usage,
+    )
+    summary.human_input = run.human_input.model_dump(mode="json") if run.human_input else None
+    summary_data, summary_json = summary.model_dump(mode="json"), summary.model_dump_json()
+    # Every checkpoint writer holds the parent run row lock until this transaction commits.
+    previous = await session.scalar(
+        select(func.max(AgentRunCheckpointRow.checkpoint_no)).where(
+            AgentRunCheckpointRow.agent_run_id == run.id
+        )
+    )
+    now = _now()
+    checkpoint = AgentRunCheckpointRow(
+        id=_id("agcp"),
+        agent_run_id=run.id,
+        checkpoint_no=(previous or 0) + 1,
+        stage=stage,
+        iteration=iteration,
+        tool_count=tool_count,
+        messages_json=_dump(messages),
+        pending_tool_calls_json=_dump(pending_tool_calls),
+        token_usage_json=_dump(token_usage),
+        survival_summary_json=summary_json,
+        dispatch_state_json=_dump(run.dispatch_state),
+        created_at=now,
+    )
+    session.add(checkpoint)
+    await session.flush()
+    session.add(
+        AgentSurvivalSummaryRow(
+            id=_id("agsum"),
+            agent_runtime_task_id=task.id,
+            agent_run_id=run.id,
+            checkpoint_id=checkpoint.id,
+            summary_json=summary_json,
+            created_at=now,
+        )
+    )
+    await session.execute(
+        update(WorkflowThreadRow)
+        .where(WorkflowThreadRow.id == saved.workflow_thread_id)
+        .values(current_stage=stage, current_checkpoint_id=checkpoint.id, last_resumed_at=now)
+    )
+    _set_stage(saved, task, run, stage, token_usage, summary_data)
+    return summary_data
+
+
+def _decode_task(task: AgentRuntimeTaskRow, thread_key: str) -> dict[str, Any]:
     return {
-        **row,
-        "survival_summary": _json(row.get("survival_summary_json"), {}),
-        "available_tools": _json(row.get("available_tools_json"), []),
+        **task.as_dict(),
+        "thread_id": thread_key,
+        "survival_summary": _json(task.survival_summary_json, {}),
+        "available_tools": _json(task.available_tools_json, []),
     }
 
 
-def _decode_checkpoint(row: dict[str, Any]) -> dict[str, Any]:
+async def _completed_conversation_checkpoint(
+    session: AsyncSession,
+    conversation_id: str,
+    run_id: str | None = None,
+) -> Row[tuple[str, str, str]] | None:
+    run = (
+        select(AgentRunRow.id)
+        .join(WorkflowThreadRow, AgentRunRow.workflow_thread_id == WorkflowThreadRow.id)
+        .where(
+            WorkflowThreadRow.thread_id == f"conversation:{conversation_id}",
+            WorkflowThreadRow.site_id.is_(None),
+            WorkflowThreadRow.workflow_type == "AGENT_CHAT",
+            AgentRunRow.trigger_type == "CHAT",
+            AgentRunRow.status == "COMPLETED",
+        )
+    )
+    if run_id is None:
+        run = run.order_by(AgentRunRow.started_at.desc(), AgentRunRow.id.desc())
+    else:
+        run = run.where(AgentRunRow.id == run_id)
+    query = (
+        select(
+            AgentRunCheckpointRow.id,
+            AgentRunCheckpointRow.agent_run_id,
+            AgentRunCheckpointRow.dispatch_state_json,
+        )
+        .where(AgentRunCheckpointRow.agent_run_id == run.limit(1).scalar_subquery())
+        .order_by(AgentRunCheckpointRow.checkpoint_no.desc())
+        .limit(1)
+    )
+    return (await session.execute(query)).one_or_none()
+
+
+async def _checkpoint_dialog(session: AsyncSession, checkpoint_id: str) -> list[dict[str, str]]:
+    messages = await session.scalar(
+        select(AgentRunCheckpointRow.messages_json).where(AgentRunCheckpointRow.id == checkpoint_id)
+    )
+    return _recent_dialog(_json(messages, []))
+
+
+def _recent_dialog(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
+    dialog = []
+    for message in reversed(messages):
+        role, content = message.get("role"), message.get("content")
+        if (
+            role in {"user", "assistant"}
+            and not message.get("tool_calls")
+            and not message.get("tool_call_id")
+            and isinstance(content, str)
+            and content.strip()
+        ):
+            dialog.append({"role": role, "content": content[:2000]})
+            if len(dialog) == 4:
+                break
+    return list(reversed(dialog))
+
+
+async def _run_detail(
+    session: AsyncSession,
+    saved: AgentRunRow,
+    task: AgentRuntimeTaskRow,
+    thread_key: str,
+) -> dict[str, Any]:
+    events = await session.scalars(
+        select(AgentRunEventRow)
+        .where(AgentRunEventRow.agent_run_id == saved.id)
+        .order_by(AgentRunEventRow.sequence)
+    )
+    checkpoint = await session.scalar(
+        select(AgentRunCheckpointRow)
+        .where(AgentRunCheckpointRow.agent_run_id == saved.id)
+        .order_by(AgentRunCheckpointRow.checkpoint_no.desc())
+        .limit(1)
+    )
     return {
-        **row,
-        "messages": _json(row.get("messages_json"), []),
-        "pending_tool_calls": _json(row.get("pending_tool_calls_json"), []),
-        "token_usage": _json(row.get("token_usage_json"), {}),
-        "survival_summary": _json(row.get("survival_summary_json"), {}),
-        "available_tools": _json(row.get("available_tools_json"), []),
+        **saved.as_dict(),
+        "task_id": task.id,
+        "site_id": task.site_id,
+        "conversation_id": task.conversation_id,
+        "task_status": task.status,
+        "thread_id": thread_key,
+        "token_usage": _json(saved.token_usage_json, {}),
+        "events": [
+            {**event.as_dict(), "payload": _json(event.payload_json, {})} for event in events
+        ],
+        "checkpoint": {
+            **checkpoint.as_dict(),
+            "messages": _json(checkpoint.messages_json, []),
+            "dispatch_state": _json(checkpoint.dispatch_state_json, {}),
+            "pending_tool_calls": _json(checkpoint.pending_tool_calls_json, []),
+            "token_usage": _json(checkpoint.token_usage_json, {}),
+            "survival_summary": _json(checkpoint.survival_summary_json, {}),
+            "available_tools": [],
+        }
+        if checkpoint is not None
+        else None,
     }
+
+
+def _restore_run(detail: dict[str, Any]) -> AgentRun:
+    run_id = detail["id"]
+    checkpoint = detail["checkpoint"]
+    if checkpoint is None:
+        raise KeyError(f"Run 没有 checkpoint: {run_id}")
+    events = [
+        AgentEvent(
+            event_id=item["id"],
+            run_id=run_id,
+            type=item["event_type"],
+            sequence=item["sequence"],
+            created_at=datetime.fromisoformat(item["created_at"]),
+            payload=item["payload"],
+        )
+        for item in detail["events"]
+    ]
+    human_input = checkpoint["survival_summary"].get("human_input")
+    return AgentRun(
+        id=run_id,
+        messages=checkpoint["messages"],
+        status=_run_status_from_db(detail["status"]),
+        events=events,
+        created_at=datetime.fromisoformat(detail["created_at"]),
+        sequence=max((event.sequence for event in events), default=0),
+        task_id=detail["task_id"],
+        thread_id=detail["thread_id"],
+        site_id=detail["site_id"],
+        conversation_id=detail["conversation_id"],
+        iteration=checkpoint["iteration"],
+        tool_count=checkpoint["tool_count"],
+        pending_tool_calls=checkpoint["pending_tool_calls"],
+        token_usage=checkpoint["token_usage"],
+        survival_summary=checkpoint["survival_summary"],
+        dispatch_state=checkpoint["dispatch_state"],
+        finished_at=datetime.fromisoformat(detail["completed_at"])
+        if detail["completed_at"]
+        else None,
+        error=detail["error_message"],
+        human_input=HumanInputState.model_validate(human_input) if human_input else None,
+    )
 
 
 def _json(value: Any, fallback: Any) -> Any:
@@ -509,12 +707,8 @@ def _json(value: Any, fallback: Any) -> Any:
         return fallback
 
 
-def _db_run_status(status: RunStatus) -> str:
-    return status.value.upper()
-
-
 def _status_group(status: str) -> str:
-    if status in {"PENDING"}:
+    if status == "PENDING":
         return "pending"
     if status in {"RUNNING", "RECOVERING", "RECOVERY_BLOCKED", "WAITING_FOR_INPUT"}:
         return "running"
@@ -522,8 +716,7 @@ def _status_group(status: str) -> str:
 
 
 def _run_status_from_db(status: str) -> RunStatus:
-    normalized = status.lower()
     try:
-        return RunStatus(normalized)
+        return RunStatus(status.lower())
     except ValueError:
         return RunStatus.FAILED

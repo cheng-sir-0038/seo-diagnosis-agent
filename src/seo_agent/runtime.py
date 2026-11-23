@@ -46,8 +46,8 @@ from src.seo_agent.workflows.opportunity_discovery import OpportunityDiscoveryWo
 from src.seo_agent.workflows.task_delivery import TaskDeliveryWorkflows
 from src.seo_agent.workflows.task_planning import TaskPlanningWorkflow
 
-seo_agent_database = SeoAgentDatabase(settings.seo_agent_sqlite_path)
-checkpoint_manager = CheckpointManager(settings.langgraph_checkpoint_sqlite_path)
+seo_agent_database = SeoAgentDatabase()
+checkpoint_manager = CheckpointManager()
 seo_chat_harness_store = AgentChatHarnessStore(seo_agent_database)
 seo_chat_recovery_service = SeoChatRecoveryService(seo_chat_harness_store, run_manager)
 adapter_registry = AdapterRegistry()

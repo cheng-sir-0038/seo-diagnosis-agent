@@ -11,6 +11,9 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from sqlalchemy import func, insert, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
 from src.observability.context import reset_current_context, set_current_context
 from src.observability.exporters import ObservationExporter
 from src.observability.models import (
@@ -23,6 +26,20 @@ from src.observability.models import (
 )
 from src.observability.otel_ids import new_span_id_hex, new_trace_id_hex
 from src.observability.sanitizer import observation_json, sanitize_payload, sanitized_json
+from src.observability.schema import (
+    EventRow,
+    IssueOccurrenceRow,
+    IssueRow,
+    IssueTraceLinkRow,
+    MetricPointRow,
+    ModelCallRow,
+    ProjectRow,
+    RunRow,
+    SpanRow,
+    ToolCallRow,
+    TraceLinkRow,
+    TraceRow,
+)
 from src.observability.storage import ObservabilityDatabase
 
 logger = logging.getLogger(__name__)
@@ -80,8 +97,6 @@ class ObservabilityClient:
         self.service_name = service_name
         self.exporters = exporters or []
         self._project_id: str | None = None
-        self._event_lock = asyncio.Lock()
-        self._issue_lock = asyncio.Lock()
 
     async def startup(self) -> None:
         await self.database.startup()
@@ -113,28 +128,20 @@ class ObservabilityClient:
     async def _ensure_project(self) -> str:
         if self._project_id is not None:
             return self._project_id
-        row = await self.database.fetch_one(
-            "SELECT * FROM obs_projects WHERE project_key = ?", (self.project_key,)
-        )
-        if row is None:
-            project_id = _id("project")
-            now = _now()
-            await self.database.execute(
-                "INSERT INTO obs_projects(id, project_key, name, service_name, metadata_json, "
-                "created_at, updated_at) VALUES (?, ?, ?, ?, '{}', ?, ?)",
-                (
-                    project_id,
-                    self.project_key,
-                    self.project_name,
-                    self.service_name,
-                    now,
-                    now,
-                ),
+        now = _now()
+        async with self.database.orm_session(write=True) as session:
+            await session.execute(
+                pg_insert(ProjectRow).values(
+                    id=_id("project"), project_key=self.project_key, name=self.project_name,
+                    service_name=self.service_name, created_at=now, updated_at=now,
+                ).on_conflict_do_nothing(index_elements=[ProjectRow.project_key])
             )
-            self._project_id = project_id
-        else:
-            self._project_id = str(row["id"])
-        return self._project_id
+            project = await session.execute(
+                select(ProjectRow.id).where(ProjectRow.project_key == self.project_key)
+            )
+            project_id = project.scalar_one()
+        self._project_id = project_id
+        return project_id
 
     async def record_event(
         self,
@@ -147,32 +154,26 @@ class ObservabilityClient:
         severity: Severity = Severity.INFO,
         stage: str | None = None,
     ) -> dict[str, Any]:
-        async with self._event_lock:
-            current = await self.database.fetch_value(
-                "SELECT COALESCE(MAX(sequence), 0) FROM obs_events WHERE trace_id = ?",
-                (trace_id,),
+        async with self.database.orm_session(write=True) as session:
+            # Serialize writers for this trace, including writers in other processes.
+            locked = await session.scalar(
+                select(TraceRow.id).where(TraceRow.id == trace_id).with_for_update(key_share=True)
             )
-            sequence = int(current or 0) + 1
-            event_id = _id("event")
-            occurred_at = _now()
-            await self.database.execute(
-                "INSERT INTO obs_events(id, trace_id, run_id, span_id, sequence, event_type, "
-                "severity, stage, payload_json, occurred_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    event_id,
-                    trace_id,
-                    run_id,
-                    span_id,
-                    sequence,
-                    event_type,
-                    severity.value,
-                    stage,
-                    sanitized_json(payload or {}),
-                    occurred_at,
-                ),
+            if locked is None:
+                raise KeyError(f"Trace 不存在: {trace_id}")
+            last_sequence = await session.scalar(
+                select(func.max(EventRow.sequence)).where(EventRow.trace_id == trace_id)
             )
-        row = await self.database.fetch_one("SELECT * FROM obs_events WHERE id = ?", (event_id,))
-        assert row is not None
+            result = await session.execute(
+                insert(EventRow).values(
+                    id=_id("event"), trace_id=trace_id, run_id=run_id, span_id=span_id,
+                    sequence=(last_sequence or 0) + 1, event_type=event_type,
+                    severity=severity.value, stage=stage,
+                    payload_json=sanitized_json(payload or {}),
+                    occurred_at=_now(),
+                ).returning(*EventRow.__table__.c)
+            )
+            row = dict(result.mappings().one())
         await self._export("event", row)
         return row
 
@@ -188,27 +189,11 @@ class ObservabilityClient:
         span_id: str | None = None,
     ) -> dict[str, Any]:
         project_id = await self._ensure_project()
-        metric_id = _id("metric")
-        await self.database.execute(
-            "INSERT INTO obs_metric_points(id, project_id, trace_id, run_id, span_id, metric_name, "
-            "value, unit, dimensions_json, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                metric_id,
-                project_id,
-                trace_id,
-                run_id,
-                span_id,
-                metric_name,
-                float(value),
-                unit,
-                sanitized_json(dimensions or {}),
-                _now(),
-            ),
+        row = await self.database.insert_row(
+            MetricPointRow, id=_id("metric"), project_id=project_id, trace_id=trace_id,
+            run_id=run_id, span_id=span_id, metric_name=metric_name, value=float(value),
+            unit=unit, dimensions_json=sanitized_json(dimensions or {}), recorded_at=_now(),
         )
-        row = await self.database.fetch_one(
-            "SELECT * FROM obs_metric_points WHERE id = ?", (metric_id,)
-        )
-        assert row is not None
         await self._export("metric", row)
         return row
 
@@ -248,52 +233,23 @@ class ObservabilityClient:
         started_at = completed_at - timedelta(milliseconds=latency_ms or 0)
         if total_tokens is None and input_tokens is not None and output_tokens is not None:
             total_tokens = input_tokens + output_tokens
-        await self.database.execute(
-            "INSERT INTO obs_model_calls(id, trace_id, run_id, span_id, provider, model, "
-            "operation, prompt_key, prompt_version, prompt_version_id, evaluation_case_id, "
-            "experiment_variant_id, input_tokens, output_tokens, reasoning_tokens, cached_tokens, "
-            "total_tokens, estimated_cost, latency_ms, time_to_first_token_ms, "
-            "finish_reason, structured_output_valid, retry_count, status, error_code, "
-            "error_message, input_summary_json, output_summary_json, started_at, completed_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-            "?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                call_id,
-                trace_id,
-                run_id,
-                span_id,
-                provider,
-                model,
-                operation,
-                prompt_key,
-                prompt_version,
-                prompt_version_id,
-                evaluation_case_id,
-                experiment_variant_id,
-                input_tokens,
-                output_tokens,
-                reasoning_tokens,
-                cached_tokens,
-                total_tokens,
-                estimated_cost,
-                latency_ms,
-                time_to_first_token_ms,
-                finish_reason,
-                None if structured_output_valid is None else int(structured_output_valid),
-                retry_count,
-                status.value,
-                error_code,
-                error_message,
-                observation_json(input_summary or {}),
-                observation_json(output_summary or {}),
-                started_at.isoformat(),
-                completed_at.isoformat(),
+        row = await self.database.insert_row(
+            ModelCallRow, id=call_id, trace_id=trace_id, run_id=run_id, span_id=span_id,
+            provider=provider, model=model, operation=operation, prompt_key=prompt_key,
+            prompt_version=prompt_version, prompt_version_id=prompt_version_id,
+            evaluation_case_id=evaluation_case_id, experiment_variant_id=experiment_variant_id,
+            input_tokens=input_tokens, output_tokens=output_tokens,
+            reasoning_tokens=reasoning_tokens,
+            cached_tokens=cached_tokens, total_tokens=total_tokens, estimated_cost=estimated_cost,
+            latency_ms=latency_ms, time_to_first_token_ms=time_to_first_token_ms,
+            finish_reason=finish_reason, structured_output_valid=(
+                None if structured_output_valid is None else int(structured_output_valid)
             ),
+            retry_count=retry_count, status=status.value, error_code=error_code,
+            error_message=error_message, input_summary_json=observation_json(input_summary or {}),
+            output_summary_json=observation_json(output_summary or {}),
+            started_at=started_at.isoformat(), completed_at=completed_at.isoformat(),
         )
-        row = await self.database.fetch_one(
-            "SELECT * FROM obs_model_calls WHERE id = ?", (call_id,)
-        )
-        assert row is not None
         if total_tokens is not None:
             await self.record_metric(
                 metric_name="model.tokens.total",
@@ -340,36 +296,16 @@ class ObservabilityClient:
         row_id = _id("toolcall")
         completed_at = datetime.now(UTC)
         started_at = completed_at - timedelta(milliseconds=latency_ms or 0)
-        await self.database.execute(
-            "INSERT INTO obs_tool_calls(id, trace_id, run_id, span_id, tool_call_id, tool_name, "
-            "adapter_key, operation, arguments_json, result_summary_json, status, retry_count, "
-            "timeout_seconds, latency_ms, external_request_id, error_code, error_message, "
-            "started_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-            "?, ?, ?, ?, ?, ?)",
-            (
-                row_id,
-                trace_id,
-                run_id,
-                span_id,
-                tool_call_id,
-                tool_name,
-                adapter_key,
-                operation,
-                observation_json(arguments or {}),
-                observation_json(result_summary or {}),
-                status.value,
-                retry_count,
-                timeout_seconds,
-                latency_ms,
-                external_request_id,
-                error_code,
-                error_message,
-                started_at.isoformat(),
-                completed_at.isoformat(),
-            ),
+        row = await self.database.insert_row(
+            ToolCallRow, id=row_id, trace_id=trace_id, run_id=run_id, span_id=span_id,
+            tool_call_id=tool_call_id, tool_name=tool_name, adapter_key=adapter_key,
+            operation=operation, arguments_json=observation_json(arguments or {}),
+            result_summary_json=observation_json(result_summary or {}), status=status.value,
+            retry_count=retry_count, timeout_seconds=timeout_seconds, latency_ms=latency_ms,
+            external_request_id=external_request_id, error_code=error_code,
+            error_message=error_message, started_at=started_at.isoformat(),
+            completed_at=completed_at.isoformat(),
         )
-        row = await self.database.fetch_one("SELECT * FROM obs_tool_calls WHERE id = ?", (row_id,))
-        assert row is not None
         await self.record_metric(
             metric_name="tool.call.count",
             value=1,
@@ -421,94 +357,42 @@ class ObservabilityClient:
             json.dumps(fingerprint_source, sort_keys=True).encode("utf-8")
         ).hexdigest()
         now = _now()
-        async with self._issue_lock:
-            issue = await self.database.fetch_one(
-                "SELECT * FROM obs_issues WHERE project_id = ? AND fingerprint = ?",
-                (project_id, fingerprint),
+        context_json = sanitized_json(context or {})
+        async with self.database.orm_session(write=True) as session:
+            await session.execute(
+                pg_insert(IssueRow).values(
+                    id=_id("issue"), project_id=project_id, fingerprint=fingerprint,
+                    title=title or f"{component or issue_type}: {message[:120]}",
+                    issue_type=issue_type, severity=severity.value, component=component,
+                    status=IssueStatus.OPEN.value, occurrence_count=0, affected_trace_count=0,
+                    first_seen_at=now, last_seen_at=now, latest_context_json=context_json,
+                ).on_conflict_do_nothing(index_elements=[IssueRow.project_id, IssueRow.fingerprint])
             )
-            if issue is None:
-                issue_id = _id("issue")
-                await self.database.execute(
-                    "INSERT INTO obs_issues(id, project_id, fingerprint, title, issue_type, "
-                    "severity, component, status, occurrence_count, affected_trace_count, "
-                    "first_seen_at, last_seen_at, latest_context_json) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', 1, 1, ?, ?, ?)",
-                    (
-                        issue_id,
-                        project_id,
-                        fingerprint,
-                        title or f"{component or issue_type}: {message[:120]}",
-                        issue_type,
-                        severity.value,
-                        component,
-                        now,
-                        now,
-                        sanitized_json(context or {}),
-                    ),
-                )
-                await self.database.execute(
-                    "INSERT INTO obs_issue_trace_links(issue_id, trace_id, created_at) "
-                    "VALUES (?, ?, ?)",
-                    (issue_id, trace_id, now),
-                )
-            else:
-                issue_id = str(issue["id"])
-                linked = await self.database.fetch_value(
-                    "SELECT COUNT(*) FROM obs_issue_trace_links "
-                    "WHERE issue_id = ? AND trace_id = ?",
-                    (issue_id, trace_id),
-                )
-                next_status = (
-                    IssueStatus.REOPENED.value
-                    if issue["status"] == IssueStatus.RESOLVED.value
-                    else issue["status"]
-                )
-                await self.database.execute(
-                    "UPDATE obs_issues SET status = ?, occurrence_count = occurrence_count + 1, "
-                    "affected_trace_count = affected_trace_count + ?, last_seen_at = ?, "
-                    "reopened_at = CASE WHEN ? = 'REOPENED' THEN ? ELSE reopened_at END, "
-                    "resolved_at = CASE WHEN ? = 'REOPENED' THEN NULL ELSE resolved_at END, "
-                    "latest_context_json = ? WHERE id = ?",
-                    (
-                        next_status,
-                        0 if linked else 1,
-                        now,
-                        next_status,
-                        now,
-                        next_status,
-                        sanitized_json(context or {}),
-                        issue_id,
-                    ),
-                )
-                if not linked:
-                    await self.database.execute(
-                        "INSERT INTO obs_issue_trace_links(issue_id, trace_id, created_at) "
-                        "VALUES (?, ?, ?)",
-                        (issue_id, trace_id, now),
-                    )
-            occurrence_id = _id("occurrence")
-            await self.database.execute(
-                "INSERT INTO obs_issue_occurrences(id, issue_id, trace_id, run_id, span_id, "
-                "fingerprint, issue_type, severity, component, error_code, message, context_json, "
-                "occurred_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    occurrence_id,
-                    issue_id,
-                    trace_id,
-                    run_id,
-                    span_id,
-                    fingerprint,
-                    issue_type,
-                    severity.value,
-                    component,
-                    error_code,
-                    message[:2000],
-                    sanitized_json(context or {}),
-                    now,
-                ),
+            query = select(IssueRow).where(
+                IssueRow.project_id == project_id, IssueRow.fingerprint == fingerprint
+            ).with_for_update(key_share=True)
+            issue = (await session.scalars(query)).one()
+            issue_id = issue.id
+            linked = await session.scalar(
+                pg_insert(IssueTraceLinkRow).values(
+                    issue_id=issue_id, trace_id=trace_id, created_at=now,
+                ).on_conflict_do_nothing().returning(IssueTraceLinkRow.trace_id)
             )
-        result = await self.database.fetch_one("SELECT * FROM obs_issues WHERE id = ?", (issue_id,))
-        assert result is not None
+            issue.affected_trace_count += int(linked is not None)
+            issue.occurrence_count += 1
+            issue.last_seen_at = now
+            issue.latest_context_json = context_json
+            if issue.status == IssueStatus.RESOLVED.value:
+                issue.status = IssueStatus.REOPENED.value
+                issue.reopened_at = now
+                issue.resolved_at = None
+            session.add(IssueOccurrenceRow(
+                id=_id("occurrence"), issue_id=issue_id, trace_id=trace_id, run_id=run_id,
+                span_id=span_id, fingerprint=fingerprint, issue_type=issue_type,
+                severity=severity.value, component=component, error_code=error_code,
+                message=message[:2000], context_json=context_json, occurred_at=now,
+            ))
+            result = {column.key: getattr(issue, column.key) for column in IssueRow.__table__.c}
         await self.record_event(
             trace_id=trace_id,
             run_id=run_id,
@@ -530,16 +414,18 @@ class ObservabilityClient:
         return result
 
     async def set_issue_status(self, issue_id: str, status: IssueStatus) -> dict[str, Any]:
-        now = _now()
-        await self.database.execute(
-            "UPDATE obs_issues SET status = ?, resolved_at = CASE WHEN ? = 'RESOLVED' "
-            "THEN ? ELSE resolved_at END WHERE id = ?",
-            (status.value, status.value, now, issue_id),
-        )
-        row = await self.database.fetch_one("SELECT * FROM obs_issues WHERE id = ?", (issue_id,))
-        if row is None:
-            raise KeyError(f"观测问题不存在: {issue_id}")
-        return row
+        values = {"status": status.value}
+        if status == IssueStatus.RESOLVED:
+            values["resolved_at"] = _now()
+        async with self.database.orm_session(write=True) as session:
+            result = await session.execute(
+                update(IssueRow).where(IssueRow.id == issue_id).values(**values)
+                .returning(*IssueRow.__table__.c)
+            )
+            row = result.mappings().one_or_none()
+            if row is None:
+                raise KeyError(f"观测问题不存在: {issue_id}")
+            return dict(row)
 
     async def link_traces(
         self,
@@ -551,133 +437,119 @@ class ObservabilityClient:
     ) -> dict[str, Any]:
         if source_trace_id == target_trace_id:
             raise ValueError("Trace 不能链接到自身")
-        source = await self.database.fetch_one(
-            "SELECT * FROM obs_traces WHERE id = ?",
-            (source_trace_id,),
-        )
-        target = await self.database.fetch_one(
-            "SELECT * FROM obs_traces WHERE id = ?",
-            (target_trace_id,),
-        )
-        if source is None:
-            raise KeyError(f"来源 Trace 不存在: {source_trace_id}")
-        if target is None:
-            raise KeyError(f"目标 Trace 不存在: {target_trace_id}")
-        if source["project_id"] != target["project_id"]:
-            raise ValueError("不同 Project 的 Trace 不能直接链接")
-        if target["status"] != "RUNNING":
-            raise ValueError("目标 Trace 已结束，无法创建标准 OpenTelemetry Span Link")
-        normalized_relation = relation_type.strip().upper()
-        existing = await self.database.fetch_one(
-            "SELECT * FROM obs_trace_links WHERE source_trace_id = ? "
-            "AND target_trace_id = ? AND relation_type = ?",
-            (source_trace_id, target_trace_id, normalized_relation),
-        )
-        if existing is not None:
-            return existing
-        link_id = _id("trace_link")
-        await self.database.execute(
-            "INSERT INTO obs_trace_links(id, source_trace_id, target_trace_id, "
-            "relation_type, attributes_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                link_id,
-                source_trace_id,
-                target_trace_id,
-                normalized_relation,
-                sanitized_json(attributes or {}),
-                _now(),
-            ),
-        )
-        row = await self.database.fetch_one(
-            "SELECT * FROM obs_trace_links WHERE id = ?",
-            (link_id,),
-        )
-        assert row is not None
+        async with self.database.orm_session(write=True) as session:
+            source = await session.get(TraceRow, source_trace_id)
+            target = await session.get(
+                TraceRow, target_trace_id, with_for_update={"key_share": True}
+            )
+            if source is None:
+                raise KeyError(f"来源 Trace 不存在: {source_trace_id}")
+            if target is None:
+                raise KeyError(f"目标 Trace 不存在: {target_trace_id}")
+            if source.project_id != target.project_id:
+                raise ValueError("不同 Project 的 Trace 不能直接链接")
+            if target.status != Status.RUNNING.value:
+                raise ValueError("目标 Trace 已结束，无法创建标准 OpenTelemetry Span Link")
+            normalized_relation = relation_type.strip().upper()
+            query = select(TraceLinkRow.__table__).where(
+                TraceLinkRow.source_trace_id == source_trace_id,
+                TraceLinkRow.target_trace_id == target_trace_id,
+                TraceLinkRow.relation_type == normalized_relation,
+            )
+            existing = (await session.execute(query)).mappings().one_or_none()
+            if existing is not None:
+                return dict(existing)
+            created = await session.execute(
+                insert(TraceLinkRow).values(
+                    id=_id("trace_link"), source_trace_id=source_trace_id,
+                    target_trace_id=target_trace_id, relation_type=normalized_relation,
+                    attributes_json=sanitized_json(attributes or {}), created_at=_now(),
+                ).returning(*TraceLinkRow.__table__.c)
+            )
+            row = dict(created.mappings().one())
         await self._export("trace_link", row)
         return row
 
     async def get_trace(self, trace_id: str) -> dict[str, Any]:
-        trace = await self.database.fetch_one("SELECT * FROM obs_traces WHERE id = ?", (trace_id,))
+        trace = await self.database.fetch_one(
+            select(TraceRow.__table__).where(TraceRow.id == trace_id)
+        )
         if trace is None:
             raise KeyError(f"Trace 不存在: {trace_id}")
         trace["runs"] = await self.database.fetch_all(
-            "SELECT * FROM obs_runs WHERE trace_id = ? ORDER BY started_at", (trace_id,)
+            select(RunRow.__table__).where(RunRow.trace_id == trace_id).order_by(RunRow.started_at)
         )
+        spans = await self.database.fetch_all(
+            select(SpanRow.__table__).where(SpanRow.trace_id == trace_id)
+            .order_by(SpanRow.started_at)
+        )
+        by_run = {run["id"]: run for run in trace["runs"]}
         for run in trace["runs"]:
-            run["spans"] = await self.database.fetch_all(
-                "SELECT * FROM obs_spans WHERE run_id = ? ORDER BY started_at", (run["id"],)
+            run["spans"] = []
+        for span in spans:
+            if span["run_id"] in by_run:
+                by_run[span["run_id"]]["spans"].append(span)
+        for key, model, ordering in (
+            ("events", EventRow, EventRow.sequence),
+            ("model_calls", ModelCallRow, ModelCallRow.started_at),
+            ("tool_calls", ToolCallRow, ToolCallRow.started_at),
+        ):
+            trace[key] = await self.database.fetch_all(
+                select(model.__table__).where(model.trace_id == trace_id).order_by(ordering)
             )
-        trace["events"] = await self.database.fetch_all(
-            "SELECT * FROM obs_events WHERE trace_id = ? ORDER BY sequence", (trace_id,)
-        )
-        trace["model_calls"] = await self.database.fetch_all(
-            "SELECT * FROM obs_model_calls WHERE trace_id = ? ORDER BY started_at", (trace_id,)
-        )
-        trace["tool_calls"] = await self.database.fetch_all(
-            "SELECT * FROM obs_tool_calls WHERE trace_id = ? ORDER BY started_at", (trace_id,)
-        )
         trace["issues"] = await self.database.fetch_all(
-            "SELECT i.* FROM obs_issues i JOIN obs_issue_trace_links l ON l.issue_id = i.id "
-            "WHERE l.trace_id = ? ORDER BY i.last_seen_at DESC",
-            (trace_id,),
+            select(IssueRow.__table__)
+            .join(IssueTraceLinkRow, IssueTraceLinkRow.issue_id == IssueRow.id)
+            .where(IssueTraceLinkRow.trace_id == trace_id).order_by(IssueRow.last_seen_at.desc())
         )
-        trace["outgoing_links"] = await self.database.fetch_all(
-            "SELECT * FROM obs_trace_links WHERE source_trace_id = ? ORDER BY created_at",
-            (trace_id,),
-        )
-        trace["incoming_links"] = await self.database.fetch_all(
-            "SELECT * FROM obs_trace_links WHERE target_trace_id = ? ORDER BY created_at",
-            (trace_id,),
-        )
+        for key, column in (
+            ("outgoing_links", TraceLinkRow.source_trace_id),
+            ("incoming_links", TraceLinkRow.target_trace_id)
+        ):
+            trace[key] = await self.database.fetch_all(
+                select(TraceLinkRow.__table__).where(column == trace_id)
+                .order_by(TraceLinkRow.created_at)
+            )
         return trace
 
     async def list_traces(
         self, *, status: str | None = None, limit: int = 100
     ) -> list[dict[str, Any]]:
         project_id = await self._ensure_project()
+        query = select(TraceRow.__table__).where(TraceRow.project_id == project_id)
         if status:
-            return await self.database.fetch_all(
-                "SELECT * FROM obs_traces WHERE project_id = ? AND status = ? "
-                "ORDER BY started_at DESC LIMIT ?",
-                (project_id, status, max(1, min(limit, 500))),
-            )
-        return await self.database.fetch_all(
-            "SELECT * FROM obs_traces WHERE project_id = ? ORDER BY started_at DESC LIMIT ?",
-            (project_id, max(1, min(limit, 500))),
-        )
+            query = query.where(TraceRow.status == status)
+        return await self.database.fetch_all(query.order_by(TraceRow.started_at.desc()).limit(
+            max(1, min(limit, 500))
+        ))
 
     async def list_issues(
         self, *, status: str | None = None, limit: int = 100
     ) -> list[dict[str, Any]]:
         project_id = await self._ensure_project()
+        query = select(IssueRow.__table__).where(IssueRow.project_id == project_id)
         if status:
-            return await self.database.fetch_all(
-                "SELECT * FROM obs_issues WHERE project_id = ? AND status = ? "
-                "ORDER BY last_seen_at DESC LIMIT ?",
-                (project_id, status, max(1, min(limit, 500))),
-            )
-        return await self.database.fetch_all(
-            "SELECT * FROM obs_issues WHERE project_id = ? ORDER BY last_seen_at DESC LIMIT ?",
-            (project_id, max(1, min(limit, 500))),
-        )
+            query = query.where(IssueRow.status == status)
+        return await self.database.fetch_all(query.order_by(IssueRow.last_seen_at.desc()).limit(
+            max(1, min(limit, 500))
+        ))
 
     async def metric_summary(
         self, *, metric_name: str | None = None, limit: int = 100
     ) -> list[dict[str, Any]]:
-        project_id = await self._ensure_project()
-        params: tuple[Any, ...]
-        where = "WHERE project_id = ?"
-        params = (project_id,)
+        metric = MetricPointRow
+        latest = func.max(metric.recorded_at).label("last_recorded_at")
+        query = select(
+            metric.metric_name, metric.unit, func.count().label("point_count"),
+            func.avg(metric.value).label("average_value"),
+            func.min(metric.value).label("minimum_value"),
+            func.max(metric.value).label("maximum_value"), latest,
+        ).where(metric.project_id == await self._ensure_project())
         if metric_name:
-            where += " AND metric_name = ?"
-            params += (metric_name,)
-        params += (max(1, min(limit, 500)),)
+            query = query.where(metric.metric_name == metric_name)
         return await self.database.fetch_all(
-            "SELECT metric_name, unit, COUNT(*) AS point_count, AVG(value) AS average_value, "
-            "MIN(value) AS minimum_value, MAX(value) AS maximum_value, "
-            "MAX(recorded_at) AS last_recorded_at FROM obs_metric_points "
-            f"{where} GROUP BY metric_name, unit ORDER BY last_recorded_at DESC LIMIT ?",
-            params,
+            query.group_by(metric.metric_name, metric.unit).order_by(latest.desc())
+            .limit(max(1, min(limit, 500)))
         )
 
     async def _export(self, entity_type: str, payload: dict[str, Any]) -> None:
@@ -728,23 +600,13 @@ class TraceScope:
         project_id = await self.client._ensure_project()
         now = _now()
         self._started_perf = time.perf_counter()
-        await self.client.database.execute(
-            "INSERT INTO obs_traces(id, project_id, operation_name, session_id, user_id, status, "
-            "input_json, otel_trace_id, otel_root_span_id, metadata_json, started_at) "
-            "VALUES (?, ?, ?, ?, ?, 'RUNNING', ?, ?, ?, ?, ?)",
-            (
-                self.trace_id,
-                project_id,
-                self.operation_name,
-                self.session_id,
-                self.user_id,
-                observation_json(self.input_data or {}),
-                self.otel_trace_id,
-                self.otel_root_span_id,
-                sanitized_json(self.metadata),
-                now,
-            ),
-        )
+        await self.client.database.execute(insert(TraceRow).values(
+            id=self.trace_id, project_id=project_id, operation_name=self.operation_name,
+            session_id=self.session_id, user_id=self.user_id, status=Status.RUNNING.value,
+            input_json=observation_json(self.input_data or {}), otel_trace_id=self.otel_trace_id,
+            otel_root_span_id=self.otel_root_span_id, metadata_json=sanitized_json(self.metadata),
+            started_at=now,
+        ))
         self._token = set_current_context(
             ObservationContext(
                 project_id=project_id,
@@ -759,19 +621,12 @@ class TraceScope:
         status = self.status_override or _status_for_exception(exc)
         duration = _duration_ms(self._started_perf)
         now = _now()
-        await self.client.database.execute(
-            "UPDATE obs_traces SET status = ?, error_code = ?, error_message = ?, "
-            "completed_at = ?, duration_ms = ?, metadata_json = ?, output_json = ? WHERE id = ?",
-            (
-                status.value,
-                type(exc).__name__ if exc else None,
-                str(exc)[:2000] if exc else None,
-                now,
-                duration,
-                sanitized_json(self.metadata),
-                observation_json(self.output_data or {}),
-                self.trace_id,
-            ),
+        row = await self.client.database.finish_row(
+            TraceRow, self.trace_id, status=status.value,
+            error_code=type(exc).__name__ if exc else None,
+            error_message=str(exc)[:2000] if exc else None, completed_at=now, duration_ms=duration,
+            metadata_json=sanitized_json(self.metadata),
+            output_json=observation_json(self.output_data or {}),
         )
         if exc is not None and not isinstance(exc, asyncio.CancelledError):
             await self.client.capture_issue(
@@ -794,17 +649,13 @@ class TraceScope:
             severity=Severity.INFO if status != Status.FAILED else Severity.ERROR,
             payload={"duration_ms": duration, "status": status.value},
         )
-        row = await self.client.database.fetch_one(
-            "SELECT * FROM obs_traces WHERE id = ?", (self.trace_id,)
-        )
-        assert row is not None
         row["incoming_links"] = await self.client.database.fetch_all(
-            "SELECT l.*, source.otel_trace_id AS source_otel_trace_id, "
-            "source.otel_root_span_id AS source_otel_root_span_id "
-            "FROM obs_trace_links l "
-            "JOIN obs_traces source ON source.id = l.source_trace_id "
-            "WHERE l.target_trace_id = ? ORDER BY l.created_at",
-            (self.trace_id,),
+            select(
+                TraceLinkRow.__table__,
+                TraceRow.otel_trace_id.label("source_otel_trace_id"),
+                TraceRow.otel_root_span_id.label("source_otel_root_span_id"),
+            ).join(TraceRow, TraceRow.id == TraceLinkRow.source_trace_id)
+            .where(TraceLinkRow.target_trace_id == self.trace_id).order_by(TraceLinkRow.created_at)
         )
         await self.client._export("trace", row)
         if self._token is not None:
@@ -857,24 +708,13 @@ class RunScope:
     async def __aenter__(self) -> RunScope:
         project_id = await self.client._ensure_project()
         self._started_perf = time.perf_counter()
-        await self.client.database.execute(
-            "INSERT INTO obs_runs(id, trace_id, thread_id, trigger_type, attempt_no, agent_name, "
-            "workflow_name, model_provider, model_name, status, started_at, metadata_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'RUNNING', ?, ?)",
-            (
-                self.run_id,
-                self.trace_id,
-                self.thread_id,
-                self.trigger_type,
-                self.attempt_no,
-                self.agent_name,
-                self.workflow_name,
-                self.model_provider,
-                self.model_name,
-                _now(),
-                sanitized_json(self.metadata),
-            ),
-        )
+        await self.client.database.execute(insert(RunRow).values(
+            id=self.run_id, trace_id=self.trace_id, thread_id=self.thread_id,
+            trigger_type=self.trigger_type, attempt_no=self.attempt_no, agent_name=self.agent_name,
+            workflow_name=self.workflow_name, model_provider=self.model_provider,
+            model_name=self.model_name, status=Status.RUNNING.value, started_at=_now(),
+            metadata_json=sanitized_json(self.metadata),
+        ))
         self._token = set_current_context(
             ObservationContext(
                 project_id=project_id,
@@ -891,17 +731,11 @@ class RunScope:
     async def __aexit__(self, exc_type: Any, exc: BaseException | None, tb: Any) -> bool:
         status = self.status_override or _status_for_exception(exc)
         duration = _duration_ms(self._started_perf)
-        await self.client.database.execute(
-            "UPDATE obs_runs SET status = ?, error_code = ?, error_message = ?, completed_at = ?, "
-            "duration_ms = ? WHERE id = ?",
-            (
-                status.value,
-                type(exc).__name__ if exc else None,
-                str(exc)[:2000] if exc else None,
-                _now(),
-                duration,
-                self.run_id,
-            ),
+        row = await self.client.database.finish_row(
+            RunRow, self.run_id, status=status.value,
+            error_code=type(exc).__name__ if exc else None,
+            error_message=str(exc)[:2000] if exc else None,
+            completed_at=_now(), duration_ms=duration,
         )
         await self.client.record_metric(
             metric_name="run.duration_ms",
@@ -918,10 +752,6 @@ class RunScope:
             severity=Severity.INFO if status != Status.FAILED else Severity.ERROR,
             payload={"duration_ms": duration, "status": status.value},
         )
-        row = await self.client.database.fetch_one(
-            "SELECT * FROM obs_runs WHERE id = ?", (self.run_id,)
-        )
-        assert row is not None
         await self.client._export("run", row)
         if self._token is not None:
             reset_current_context(self._token)
@@ -970,23 +800,14 @@ class SpanScope:
     async def __aenter__(self) -> SpanScope:
         project_id = await self.client._ensure_project()
         self._started_perf = time.perf_counter()
-        await self.client.database.execute(
-            "INSERT INTO obs_spans(id, trace_id, run_id, parent_span_id, kind, component_name, "
-            "operation_name, status, input_json, metadata_json, started_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, 'RUNNING', ?, ?, ?)",
-            (
-                self.span_id,
-                self.trace_id,
-                self.run_id,
-                self.parent_span_id,
-                self.kind.value,
-                self.component_name,
-                self.operation_name,
-                observation_json(self.input_data or {}),
-                sanitized_json(self.metadata),
-                _now(),
-            ),
-        )
+        await self.client.database.execute(insert(SpanRow).values(
+            id=self.span_id, trace_id=self.trace_id, run_id=self.run_id,
+            parent_span_id=self.parent_span_id,
+            kind=self.kind.value, component_name=self.component_name,
+            operation_name=self.operation_name,
+            status=Status.RUNNING.value, input_json=observation_json(self.input_data or {}),
+            metadata_json=sanitized_json(self.metadata), started_at=_now(),
+        ))
         self._token = set_current_context(
             ObservationContext(
                 project_id=project_id,
@@ -1014,13 +835,10 @@ class SpanScope:
             else (self._captured_error[0] if self._captured_error else None)
         )
         error_message = str(effective_error)[:2000] if effective_error is not None else None
-        await self.client.database.execute(
-            "UPDATE obs_spans SET status = ?, error_code = ?, error_message = ?, completed_at = ?, "
-            "duration_ms = ?, output_json = ? WHERE id = ?",
-            (
-                status.value, error_code, error_message, _now(), duration,
-                observation_json(self.output_data or {}), self.span_id,
-            ),
+        row = await self.client.database.finish_row(
+            SpanRow, self.span_id, status=status.value, error_code=error_code,
+            error_message=error_message, completed_at=_now(), duration_ms=duration,
+            output_json=observation_json(self.output_data or {}),
         )
         await self.metric("span.duration_ms", duration, unit="ms")
         await self.event(
@@ -1028,10 +846,6 @@ class SpanScope:
             {"duration_ms": duration, "status": status.value},
             severity=Severity.INFO if status != Status.FAILED else Severity.ERROR,
         )
-        row = await self.client.database.fetch_one(
-            "SELECT * FROM obs_spans WHERE id = ?", (self.span_id,)
-        )
-        assert row is not None
         await self.client._export("span", row)
         if self._token is not None:
             reset_current_context(self._token)

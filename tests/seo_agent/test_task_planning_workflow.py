@@ -5,15 +5,21 @@ import json
 from pathlib import Path
 
 import pytest
+from sqlalchemy import func, insert, select, update
 
 from src.core.exceptions import InternalProviderRequestError, InternalProviderResponseError
 from src.seo_agent.approvals.service import ApprovalService
 from src.seo_agent.db.database import SeoAgentDatabase
+from src.seo_agent.db.models import TABLES
 from src.seo_agent.services.system import SeoAgentSystemService
 from src.seo_agent.tasks.models import TaskPrdContent
 from src.seo_agent.tasks.service import TaskDeliveryService
 from src.seo_agent.workflows.task_delivery import TaskDeliveryWorkflows
 from src.seo_agent.workflows.task_planning import TaskPlanningRequest, TaskPlanningWorkflow
+
+tasks_table = TABLES["execution_tasks"]
+opportunities = TABLES["opportunities"]
+actions = TABLES["approval_actions"]
 
 
 class PrdModel:
@@ -59,8 +65,8 @@ class PrdModel:
 
 
 @pytest.fixture
-async def planning(tmp_path: Path, approve_opportunity):
-    db = SeoAgentDatabase(tmp_path / "business.db")
+async def planning(tmp_path: Path, pg_url, approve_opportunity):
+    db = SeoAgentDatabase(pg_url)
     await db.startup()
     system = SeoAgentSystemService(db)
     site = await system.create_site(
@@ -74,14 +80,13 @@ async def planning(tmp_path: Path, approve_opportunity):
     owner = await system.create_actor(actor_type="HUMAN_OPERATOR", name="Writer")
     now = "2026-11-11T00:00:00+00:00"
     for index in range(2):
-        await db.execute(
-            "INSERT INTO opportunities(id,site_id,fingerprint,normalized_intent,opportunity_type,"
-            "target_country,target_language,title,current_score,priority_level,status,policy_version,"
-            "first_seen_at,last_seen_at,created_at,updated_at) "
-            "VALUES (?, ?, ?, 'waterjet cost', 'KEYWORD_OPPORTUNITY', 'US', 'en', 'Cost', "
-            "85, 'HIGH', 'WAITING_FOR_DECISION', 'v1', ?, ?, ?, ?)",
-            (f"opp-{index}", site["id"], f"fingerprint-{index}", now, now, now, now),
-        )
+        await db.execute(insert(opportunities).values(
+            id=f"opp-{index}", site_id=site["id"], fingerprint=f"fingerprint-{index}",
+            normalized_intent="waterjet cost", opportunity_type="KEYWORD_OPPORTUNITY",
+            target_country="US", target_language="en", title="Cost", current_score=85,
+            priority_level="HIGH", status="WAITING_FOR_DECISION", policy_version="v1",
+            first_seen_at=now, last_seen_at=now, created_at=now, updated_at=now,
+        ))
         await approve_opportunity(db, site["id"], f"opp-{index}", actor["id"])
     tasks = TaskDeliveryService(db, artifact_root=tmp_path / "artifacts")
     model = PrdModel()
@@ -104,22 +109,22 @@ async def planning(tmp_path: Path, approve_opportunity):
 @pytest.mark.asyncio
 async def test_planning_creates_one_draft_task_prd_and_artifacts_and_replays(planning):
     db, _, _, tasks, model, workflow, request = planning
-    approvals_before = await db.fetch_all("SELECT * FROM approval_actions ORDER BY id")
+    approvals_before = await db.fetch_all(select(actions).order_by(actions.c.id))
     first = await workflow.execute(request)
     assert first["workflow_status"] == "complete"
     task = await tasks.get_task_detail(first["task_id"])
     assert task["status"] == "DRAFT" and len(task["prd_versions"]) == 1
     assert task["current_prd_version_id"] == first["prd_version_id"]
-    artifacts = await db.fetch_all("SELECT * FROM task_prd_artifacts")
+    artifacts = await db.fetch_all(select(TABLES["task_prd_artifacts"]))
     assert len(artifacts) == 2 and all(Path(row["file_path"]).is_file() for row in artifacts)
     assert TaskPrdContent.model_validate_json(task["prd_versions"][0]["structured_content_json"])
     assert first == await workflow.execute(request)
     assert model.calls == 1
-    assert await db.fetch_value("SELECT COUNT(*) FROM execution_tasks") == 1
-    assert await db.fetch_value("SELECT COUNT(*) FROM task_prd_versions") == 1
-    assert await db.fetch_all("SELECT * FROM approval_actions ORDER BY id") == approvals_before
+    assert await db.fetch_value(select(func.count()).select_from(tasks_table)) == 1
+    assert await db.fetch_value(select(func.count()).select_from(TABLES["task_prd_versions"])) == 1
+    assert await db.fetch_all(select(actions).order_by(actions.c.id)) == approvals_before
     for table in ("task_dispatches", "deliveries", "publish_records"):
-        assert await db.fetch_value(f"SELECT COUNT(*) FROM {table}") == 0
+        assert await db.fetch_value(select(func.count()).select_from(TABLES[table])) == 0
 
 
 @pytest.mark.asyncio
@@ -128,8 +133,10 @@ async def test_invalid_opportunities_fail_before_model_or_business_writes(planni
     db, _, actor, _, model, workflow, request = planning
     if problem in {"pending", "low"}:
         await db.execute(
-            "UPDATE opportunities SET status=?, priority_level=? WHERE id='opp-0'",
-            ("OBSERVED" if problem == "low" else "WAITING_FOR_DECISION", "LOW"),
+            update(opportunities).where(opportunities.c.id == "opp-0").values(
+                status="OBSERVED" if problem == "low" else "WAITING_FOR_DECISION",
+                priority_level="LOW",
+            )
         )
     elif problem == "newer_pending":
         await ApprovalService(db).create_action(
@@ -150,13 +157,15 @@ async def test_invalid_opportunities_fail_before_model_or_business_writes(planni
             default_language="en",
             timezone="UTC",
         )
-        await db.execute("UPDATE opportunities SET site_id=? WHERE id='opp-0'", (other_site["id"],))
+        await db.execute(update(opportunities).where(opportunities.c.id == "opp-0").values(
+            site_id=other_site["id"],
+        ))
     else:
         request = request.model_copy(update={"opportunity_ids": ["opp-0", "opp-0"]})
     with pytest.raises((ValueError, KeyError)):
         await workflow.execute(request)
     assert model.calls == 0
-    assert await db.fetch_value("SELECT COUNT(*) FROM execution_tasks") == 0
+    assert await db.fetch_value(select(func.count()).select_from(tasks_table)) == 0
 
 
 @pytest.mark.asyncio
@@ -165,11 +174,11 @@ async def test_model_failure_leaves_no_task_and_same_request_can_retry(planning)
     model.fail = True
     with pytest.raises(InternalProviderRequestError):
         await workflow.execute(request)
-    assert await db.fetch_value("SELECT COUNT(*) FROM execution_tasks") == 0
-    assert await db.fetch_value("SELECT COUNT(*) FROM work_records") == 0
+    assert await db.fetch_value(select(func.count()).select_from(tasks_table)) == 0
+    assert await db.fetch_value(select(func.count()).select_from(TABLES["work_records"])) == 0
     model.fail = False
     assert (await workflow.execute(request))["task_id"]
-    assert await db.fetch_value("SELECT COUNT(*) FROM execution_tasks") == 1
+    assert await db.fetch_value(select(func.count()).select_from(tasks_table)) == 1
 
 
 @pytest.mark.asyncio
@@ -178,8 +187,8 @@ async def test_invalid_model_schema_does_not_persist_task_or_prd(planning):
     model.invalid = True
     with pytest.raises(InternalProviderResponseError):
         await workflow.execute(request)
-    assert await db.fetch_value("SELECT COUNT(*) FROM execution_tasks") == 0
-    assert await db.fetch_value("SELECT COUNT(*) FROM task_prd_versions") == 0
+    assert await db.fetch_value(select(func.count()).select_from(tasks_table)) == 0
+    assert await db.fetch_value(select(func.count()).select_from(TABLES["task_prd_versions"])) == 0
 
 
 @pytest.mark.asyncio
@@ -187,7 +196,7 @@ async def test_approval_is_rechecked_after_model_before_atomic_write(planning):
     db, _, _, _, model, workflow, request = planning
 
     async def change_approval():
-        action = await db.fetch_one("SELECT id FROM approval_actions WHERE target_id='opp-0'")
+        action = await db.fetch_one(select(actions.c.id).where(actions.c.target_id == "opp-0"))
         await ApprovalService(db).decide(
             action_id=action["id"], actor_id=request.created_by_actor_id,
             decision="DECISION_CORRECTED",
@@ -197,8 +206,8 @@ async def test_approval_is_rechecked_after_model_before_atomic_write(planning):
     with pytest.raises(ValueError, match="审批"):
         await workflow.execute(request)
     assert model.calls == 1
-    assert await db.fetch_value("SELECT COUNT(*) FROM execution_tasks") == 0
-    assert await db.fetch_value("SELECT COUNT(*) FROM task_prd_versions") == 0
+    assert await db.fetch_value(select(func.count()).select_from(tasks_table)) == 0
+    assert await db.fetch_value(select(func.count()).select_from(TABLES["task_prd_versions"])) == 0
 
 
 @pytest.mark.asyncio
@@ -208,7 +217,7 @@ async def test_planning_serializes_duplicate_calls_and_rejects_changed_request(p
     assert first == second and model.calls == 1
     with pytest.raises(ValueError, match="幂等"):
         await workflow.execute(request.model_copy(update={"title": "Different request"}))
-    assert await db.fetch_value("SELECT COUNT(*) FROM execution_tasks") == 1
+    assert await db.fetch_value(select(func.count()).select_from(tasks_table)) == 1
 
 
 @pytest.mark.asyncio
@@ -217,9 +226,9 @@ async def test_parallel_workflow_instances_share_one_durable_result(planning):
     other = TaskPlanningWorkflow(db, tasks, workflow.delivery)
     first, second = await asyncio.gather(workflow.execute(request), other.execute(request))
     assert first == second
-    assert await db.fetch_value("SELECT COUNT(*) FROM execution_tasks") == 1
-    assert await db.fetch_value("SELECT COUNT(*) FROM task_prd_versions") == 1
-    assert await db.fetch_value("SELECT COUNT(*) FROM work_records") == 1
+    assert await db.fetch_value(select(func.count()).select_from(tasks_table)) == 1
+    assert await db.fetch_value(select(func.count()).select_from(TABLES["task_prd_versions"])) == 1
+    assert await db.fetch_value(select(func.count()).select_from(TABLES["work_records"])) == 1
     assert model.calls in {1, 2}
 
 
@@ -248,14 +257,15 @@ async def test_persistence_failure_rolls_back_and_retry_has_no_duplicate_task(
     with pytest.raises((RuntimeError, OSError, asyncio.CancelledError)):
         await workflow.execute(request)
     for table in ("execution_tasks", "task_prd_versions", "task_prd_artifacts", "work_records"):
-        assert await db.fetch_value(f"SELECT COUNT(*) FROM {table}") == 0
+        assert await db.fetch_value(select(func.count()).select_from(TABLES[table])) == 0
     assert not list(tasks.artifact_root.glob("task_*"))
     if failure == "renderer":
         monkeypatch.setattr(tasks.pdf_renderer, "render", original)
     else:
         monkeypatch.setattr(SeoAgentSystemService, "append_work_record", original)
     result = await workflow.execute(request)
-    assert result["task_id"] and await db.fetch_value("SELECT COUNT(*) FROM execution_tasks") == 1
+    assert result["task_id"]
+    assert await db.fetch_value(select(func.count()).select_from(tasks_table)) == 1
 
 
 @pytest.mark.asyncio
@@ -263,16 +273,20 @@ async def test_persistence_failure_rolls_back_and_retry_has_no_duplicate_task(
 async def test_inactive_scope_rejected_before_model(planning, scope):
     db, _, actor, _, model, workflow, request = planning
     if scope == "site":
-        await db.execute("UPDATE sites SET status='INACTIVE' WHERE id=?", (request.site_id,))
+        sites = TABLES["sites"]
+        await db.execute(
+            update(sites).where(sites.c.id == request.site_id).values(status="INACTIVE")
+        )
     elif scope == "missing_actor":
         request = request.model_copy(update={"created_by_actor_id": "unknown"})
     else:
         actor_id = request.owner_actor_id if scope == "owner" else request.created_by_actor_id
-        await db.execute("UPDATE actors SET status='INACTIVE' WHERE id=?", (actor_id,))
+        actors = TABLES["actors"]
+        await db.execute(update(actors).where(actors.c.id == actor_id).values(status="INACTIVE"))
     with pytest.raises((ValueError, KeyError)):
         await workflow.execute(request)
     assert model.calls == 0
-    assert await db.fetch_value("SELECT COUNT(*) FROM execution_tasks") == 0
+    assert await db.fetch_value(select(func.count()).select_from(tasks_table)) == 0
 
 
 @pytest.mark.asyncio
@@ -294,7 +308,7 @@ async def test_planning_api_uses_real_services_and_sanitizes_model_errors(planni
         model.fail = True
         unavailable = await client.post("/seo-agent/tasks/plan", json=request.model_dump())
         assert unavailable.status_code == 503 and "private model failure" not in unavailable.text
-        assert await db.fetch_value("SELECT COUNT(*) FROM execution_tasks") == 0
+        assert await db.fetch_value(select(func.count()).select_from(tasks_table)) == 0
         model.fail = False
         result = await client.post("/seo-agent/tasks/plan", json=request.model_dump())
         assert result.status_code == 200 and result.json()["task_id"]
@@ -314,19 +328,20 @@ async def test_planning_api_uses_real_services_and_sanitizes_model_errors(planni
 
 
 @pytest.mark.asyncio
-async def test_planning_observations_correlate_approval_model_and_atomic_write(planning, tmp_path):
+async def test_planning_observations_correlate_approval_model_and_atomic_write(planning, pg_url):
     from src.observability.client import ObservabilityClient
+    from src.observability.schema import ModelCallRow, SpanRow
     from src.observability.storage import ObservabilityDatabase
 
     db, _, _, tasks, model, _, request = planning
     observer = ObservabilityClient(
-        ObservabilityDatabase(tmp_path / "observations.db"), project_key="test"
+        ObservabilityDatabase(pg_url), project_key="test"
     )
     delivery = TaskDeliveryWorkflows(db, tasks, model_factory=lambda: model, observability=observer)
     workflow = TaskPlanningWorkflow(db, tasks, delivery)
     try:
         result = await workflow.execute(request)
-        spans = await observer.database.fetch_all("SELECT * FROM obs_spans")
+        spans = await observer.database.fetch_all(select(SpanRow.__table__))
         assert {row["trace_id"] for row in spans} == {result["trace_id"]}
         assert {row["operation_name"] for row in spans} >= {
             "seo.task_planning",
@@ -334,11 +349,13 @@ async def test_planning_observations_correlate_approval_model_and_atomic_write(p
             "seo.prd.generate",
             "persist_task_and_prd",
         }
-        model_call = await observer.database.fetch_one("SELECT * FROM obs_model_calls")
+        model_call = await observer.database.fetch_one(select(ModelCallRow.__table__))
         assert model_call["prompt_key"] == "seo.prd.generate"
         assert "waterjet cost" in model_call["input_summary_json"]
         assert "acceptance_criteria" in model_call["output_summary_json"]
         await workflow.execute(request)
-        assert await observer.database.fetch_value("SELECT COUNT(*) FROM obs_model_calls") == 1
+        assert await observer.database.fetch_value(
+            select(func.count()).select_from(ModelCallRow.__table__)
+        ) == 1
     finally:
         await observer.shutdown()

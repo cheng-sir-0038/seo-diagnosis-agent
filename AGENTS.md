@@ -1,6 +1,6 @@
 # Agent 协作指引
 
-本仓库是独立的 SEO 诊断 Agent，包含对话运行、数据查询、审批和前端工作台。
+本仓库用 LangGraph 主 Agent 调度 SEO/GEO 与医药业务，包含对话运行、数据查询、审批和前端工作台。数据库使用 PostgreSQL 和 SQLAlchemy。
 
 - 修改代码前，先阅读 [README](README.md) 和受影响的现有实现、调用方及测试。
 - 开发和修复时检查相关调用方，并按改动范围运行增量验证。

@@ -7,12 +7,14 @@ import shutil
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import func, select
 
 from src.core.exceptions import InternalProviderRequestError, InternalProviderResponseError
 from src.observability.client import ObservabilityClient
 from src.observability.instrumentation import observed_operation
 from src.observability.models import SpanKind
 from src.seo_agent.db.database import SeoAgentDatabase
+from src.seo_agent.db.models import TABLES
 from src.seo_agent.services.system import SeoAgentSystemService
 from src.seo_agent.tasks.service import TaskDeliveryService
 from src.seo_agent.workflows.task_delivery import TaskDeliveryWorkflows
@@ -112,6 +114,11 @@ class TaskPlanningWorkflow:
                         },
                     ) as write:
                         async with self.database.transaction() as transaction:
+                            # The receipt does not exist on the first call. Lock its logical key
+                            # across processes before checking again and writing any artifacts.
+                            await transaction.fetch_value(select(
+                                func.pg_advisory_xact_lock(func.hashtextextended(key, 0))
+                            ))
                             existing = await self._receipt(transaction, key, request_hash)
                             if existing is not None:
                                 if write is not None:
@@ -139,7 +146,6 @@ class TaskPlanningWorkflow:
                                         "deadline_at",
                                     }
                                 ),
-                                connection=transaction._require_connection(),
                             )
                             task_id = task["id"]
                             prd = await tasks.create_prd_version(
@@ -173,8 +179,9 @@ class TaskPlanningWorkflow:
                         if write is not None:
                             write.output_data = result
                 except BaseException:
-                    if task_id and not await self.database.fetch_one(
-                        "SELECT id FROM execution_tasks WHERE id=?", (task_id,)
+                    task_table = TABLES["execution_tasks"]
+                    if task_id and not await self.database.fetch_value(
+                        select(task_table.c.id).where(task_table.c.id == task_id)
                     ):
                         shutil.rmtree(self.tasks.artifact_root / task_id, ignore_errors=True)
                     raise
@@ -185,29 +192,39 @@ class TaskPlanningWorkflow:
     async def _context(
         self, database: SeoAgentDatabase, request: TaskPlanningRequest
     ) -> list[dict]:
-        site = await SeoAgentSystemService(database).get_site(request.site_id)
+        sites, actors = TABLES["sites"], TABLES["actors"]
+        site_query = select(sites).where(sites.c.id == request.site_id)
+        actor_ids = {request.owner_actor_id, request.created_by_actor_id}
+        actor_query = select(actors).where(actors.c.id.in_(actor_ids)).order_by(actors.c.id)
+        if database.in_transaction:
+            site_query = site_query.with_for_update(read=True)
+            actor_query = actor_query.with_for_update(read=True)
+        site = await database.fetch_one(site_query)
+        if site is None:
+            raise KeyError(f"站点不存在: {request.site_id}")
         if site["status"] != "ACTIVE" or site.get("archived_at") is not None:
             raise ValueError("站点当前不可创建任务")
-        for actor_id in {request.owner_actor_id, request.created_by_actor_id}:
-            actor = await database.fetch_one("SELECT * FROM actors WHERE id=?", (actor_id,))
-            if actor is None:
-                raise KeyError("任务负责人或操作人不存在")
+        records = await database.fetch_all(actor_query)
+        if len(records) != len(actor_ids):
+            raise KeyError("任务负责人或操作人不存在")
+        for actor in records:
             if actor["status"] != "ACTIVE" or actor.get("archived_at") is not None:
                 raise ValueError("任务负责人或操作人当前不可用")
         return await self.tasks.validate_opportunities(
             site_id=request.site_id,
             opportunity_ids=request.opportunity_ids,
-            connection=database._require_connection(),
+            database=database,
         )
 
     @staticmethod
     async def _receipt(database: SeoAgentDatabase, key: str, request_hash: str) -> dict | None:
-        record = await database.fetch_one(
-            "SELECT payload_json FROM work_records WHERE idempotency_key=?", (key,)
+        records = TABLES["work_records"]
+        raw = await database.fetch_value(
+            select(records.c.payload_json).where(records.c.idempotency_key == key)
         )
-        if record is None:
+        if raw is None:
             return None
-        payload = json.loads(record["payload_json"])
+        payload = json.loads(raw)
         if payload.get("request_hash") != request_hash:
             raise ValueError("相同幂等键不能提交不同的任务规划请求")
         return payload["result"]

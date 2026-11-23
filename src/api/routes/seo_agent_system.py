@@ -9,6 +9,7 @@ from src.seo_agent.runtime import (
     seo_agent_database,
     seo_agent_system_service,
 )
+from src.seo_agent.services.system import SiteDomainConflictError
 
 router = APIRouter(prefix="/seo-agent/system", tags=["SEO Agent System"])
 
@@ -56,10 +57,8 @@ async def system_status() -> dict:
 async def create_site(body: CreateSiteRequest) -> dict:
     try:
         return await seo_agent_system_service.create_site(**body.model_dump())
-    except Exception as exc:
-        if "UNIQUE constraint failed" in str(exc):
-            raise HTTPException(status_code=409, detail="站点域名已存在") from exc
-        raise
+    except SiteDomainConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/sites")

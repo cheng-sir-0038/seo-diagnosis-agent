@@ -5,6 +5,7 @@ from pydantic import BaseModel
 
 from src.core.exceptions import InternalAdapterError
 from src.seo_agent.opportunities.models import OpportunityCandidate
+from src.seo_agent.opportunities.service import OpportunityRequestConflictError
 from src.seo_agent.runtime import (
     opportunity_discovery_workflow,
     opportunity_service,
@@ -38,7 +39,12 @@ class RejectRequest(BaseModel):
 
 @router.post("/scan-runs", status_code=201)
 async def start_scan(body: StartScanRequest) -> dict:
-    return await scan_run_service.start(**body.model_dump())
+    try:
+        return await scan_run_service.start(**body.model_dump())
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except OpportunityRequestConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.post("/scan-runs/{run_id}/complete")
@@ -64,9 +70,14 @@ async def discover_opportunities(run_id: str, body: OpportunityDiscoveryRequest)
 
 @router.post("/opportunities/ingest", status_code=201)
 async def ingest_candidate(body: CandidateRequest) -> dict:
-    return await opportunity_service.upsert_candidate(
-        candidate=body.candidate, **body.model_dump(exclude={"candidate"})
-    )
+    try:
+        return await opportunity_service.upsert_candidate(
+            candidate=body.candidate, **body.model_dump(exclude={"candidate"})
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except OpportunityRequestConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/opportunities")

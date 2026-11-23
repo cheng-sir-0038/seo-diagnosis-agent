@@ -272,7 +272,7 @@ export const productApi = {
     ),
 }
 
-export const PRODUCT_CONFIG_KEY = 'seo-agent-product-config-v1'
+export const PRODUCT_CONFIG_KEY = 'seo-agent-product-config-v2'
 
 export function loadProductConfig(): ProductConfig | null {
   try {

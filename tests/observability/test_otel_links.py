@@ -3,9 +3,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime
-from pathlib import Path
 
-import aiosqlite
 import pytest
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
@@ -20,9 +18,9 @@ SPAN_ID = re.compile(r"^[0-9a-f]{16}$")
 
 
 @pytest.mark.asyncio
-async def test_business_steps_export_evidence_and_receipt_on_the_same_trace(tmp_path: Path):
+async def test_business_steps_export_evidence_and_receipt_on_the_same_trace(pg_url: str):
     memory = InMemorySpanExporter()
-    database = ObservabilityDatabase(tmp_path / "observability.db")
+    database = ObservabilityDatabase(pg_url)
     exporter = OpenTelemetryExporter(
         service_name="seo-agent", endpoint=None, span_exporter=memory, database=database
     )
@@ -57,9 +55,9 @@ async def test_business_steps_export_evidence_and_receipt_on_the_same_trace(tmp_
 
 
 @pytest.mark.asyncio
-async def test_otel_exports_correlated_model_and_tool_calls(tmp_path: Path) -> None:
+async def test_otel_exports_correlated_model_and_tool_calls(pg_url: str) -> None:
     memory = InMemorySpanExporter()
-    database = ObservabilityDatabase(tmp_path / "observability.db")
+    database = ObservabilityDatabase(pg_url)
     await database.startup()
     exporter = OpenTelemetryExporter(
         service_name="seo-agent", endpoint=None, span_exporter=memory, database=database
@@ -126,9 +124,9 @@ async def test_otel_exports_correlated_model_and_tool_calls(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_unexpected_tool_arguments_do_not_break_export(tmp_path: Path) -> None:
+async def test_unexpected_tool_arguments_do_not_break_export(pg_url: str) -> None:
     memory = InMemorySpanExporter()
-    database = ObservabilityDatabase(tmp_path / "observability.db")
+    database = ObservabilityDatabase(pg_url)
     exporter = OpenTelemetryExporter(
         service_name="seo-agent", endpoint=None, span_exporter=memory, database=database
     )
@@ -155,14 +153,14 @@ async def test_unexpected_tool_arguments_do_not_break_export(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_trace_link_is_exported_as_real_otel_span_link(tmp_path: Path) -> None:
+async def test_trace_link_is_exported_as_real_otel_span_link(pg_url: str) -> None:
     memory = InMemorySpanExporter()
     exporter = OpenTelemetryExporter(
         service_name="seo-agent",
         endpoint=None,
         span_exporter=memory,
     )
-    database = ObservabilityDatabase(tmp_path / "observability.db")
+    database = ObservabilityDatabase(pg_url)
     await database.startup()
     client = ObservabilityClient(
         database,
@@ -195,12 +193,8 @@ async def test_trace_link_is_exported_as_real_otel_span_link(tmp_path: Path) -> 
             span.attributes.get("agent.observability.entity_type") == "trace_link" for span in spans
         )
 
-        publish_row = await database.fetch_one(
-            "SELECT * FROM obs_traces WHERE id = ?", (publish_trace.trace_id,)
-        )
-        monitoring_row = await database.fetch_one(
-            "SELECT * FROM obs_traces WHERE id = ?", (monitoring_trace.trace_id,)
-        )
+        publish_row = await client.get_trace(publish_trace.trace_id)
+        monitoring_row = await client.get_trace(monitoring_trace.trace_id)
         assert publish_row is not None and monitoring_row is not None
 
         publish_span = trace_spans[publish_trace.trace_id]
@@ -224,73 +218,33 @@ async def test_trace_link_is_exported_as_real_otel_span_link(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_existing_database_backfills_valid_stable_otel_ids(tmp_path: Path) -> None:
-    path = tmp_path / "legacy.db"
-    async with aiosqlite.connect(path) as connection:
-        await connection.executescript(
-            """
-            CREATE TABLE obs_projects (
-                id TEXT PRIMARY KEY,
-                project_key TEXT NOT NULL UNIQUE,
-                name TEXT NOT NULL,
-                service_name TEXT,
-                metadata_json TEXT NOT NULL DEFAULT '{}',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE TABLE obs_traces (
-                id TEXT PRIMARY KEY,
-                project_id TEXT NOT NULL,
-                operation_name TEXT NOT NULL,
-                session_id TEXT,
-                user_id TEXT,
-                status TEXT NOT NULL,
-                input_json TEXT NOT NULL DEFAULT '{}',
-                output_json TEXT NOT NULL DEFAULT '{}',
-                error_code TEXT,
-                error_message TEXT,
-                started_at TEXT NOT NULL,
-                completed_at TEXT,
-                duration_ms REAL,
-                metadata_json TEXT NOT NULL DEFAULT '{}'
-            );
-            INSERT INTO obs_projects(id, project_key, name, created_at, updated_at)
-            VALUES ('project-1', 'seo-agent', 'SEO Agent', '2026-07-24', '2026-07-24');
-            INSERT INTO obs_traces(
-                id, project_id, operation_name, status, started_at
-            ) VALUES ('trace-legacy', 'project-1', 'legacy.run', 'COMPLETED', '2026-07-24');
-            """
-        )
-        await connection.commit()
-
-    database = ObservabilityDatabase(path)
-    await database.startup()
+async def test_postgres_restart_preserves_exported_otel_ids(pg_url: str) -> None:
+    client = ObservabilityClient(ObservabilityDatabase(pg_url), project_key="test")
+    await client.startup()
     try:
-        first = await database.fetch_one(
-            "SELECT otel_trace_id, otel_root_span_id FROM obs_traces WHERE id = 'trace-legacy'"
-        )
-        assert first is not None
+        async with client.trace("persisted") as trace:
+            trace_id = trace.trace_id
+        first = await client.get_trace(trace_id)
         assert TRACE_ID.fullmatch(first["otel_trace_id"])
         assert SPAN_ID.fullmatch(first["otel_root_span_id"])
         assert int(first["otel_trace_id"], 16) != 0
         assert int(first["otel_root_span_id"], 16) != 0
     finally:
-        await database.shutdown()
+        await client.shutdown()
 
-    restarted = ObservabilityDatabase(path)
+    restarted = ObservabilityClient(ObservabilityDatabase(pg_url), project_key="test")
     await restarted.startup()
     try:
-        second = await restarted.fetch_one(
-            "SELECT otel_trace_id, otel_root_span_id FROM obs_traces WHERE id = 'trace-legacy'"
-        )
-        assert second == first
+        second = await restarted.get_trace(trace_id)
+        assert second["otel_trace_id"] == first["otel_trace_id"]
+        assert second["otel_root_span_id"] == first["otel_root_span_id"]
     finally:
         await restarted.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_completed_target_trace_rejects_late_otel_link(tmp_path: Path) -> None:
-    database = ObservabilityDatabase(tmp_path / "observability.db")
+async def test_completed_target_trace_rejects_late_otel_link(pg_url: str) -> None:
+    database = ObservabilityDatabase(pg_url)
     await database.startup()
     client = ObservabilityClient(database, project_key="seo-agent")
     try:

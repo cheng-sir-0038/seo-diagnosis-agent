@@ -1,0 +1,35 @@
+name: seo-agent-workspace
+
+services:
+  api:
+    profiles: ["app"]
+    build: .
+    env_file: .env.local
+    environment:
+      DATABASE_URL: postgresql://seo_agent:${POSTGRES_PASSWORD}@db:5432/seo_agent
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    volumes:
+      - artifacts:/app/data
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: seo_agent
+      POSTGRES_USER: seo_agent
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.local}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "seo_agent", "-d", "seo_agent"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  postgres-data:
+  artifacts:

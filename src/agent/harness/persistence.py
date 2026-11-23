@@ -13,6 +13,15 @@ class StoreRunPersistence:
     async def persist_event(self, run: AgentRun, event: AgentEvent) -> None:
         await self.store.persist_event(run, event)
 
+    async def save_waiting(
+        self,
+        run: AgentRun,
+        *,
+        messages: list[dict[str, Any]],
+        events: tuple[AgentEvent, AgentEvent],
+    ) -> dict[str, Any]:
+        return await self.store.save_waiting(run, messages=messages, events=events)
+
     async def save_checkpoint(
         self,
         run: AgentRun,

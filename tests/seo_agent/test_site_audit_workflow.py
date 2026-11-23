@@ -1,22 +1,23 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 from typing import Any
 
 import pytest
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from sqlalchemy import select
 
-from src.agent.loop import AgentLoop
 from src.agent.models import RunStatus
 from src.agent.observability import AgentRunObserver
 from src.agent.providers.base import ModelChunk, ToolCall
 from src.agent.providers.fake import FakeModelProvider
 from src.agent.run_manager import RunManager
+from src.agent.runtime.executor import AgentExecutor
 from src.core.exceptions import InternalProviderRequestError
 from src.models.common import Capability
 from src.observability.client import ObservabilityClient
 from src.observability.exporters import OpenTelemetryExporter
+from src.observability.schema import SpanRow
 from src.observability.storage import ObservabilityDatabase
 from src.seo_agent.chat.runtime import build_seo_system_prompt
 from src.seo_agent.chat.tools import build_seo_agent_registry
@@ -87,7 +88,7 @@ async def test_agent_loop_runs_page_and_performance_workflow() -> None:
     ])
     run = RunManager().create_run([{"role": "user", "content": "做页面基础体检并检查性能"}])
 
-    await AgentLoop(provider, registry).run(run)
+    await AgentExecutor(provider, registry).run(run)
 
     assert run.status == RunStatus.COMPLETED
     assert [call["capability"] for call in facade.calls] == [
@@ -173,7 +174,7 @@ async def test_performance_timeout_returns_page_before_agent_tool_timeout(monkey
     ])
     run = RunManager().create_run([{"role": "user", "content": "检查页面和性能"}])
 
-    await AgentLoop(provider, registry, tool_timeout=0.25).run(run)
+    await AgentExecutor(provider, registry, tool_timeout=0.25).run(run)
 
     event = next(event for event in run.events if event.type == "tool.completed")
     assert event.payload["result"]["data"]["workflow_status"] == "partial"
@@ -184,10 +185,10 @@ async def test_performance_timeout_returns_page_before_agent_tool_timeout(monkey
 @pytest.mark.asyncio
 @pytest.mark.parametrize("include_performance", [False, True])
 async def test_audit_records_only_executed_tools_as_child_spans(
-    tmp_path: Path, include_performance: bool
+    pg_url, include_performance: bool
 ) -> None:
     memory = InMemorySpanExporter()
-    database = ObservabilityDatabase(tmp_path / "observability.db")
+    database = ObservabilityDatabase(pg_url)
     exporter = OpenTelemetryExporter(
         service_name="seo-agent", endpoint=None, span_exporter=memory, database=database
     )
@@ -205,11 +206,11 @@ async def test_audit_records_only_executed_tools_as_child_spans(
     ])
     run = RunManager().create_run([{"role": "user", "content": "检查页面"}])
     try:
-        await AgentLoop(
+        await AgentExecutor(
             provider, registry, observer=AgentRunObserver(observer, operation_name="seo_agent.chat")
         ).run(run)
         rows = await database.fetch_all(
-            "SELECT id, parent_span_id, operation_name, status FROM obs_spans"
+            select(SpanRow.id, SpanRow.parent_span_id, SpanRow.operation_name, SpanRow.status)
         )
         by_name = {row["operation_name"]: row for row in rows}
         assert by_name["seo_page_metadata"]["parent_span_id"] == by_name["seo_site_audit"]["id"]
@@ -232,9 +233,9 @@ async def test_audit_records_only_executed_tools_as_child_spans(
 
 @pytest.mark.asyncio
 async def test_performance_failure_marks_child_span_but_keeps_workflow_partial(
-    tmp_path: Path,
+    pg_url,
 ) -> None:
-    database = ObservabilityDatabase(tmp_path / "observability.db")
+    database = ObservabilityDatabase(pg_url)
     observer = ObservabilityClient(database, project_key="seo-agent")
     registry = build_seo_agent_registry(
         ExternalDataFixture(fail_performance=True), SITE, observability=observer
@@ -247,11 +248,11 @@ async def test_performance_failure_marks_child_span_but_keeps_workflow_partial(
     ])
     run = RunManager().create_run([{"role": "user", "content": "检查页面和性能"}])
     try:
-        await AgentLoop(
+        await AgentExecutor(
             provider, registry, observer=AgentRunObserver(observer, operation_name="seo_agent.chat")
         ).run(run)
         row = await database.fetch_one(
-            "SELECT status FROM obs_spans WHERE operation_name = 'seo_page_performance'"
+            select(SpanRow.status).where(SpanRow.operation_name == 'seo_page_performance')
         )
         assert row is not None and row["status"] == "FAILED"
         event = next(event for event in run.events if event.type == "tool.completed")

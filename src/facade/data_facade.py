@@ -12,7 +12,7 @@ Facade 统一查询入口
 
     POST /api/v1/query ─→ Facade ─→ Provider(s) ─→ 外部 API / 伪模式
                              │
-                             ├── CacheManager (Redis + SQLite)
+                             ├── CacheManager (本地 TTL + PostgreSQL 快照)
                              └── 异常转换
 
 多 Provider 路由:
@@ -27,7 +27,7 @@ Facade 统一查询入口
 当前限制:
   - ProviderRouter 根据结构化意图和当前已实现能力确定主 Provider
   - 仅向完整满足要求的候选执行受控失败回退
-  - CacheManager 提供进程内 TTL 缓存和 SQLite 快照；Redis 未接入
+  - CacheManager 提供进程内 TTL 缓存和 PostgreSQL 证据快照
 """
 
 from __future__ import annotations

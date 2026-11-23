@@ -6,7 +6,18 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
+from sqlalchemy import func, insert, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
 from src.seo_agent.db.database import SeoAgentDatabase
+from src.seo_agent.db.models import (
+    NotificationAttemptRow,
+    NotificationDeliveryRow,
+    NotificationEventRow,
+    NotificationEventTypeRow,
+    NotificationPreferenceRow,
+    NotificationSubscriptionRow,
+)
 from src.seo_agent.notifications.email import EmailMessage, EmailSendResult, SmtpEmailProvider
 
 
@@ -39,13 +50,24 @@ class NotificationService:
 
     async def seed_event_types(self) -> None:
         now = _now()
-        for key, name, mode, threshold, schedule in EVENT_TYPES:
-            await self.database.execute(
-                "INSERT OR IGNORE INTO notification_event_types(id, event_key, name, "
-                "default_delivery_mode, supports_threshold, supports_schedule, status, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (_id("net"), key, name, mode, threshold, schedule, "ACTIVE", now),
-            )
+        values = [
+            {
+                "id": _id("net"),
+                "event_key": key,
+                "name": name,
+                "default_delivery_mode": mode,
+                "supports_threshold": threshold,
+                "supports_schedule": schedule,
+                "status": "ACTIVE",
+                "created_at": now,
+            }
+            for key, name, mode, threshold, schedule in EVENT_TYPES
+        ]
+        await self.database.execute(
+            pg_insert(NotificationEventTypeRow)
+            .values(values)
+            .on_conflict_do_nothing(index_elements=[NotificationEventTypeRow.event_key])
+        )
 
     async def create_subscription(
         self,
@@ -56,76 +78,93 @@ class NotificationService:
         recipient_role: str,
         is_default_approver: bool = False,
     ) -> dict[str, Any]:
-        subscription_id = _id("subscription")
-        now = _now()
-        await self.database.execute(
-            "INSERT INTO notification_subscriptions(id, site_id, subscriber_actor_id, "
-            "recipient_email, recipient_role, channel, enabled, is_default_approver, "
-            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'EMAIL', 1, ?, ?, ?)",
-            (
-                subscription_id,
-                site_id,
-                subscriber_actor_id,
-                recipient_email,
-                recipient_role,
-                int(is_default_approver),
-                now,
-                now,
-            ),
-        )
         await self.seed_event_types()
-        event_types = await self.database.fetch_all("SELECT * FROM notification_event_types")
-        for event_type in event_types:
-            mandatory = bool(
-                is_default_approver and event_type["event_key"] == "approval_requested"
+        async with self.database.transaction() as db:
+            subscription_id = _id("subscription")
+            now = _now()
+            await db.execute(
+                insert(NotificationSubscriptionRow).values(
+                    id=subscription_id,
+                    site_id=site_id,
+                    subscriber_actor_id=subscriber_actor_id,
+                    recipient_email=recipient_email,
+                    recipient_role=recipient_role,
+                    channel="EMAIL",
+                    enabled=1,
+                    is_default_approver=int(is_default_approver),
+                    created_at=now,
+                    updated_at=now,
+                )
             )
-            enabled = mandatory or event_type["event_key"] in {
-                "approval_requested",
-                "high_value_opportunity",
-                "task_completed",
-            }
-            await self.database.execute(
-                "INSERT INTO notification_preferences(id, subscription_id, event_type_id, enabled, "
-                "mandatory, delivery_mode, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    _id("preference"),
-                    subscription_id,
-                    event_type["id"],
-                    int(enabled),
-                    int(mandatory),
-                    event_type["default_delivery_mode"],
-                    now,
-                    now,
-                ),
+            event_types = await db.fetch_all(select(NotificationEventTypeRow.__table__))
+            for event_type in event_types:
+                mandatory = bool(
+                    is_default_approver and event_type["event_key"] == "approval_requested"
+                )
+                enabled = mandatory or event_type["event_key"] in {
+                    "approval_requested",
+                    "high_value_opportunity",
+                    "task_completed",
+                }
+                await db.execute(
+                    insert(NotificationPreferenceRow).values(
+                        id=_id("preference"),
+                        subscription_id=subscription_id,
+                        event_type_id=event_type["id"],
+                        enabled=int(enabled),
+                        mandatory=int(mandatory),
+                        delivery_mode=event_type["default_delivery_mode"],
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+            row = await db.fetch_one(
+                select(NotificationSubscriptionRow.__table__).where(
+                    NotificationSubscriptionRow.id == subscription_id
+                )
             )
-        row = await self.database.fetch_one(
-            "SELECT * FROM notification_subscriptions WHERE id = ?", (subscription_id,)
-        )
-        assert row is not None
-        return row
+            assert row is not None
+            return row
 
     async def list_subscriptions(self, site_id: str) -> list[dict[str, Any]]:
         return await self.database.fetch_all(
-            "SELECT * FROM notification_subscriptions WHERE site_id = ? AND archived_at IS NULL "
-            "ORDER BY created_at",
-            (site_id,),
+            select(NotificationSubscriptionRow.__table__)
+            .where(
+                NotificationSubscriptionRow.site_id == site_id,
+                NotificationSubscriptionRow.archived_at.is_(None),
+            )
+            .order_by(NotificationSubscriptionRow.created_at)
         )
 
     async def list_preferences(self, subscription_id: str) -> list[dict[str, Any]]:
         return await self.database.fetch_all(
-            "SELECT p.*, t.event_key, t.name, t.description, t.supports_threshold, "
-            "t.supports_schedule FROM notification_preferences p "
-            "JOIN notification_event_types t ON t.id = p.event_type_id "
-            "WHERE p.subscription_id = ? ORDER BY t.event_key",
-            (subscription_id,),
+            select(
+                NotificationPreferenceRow.__table__,
+                NotificationEventTypeRow.event_key,
+                NotificationEventTypeRow.name,
+                NotificationEventTypeRow.description,
+                NotificationEventTypeRow.supports_threshold,
+                NotificationEventTypeRow.supports_schedule,
+            )
+            .join(
+                NotificationEventTypeRow,
+                NotificationEventTypeRow.id == NotificationPreferenceRow.event_type_id,
+            )
+            .where(NotificationPreferenceRow.subscription_id == subscription_id)
+            .order_by(NotificationEventTypeRow.event_key)
         )
 
     async def get_preference(self, subscription_id: str, event_key: str) -> dict[str, Any]:
         row = await self.database.fetch_one(
-            "SELECT p.*, t.event_key FROM notification_preferences p "
-            "JOIN notification_event_types t ON t.id = p.event_type_id "
-            "WHERE p.subscription_id = ? AND t.event_key = ?",
-            (subscription_id, event_key),
+            select(NotificationPreferenceRow.__table__, NotificationEventTypeRow.event_key)
+            .join(
+                NotificationEventTypeRow,
+                NotificationEventTypeRow.id == NotificationPreferenceRow.event_type_id,
+            )
+            .where(
+                NotificationPreferenceRow.subscription_id == subscription_id,
+                NotificationEventTypeRow.event_key == event_key,
+            )
         )
         if row is None:
             raise KeyError(f"订阅偏好不存在: {subscription_id}/{event_key}")
@@ -146,16 +185,15 @@ class NotificationService:
             raise ValueError("默认审批人的待审批通知必须强制开启")
         now = _now()
         await self.database.execute(
-            "UPDATE notification_preferences SET enabled = ?, delivery_mode = COALESCE(?, delivery_mode), "
-            "schedule_json = ?, threshold_json = ?, updated_at = ? WHERE id = ?",
-            (
-                int(enabled),
-                delivery_mode,
-                json.dumps(schedule or {}, ensure_ascii=False),
-                json.dumps(threshold or {}, ensure_ascii=False),
-                now,
-                current["id"],
-            ),
+            update(NotificationPreferenceRow)
+            .where(NotificationPreferenceRow.id == current["id"])
+            .values(
+                enabled=int(enabled),
+                delivery_mode=func.coalesce(delivery_mode, NotificationPreferenceRow.delivery_mode),
+                schedule_json=json.dumps(schedule or {}, ensure_ascii=False),
+                threshold_json=json.dumps(threshold or {}, ensure_ascii=False),
+                updated_at=now,
+            )
         )
         return await self.get_preference(subscription_id, event_key)
 
@@ -171,119 +209,170 @@ class NotificationService:
         priority: str,
         idempotency_key: str,
     ) -> dict[str, Any]:
-        existing = await self.database.fetch_one(
-            "SELECT * FROM notification_events WHERE idempotency_key = ?", (idempotency_key,)
-        )
-        if existing is not None:
-            return existing
-        event_type = await self.database.fetch_one(
-            "SELECT * FROM notification_event_types WHERE event_key = ?", (event_key,)
-        )
-        if event_type is None:
-            raise KeyError(f"通知事件类型不存在: {event_key}")
-        event_id = _id("notification")
-        now = _now()
-        await self.database.execute(
-            "INSERT INTO notification_events(id, site_id, event_type_id, business_object_type, "
-            "business_object_id, title, content_json, priority, idempotency_key, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                event_id,
-                site_id,
-                event_type["id"],
-                business_object_type,
-                business_object_id,
-                title,
-                json.dumps(content, ensure_ascii=False),
-                priority,
-                idempotency_key,
-                now,
-            ),
-        )
-        subscriptions = await self.database.fetch_all(
-            "SELECT s.*, p.id AS preference_id FROM notification_subscriptions s "
-            "JOIN notification_preferences p ON p.subscription_id = s.id "
-            "WHERE s.site_id = ? AND s.enabled = 1 AND s.archived_at IS NULL "
-            "AND p.event_type_id = ? AND p.enabled = 1",
-            (site_id, event_type["id"]),
-        )
-        for subscription in subscriptions:
-            delivery_key = f"{idempotency_key}:{subscription['id']}:email"
-            await self.database.execute(
-                "INSERT OR IGNORE INTO notification_deliveries(id, notification_event_id, "
-                "subscription_id, channel_adapter, provider_adapter, recipient, status, "
-                "idempotency_key, scheduled_at, created_at) VALUES (?, ?, ?, 'email', 'smtp', ?, "
-                "'PENDING', ?, ?, ?)",
-                (
-                    _id("delivery"),
-                    event_id,
-                    subscription["id"],
-                    subscription["recipient_email"],
-                    delivery_key,
-                    now,
-                    now,
-                ),
+        async with self.database.transaction() as db:
+            event_type = await db.fetch_one(
+                select(NotificationEventTypeRow.__table__).where(
+                    NotificationEventTypeRow.event_key == event_key
+                )
             )
-        row = await self.database.fetch_one(
-            "SELECT * FROM notification_events WHERE id = ?", (event_id,)
-        )
-        assert row is not None
-        return row
+            if event_type is None:
+                raise KeyError(f"通知事件类型不存在: {event_key}")
+            event_id = _id("notification")
+            now = _now()
+            recorded = await db.fetch_one(
+                pg_insert(NotificationEventRow)
+                .values(
+                    id=event_id,
+                    site_id=site_id,
+                    event_type_id=event_type["id"],
+                    business_object_type=business_object_type,
+                    business_object_id=business_object_id,
+                    title=title,
+                    content_json=json.dumps(content, ensure_ascii=False),
+                    priority=priority,
+                    idempotency_key=idempotency_key,
+                    created_at=now,
+                )
+                .on_conflict_do_nothing(index_elements=[NotificationEventRow.idempotency_key])
+                .returning(*NotificationEventRow.__table__.c)
+            )
+            if recorded is None:
+                existing = await db.fetch_one(
+                    select(NotificationEventRow.__table__).where(
+                        NotificationEventRow.idempotency_key == idempotency_key
+                    )
+                )
+                if existing is None or (
+                    existing["site_id"],
+                    existing["business_object_type"],
+                    existing["business_object_id"],
+                    existing["event_type_id"],
+                ) != (site_id, business_object_type, business_object_id, event_type["id"]):
+                    raise ValueError("通知幂等键已用于其他业务事件")
+                return existing
+            subscriptions = await db.fetch_all(
+                select(
+                    NotificationSubscriptionRow.__table__,
+                    NotificationPreferenceRow.id.label("preference_id"),
+                )
+                .join(
+                    NotificationPreferenceRow,
+                    NotificationPreferenceRow.subscription_id == NotificationSubscriptionRow.id,
+                )
+                .where(
+                    NotificationSubscriptionRow.site_id == site_id,
+                    NotificationSubscriptionRow.enabled == 1,
+                    NotificationSubscriptionRow.archived_at.is_(None),
+                    NotificationPreferenceRow.event_type_id == event_type["id"],
+                    NotificationPreferenceRow.enabled == 1,
+                )
+            )
+            for subscription in subscriptions:
+                delivery_key = f"{idempotency_key}:{subscription['id']}:email"
+                await db.execute(
+                    pg_insert(NotificationDeliveryRow)
+                    .values(
+                        id=_id("delivery"),
+                        notification_event_id=event_id,
+                        subscription_id=subscription["id"],
+                        channel_adapter="email",
+                        provider_adapter="smtp",
+                        recipient=subscription["recipient_email"],
+                        status="PENDING",
+                        idempotency_key=delivery_key,
+                        scheduled_at=now,
+                        created_at=now,
+                    )
+                    .on_conflict_do_nothing()
+                )
+            return recorded
 
-    async def send_delivery(self, delivery_id: str) -> EmailSendResult:
-        if self.provider is None:
-            raise RuntimeError("邮件 Provider 未配置")
-        row = await self.database.fetch_one(
-            "SELECT d.*, e.title, e.content_json FROM notification_deliveries d "
-            "JOIN notification_events e ON e.id = d.notification_event_id WHERE d.id = ?",
-            (delivery_id,),
-        )
-        if row is None:
-            raise KeyError(f"通知投递不存在: {delivery_id}")
-        count = await self.database.fetch_value(
-            "SELECT COUNT(*) FROM notification_attempts WHERE notification_delivery_id = ?",
-            (delivery_id,),
-        )
-        attempt_no = int(count or 0) + 1
-        attempt_id = _id("attempt")
-        now = _now()
-        await self.database.execute(
-            "INSERT INTO notification_attempts(id, notification_delivery_id, attempt_no, provider, "
-            "status, started_at, created_at) VALUES (?, ?, ?, 'smtp', 'RUNNING', ?, ?)",
-            (attempt_id, delivery_id, attempt_no, now, now),
-        )
-        content = json.loads(row["content_json"])
-        message = EmailMessage(
-            message_id=row["notification_event_id"],
-            to=[row["recipient"]],
-            subject=row["title"],
-            text_content=str(content.get("text") or content.get("summary") or row["title"]),
-            html_content=content.get("html"),
-            idempotency_key=row["idempotency_key"],
-        )
-        result = await self.provider.send(message)
-        completed = _now()
-        await self.database.execute(
-            "UPDATE notification_attempts SET status = ?, error_code = ?, error_message = ?, "
-            "completed_at = ? WHERE id = ?",
-            (result.status, result.error_code, result.error_message, completed, attempt_id),
-        )
-        await self.database.execute(
-            "UPDATE notification_deliveries SET status = ?, provider_message_id = ?, sent_at = ?, "
-            "failed_at = ? WHERE id = ?",
-            (
-                result.status,
-                result.provider_message_id,
-                completed if result.success else None,
-                None if result.success else completed,
-                delivery_id,
-            ),
-        )
-        return result
+    async def send_delivery(
+        self, delivery_id: str, *, max_attempts: int | None = None
+    ) -> EmailSendResult:
+        async with self.database.transaction() as db:
+            if self.provider is None:
+                raise RuntimeError("邮件 Provider 未配置")
+            row = await db.fetch_one(
+                select(
+                    NotificationDeliveryRow.__table__,
+                    NotificationEventRow.title,
+                    NotificationEventRow.content_json,
+                )
+                .join(
+                    NotificationEventRow,
+                    NotificationEventRow.id == NotificationDeliveryRow.notification_event_id,
+                )
+                .where(NotificationDeliveryRow.id == delivery_id)
+                .with_for_update(of=NotificationDeliveryRow)
+            )
+            if row is None:
+                raise KeyError(f"通知投递不存在: {delivery_id}")
+            if row["status"] == "SENT":
+                return EmailSendResult(
+                    success=True,
+                    provider="smtp",
+                    status="SENT",
+                    provider_message_id=row["provider_message_id"],
+                )
+            count = await db.fetch_value(
+                select(func.count())
+                .select_from(NotificationAttemptRow)
+                .where(NotificationAttemptRow.notification_delivery_id == delivery_id)
+            )
+            attempt_no = int(count or 0) + 1
+            if max_attempts is not None and attempt_no > max_attempts:
+                return EmailSendResult(success=False, provider="smtp", status="EXHAUSTED")
+            attempt_id = _id("attempt")
+            now = _now()
+            await db.execute(
+                insert(NotificationAttemptRow).values(
+                    id=attempt_id,
+                    notification_delivery_id=delivery_id,
+                    attempt_no=attempt_no,
+                    provider="smtp",
+                    status="RUNNING",
+                    started_at=now,
+                    created_at=now,
+                )
+            )
+            content = json.loads(row["content_json"])
+            message = EmailMessage(
+                message_id=row["notification_event_id"],
+                to=[row["recipient"]],
+                subject=row["title"],
+                text_content=str(content.get("text") or content.get("summary") or row["title"]),
+                html_content=content.get("html"),
+                idempotency_key=row["idempotency_key"],
+            )
+            result = await self.provider.send(message)
+            completed = _now()
+            await db.execute(
+                update(NotificationAttemptRow)
+                .where(NotificationAttemptRow.id == attempt_id)
+                .values(
+                    status=result.status,
+                    error_code=result.error_code,
+                    error_message=result.error_message,
+                    completed_at=completed,
+                )
+            )
+            await db.execute(
+                update(NotificationDeliveryRow)
+                .where(NotificationDeliveryRow.id == delivery_id)
+                .values(
+                    status=result.status,
+                    provider_message_id=result.provider_message_id,
+                    sent_at=completed if result.success else None,
+                    failed_at=None if result.success else completed,
+                )
+            )
+            return result
 
     async def list_pending_deliveries(self, limit: int = 100) -> list[dict[str, Any]]:
         return await self.database.fetch_all(
-            "SELECT * FROM notification_deliveries WHERE status IN ('PENDING', 'FAILED') "
-            "ORDER BY scheduled_at LIMIT ?",
-            (limit,),
+            select(NotificationDeliveryRow.__table__)
+            .where(NotificationDeliveryRow.status.in_(("PENDING", "FAILED")))
+            .order_by(NotificationDeliveryRow.scheduled_at)
+            .limit(limit)
         )

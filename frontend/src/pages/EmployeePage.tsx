@@ -61,7 +61,7 @@ export function EmployeePage() {
         <section className="panel-card"><h2>基础设施</h2><div className="compact-list"><div><span>业务数据库</span><StatusPill value={status?.database_started ? 'READY' : 'UNAVAILABLE'} /></div><div><span>LangGraph Checkpoint</span><StatusPill value={status?.checkpoint_started ? 'READY' : 'UNAVAILABLE'} /></div>{status?.adapters.map((adapter) => <div key={`${adapter.category}:${adapter.key}`}><span>{adapter.display_name}</span><StatusPill value={adapter.implemented ? 'READY' : 'NOT_IMPLEMENTED'} /></div>)}</div>{!status?.adapters.length ? <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无已注册适配器详情" /> : null}</section>
       </div>
 
-      <section className="panel-card"><div className="section-heading"><div><h2>能力边界</h2><p>诊断与自动修复仍保持协议和伪代码；下列工程链路是真实实现。</p></div></div><div className="capability-grid">{['DataForSEO Tools', 'SQLite 三库', '具体动作审批', 'QQ SMTP', '版本化 PRD', '内部人工派发', 'HTML 发布', '效果监控'].map((item) => <div key={item}><CheckCircleOutlined /><span>{item}</span></div>)}</div></section>
+      <section className="panel-card"><div className="section-heading"><div><h2>能力边界</h2><p>诊断与自动修复仍保持协议和伪代码；下列工程链路是真实实现。</p></div></div><div className="capability-grid">{['DataForSEO Tools', 'PostgreSQL', '具体动作审批', 'QQ SMTP', '版本化 PRD', '内部人工派发', 'HTML 发布', '效果监控'].map((item) => <div key={item}><CheckCircleOutlined /><span>{item}</span></div>)}</div></section>
     </div>
   )
 }

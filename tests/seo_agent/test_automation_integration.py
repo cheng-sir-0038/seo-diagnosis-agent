@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
 import pytest
+from sqlalchemy import func, insert, select
 
 from src.observability.client import ObservabilityClient
+from src.observability.schema import SpanRow
 from src.observability.storage import ObservabilityDatabase
 from src.seo_agent.automation.digests import DigestService
 from src.seo_agent.automation.models import DeliveryReviewOutput
@@ -13,6 +16,13 @@ from src.seo_agent.automation.outbox import NotificationOutboxWorker
 from src.seo_agent.automation.schedules import ScheduleAutomationCoordinator
 from src.seo_agent.automation.structured import StructuredModelAutomation
 from src.seo_agent.db.database import SeoAgentDatabase
+from src.seo_agent.db.models import (
+    NotificationAttemptRow,
+    NotificationDeliveryRow,
+    OpportunityRow,
+    TaskPrdArtifactRow,
+    WorkRecordRow,
+)
 from src.seo_agent.notifications.email import EmailMessage, SmtpEmailProvider, SmtpSettings
 from src.seo_agent.notifications.service import NotificationService
 from src.seo_agent.opportunities.service import ScanRunService
@@ -51,8 +61,8 @@ class FakeSMTP:
 
 
 @pytest.fixture
-async def context(tmp_path: Path, approve_opportunity):
-    db = SeoAgentDatabase(tmp_path / "automation.db")
+async def context(tmp_path: Path, approve_opportunity, pg_url: str):
+    db = SeoAgentDatabase(pg_url)
     await db.startup()
     system = SeoAgentSystemService(db)
     site = await system.create_site(
@@ -69,14 +79,25 @@ async def context(tmp_path: Path, approve_opportunity):
     agent = await system.create_actor(actor_type="SEO_AGENT", name="SEO Agent")
     now = "2026-07-23T00:00:00+00:00"
     await db.execute(
-        "INSERT INTO opportunities(id, site_id, fingerprint, normalized_intent, opportunity_type, "
-        "target_country, target_language, title, current_score, priority_level, status, "
-        "current_summary, "
-        "policy_version, first_seen_at, last_seen_at, created_at, updated_at) "
-        "VALUES ('opp-1', ?, 'fp', 'waterjet maintenance cost', 'CONTENT_GAP', 'US', 'en', "
-        "'Maintenance Cost', 88, 'HIGH', 'WAITING_FOR_DECISION', 'Competitors cover pricing', "
-        "'v1', ?, ?, ?, ?)",
-        (site["id"], now, now, now, now),
+        insert(OpportunityRow).values(
+            id="opp-1",
+            site_id=site["id"],
+            fingerprint="fp",
+            normalized_intent="waterjet maintenance cost",
+            opportunity_type="CONTENT_GAP",
+            target_country="US",
+            target_language="en",
+            title="Maintenance Cost",
+            current_score=88,
+            priority_level="HIGH",
+            status="WAITING_FOR_DECISION",
+            current_summary="Competitors cover pricing",
+            policy_version="v1",
+            first_seen_at=now,
+            last_seen_at=now,
+            created_at=now,
+            updated_at=now,
+        )
     )
     await approve_opportunity(db, site["id"], "opp-1", owner["id"])
     tasks = TaskDeliveryService(db, artifact_root=tmp_path / "artifacts")
@@ -129,7 +150,9 @@ async def test_structured_model_generates_prd_and_review(context) -> None:
     assert prd["version_no"] == 1
     assert (
         await db.fetch_value(
-            "SELECT COUNT(*) FROM task_prd_artifacts WHERE prd_version_id = ?", (prd["id"],)
+            select(func.count())
+            .select_from(TaskPrdArtifactRow)
+            .where(TaskPrdArtifactRow.prd_version_id == prd["id"])
         )
         == 2
     )
@@ -184,8 +207,10 @@ async def test_outbox_worker_sends_current_provider_and_records_attempt(context)
     )
     result = await NotificationOutboxWorker(db, notifications, provider, max_attempts=3).run_once()
     assert result.sent == 1 and result.failed == 0
+    sent_id = await db.fetch_value(select(NotificationDeliveryRow.id))
+    await asyncio.gather(notifications.send_delivery(sent_id), notifications.send_delivery(sent_id))
     assert len(transport.messages) == 1
-    assert await db.fetch_value("SELECT COUNT(*) FROM notification_attempts") == 1
+    assert await db.fetch_value(select(func.count()).select_from(NotificationAttemptRow)) == 1
 
 
 @pytest.mark.asyncio
@@ -209,18 +234,19 @@ async def test_digest_uses_business_records_and_creates_one_event(context) -> No
         actor_id=agent["id"],
         idempotency_key="record:digest",
     )
-    digest = await DigestService(db, notifications).create_digest(
-        site_id=site["id"], period="daily", period_key="2026-07-23"
-    )
-    repeated = await DigestService(db, notifications).create_digest(
-        site_id=site["id"], period="daily", period_key="2026-07-23"
+    service = DigestService(db, notifications)
+    digest, repeated = await asyncio.gather(
+        *(
+            service.create_digest(site_id=site["id"], period="daily", period_key="2026-07-23")
+            for _ in range(2)
+        )
     )
     assert repeated["id"] == digest["id"]
-    assert await db.fetch_value("SELECT COUNT(*) FROM notification_deliveries") == 1
+    assert await db.fetch_value(select(func.count()).select_from(NotificationDeliveryRow)) == 1
 
 
 @pytest.mark.asyncio
-async def test_schedule_coordinator_syncs_and_triggers_real_scan_run(context) -> None:
+async def test_schedule_coordinator_syncs_and_triggers_real_scan_run(context, pg_url: str) -> None:
     db, system, site, _, _, agent, _, _, tmp_path = context
     schedules = WorkScheduleService(db)
     schedule = await schedules.create_schedule(
@@ -232,7 +258,7 @@ async def test_schedule_coordinator_syncs_and_triggers_real_scan_run(context) ->
         execution_time="06:30",
     )
     provider = LocalScheduleProvider()
-    observability_db = ObservabilityDatabase(tmp_path / "scheduler-observability.db")
+    observability_db = ObservabilityDatabase(pg_url)
     await observability_db.startup()
     observability = ObservabilityClient(observability_db, project_key="seo-agent")
     await provider.startup()
@@ -252,11 +278,15 @@ async def test_schedule_coordinator_syncs_and_triggers_real_scan_run(context) ->
         assert run["status"] == "RUNNING"
         assert (
             await db.fetch_value(
-                "SELECT COUNT(*) FROM work_records WHERE record_type = 'scan_started'"
+                select(func.count())
+                .select_from(WorkRecordRow)
+                .where(WorkRecordRow.record_type == "scan_started")
             )
             == 1
         )
-        span = await observability_db.fetch_one("SELECT * FROM obs_spans WHERE kind = 'SCHEDULER'")
+        span = await observability_db.fetch_one(
+            select(SpanRow.__table__).where(SpanRow.kind == "SCHEDULER")
+        )
         assert span is not None
         assert span["operation_name"] == "scheduler.opportunity_scan"
     finally:

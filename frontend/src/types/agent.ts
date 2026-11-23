@@ -4,6 +4,8 @@ export type AgentEventType =
   | 'run.waiting_for_input'
   | 'input.submitted'
   | 'input.accepted'
+  | 'agent.dispatched'
+  | 'skill.loaded'
   | 'stage.changed'
   | 'message.started'
   | 'message.delta'
@@ -36,9 +38,28 @@ export interface HumanInputRequest {
 
 export type RenderHint = 'chart' | 'table' | 'tree' | 'cards'
 
+export const specialistNames = { seo: 'SEO / GEO', healthcare: '医药业务' } as const
+export type Specialist = keyof typeof specialistNames
+
+export interface AppliedSkill {
+  agent: Specialist
+  name: string
+  label: string
+}
+
+export interface SpecialistDirectoryData {
+  specialists: {
+    agent: Specialist
+    tools: { name: string, description: string }[]
+    skills?: { name: string, label: string, tools: string[] }[]
+    note?: string | null
+  }[]
+}
+
 export interface ToolRun {
   id: string
   name: string
+  agent?: Specialist
   status: 'running' | 'completed' | 'failed'
   arguments?: unknown
   result?: unknown
@@ -53,6 +74,8 @@ export interface RunState {
   status: RunStatus
   stage: string
   assistantText: string
+  agents: Specialist[]
+  skills: AppliedSkill[]
   tools: ToolRun[]
   events: AgentEvent[]
   lastSequence: number
@@ -68,12 +91,15 @@ export interface ChatMessage {
   content: string
   createdAt: string
   toolResults?: ToolRun[]
+  agents?: Specialist[]
+  skills?: AppliedSkill[]
   runId?: string
   inputRequest?: HumanInputRequest
 }
 
 export interface SavedAgentRun {
-  siteId: string
+  priorAgents?: Specialist[]
+  priorSkills?: AppliedSkill[]
   runId: string
   eventsUrl: string
   cancelUrl: string
@@ -93,7 +119,7 @@ export type AgentTaskStatusGroup = 'pending' | 'running' | 'ended'
 
 export interface AgentTaskSummary {
   id: string
-  site_id: string
+  site_id: string | null
   conversation_id?: string | null
   thread_id: string
   title: string

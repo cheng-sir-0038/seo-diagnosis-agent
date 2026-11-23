@@ -92,23 +92,29 @@ class AgentRun:
     partial: bool = False
     pause_requested: bool = False
     human_input: HumanInputState | None = None
+    dispatch_state: dict[str, Any] = field(default_factory=dict)
 
     @property
     def terminal(self) -> bool:
         return self.status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}
 
     def emit(self, event_type: str, payload: dict[str, Any] | None = None) -> AgentEvent:
-        self.sequence += 1
         event = AgentEvent(
             run_id=self.id,
             type=event_type,
-            sequence=self.sequence,
+            sequence=self.sequence + 1,
             payload=payload or {},
         )
+        self.publish_event(event)
+        return event
+
+    def publish_event(self, event: AgentEvent) -> None:
+        if event.run_id != self.id or event.sequence != self.sequence + 1:
+            raise ValueError("事件必须属于当前运行并按顺序发布")
+        self.sequence = event.sequence
         self.events.append(event)
         self._events_changed.set()
         self._events_changed = asyncio.Event()
-        return event
 
     async def follow_events(self) -> AsyncIterator[AgentEvent | None]:
         index = 0

@@ -4,9 +4,9 @@ from typing import Any
 
 import pytest
 
-from src.agent.loop import AgentLoop
 from src.agent.providers.fake import FakeModelProvider
 from src.agent.run_manager import RunManager
+from src.agent.runtime.executor import AgentExecutor
 from src.agent.tools import (
     ToolProtocol,
     ToolRegistry,
@@ -101,7 +101,7 @@ async def test_agent_loop_passes_runtime_context_to_protocol_tool() -> None:
         ]
     )
 
-    await AgentLoop(provider, ToolRegistry([tool])).run(run)
+    await AgentExecutor(provider, ToolRegistry([tool])).run(run)
 
     assert tool.runtime is not None
     assert tool.runtime.run_id == run.id

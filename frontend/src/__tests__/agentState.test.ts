@@ -56,6 +56,26 @@ describe('reduceAgentEvent', () => {
     expect(completed.tools[0].render_hint).toBeUndefined()
   })
 
+  it('tracks actual dispatches in order and ignores replayed events and unknown agents', () => {
+    const first = event(1, 'agent.dispatched', { agent: 'healthcare' })
+    const second = event(2, 'agent.dispatched', { agent: 'seo' })
+    const state = [first, second, second, event(3, 'agent.dispatched', { agent: 'unknown' })]
+      .reduce(reduceAgentEvent, initialRunState)
+    expect(state.agents).toEqual(['healthcare', 'seo'])
+    expect(reduceAgentEvent(state, event(0, 'run.reset', { status: 'pending' })).agents).toEqual([])
+  })
+
+  it('attributes each call to the specialist that started it, including late completions', () => {
+    const state = [
+      event(1, 'agent.dispatched', { agent: 'healthcare' }),
+      event(2, 'tool.started', { tool_call_id: 'rule', name: 'medical_exam_syllabus' }),
+      event(3, 'agent.dispatched', { agent: 'seo' }),
+      event(4, 'tool.completed', { tool_call_id: 'rule', name: 'medical_exam_syllabus' }),
+      event(5, 'tool.completed', { tool_call_id: 'page', name: 'seo_page_metadata' }),
+    ].reduce(reduceAgentEvent, initialRunState)
+    expect(state.tools.map(tool => tool.agent)).toEqual(['healthcare', 'seo'])
+  })
+
   it('marks budget completion as a partial successful result', () => {
     const done = reduceAgentEvent(initialRunState, event(1, 'run.completed', {
       status: 'completed',

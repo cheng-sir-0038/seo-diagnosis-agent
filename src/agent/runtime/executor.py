@@ -5,13 +5,14 @@ import json
 import logging
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
 from src.agent.content_sanitizer import sanitize_assistant_content
 from src.agent.harness.protocols import AgentRunPersistence
 from src.agent.harness.summary import compact_model_context
-from src.agent.models import AgentRun, HumanInputRequest, HumanInputState, RunStatus
+from src.agent.models import AgentEvent, AgentRun, HumanInputRequest, HumanInputState, RunStatus
 from src.agent.observability import AgentRunObserver
 from src.agent.providers.base import ModelProvider, ToolCall
 from src.agent.tools.base import ToolResult, ToolRuntimeContext, resolve_render_hint
@@ -40,7 +41,7 @@ _BUDGET_PREFIX = (
 _DUPLICATE_GUARD_PREFIX = "检测到重复工具调用，已停止继续补查；以下结论基于已经获得的证据。"
 
 
-class AgentLoop:
+class AgentExecutor:
     def __init__(
         self,
         provider: ModelProvider,
@@ -64,12 +65,11 @@ class AgentLoop:
         self.context_message_limit = context_message_limit
         self.context_character_limit = context_character_limit
 
-    async def run(self, run: AgentRun) -> None:
+    async def run(
+        self, run: AgentRun, *, workflow: Callable[[AgentRun], Awaitable[None]] | None = None
+    ) -> None:
         context_token = set_current_context(get_current_context()) if self.observer else None
         resumed = run.status == RunStatus.RECOVERING
-        messages = [dict(message) for message in run.messages]
-        iteration = int(run.iteration)
-        tool_count = int(run.tool_count)
         run.error = None
         run.finished_at = None
         run.partial = False
@@ -78,334 +78,49 @@ class AgentLoop:
             if self.observer is not None:
                 await self.observer.start(run, self.provider)
             run.status = RunStatus.RUNNING
-            await self._emit(
+            await self.emit(
                 run,
                 "run.resumed" if resumed else "run.started",
                 {"status": run.status.value, "iteration": run.iteration},
             )
             if self.max_iterations <= 0:
                 raise RuntimeError("最大模型循环次数必须大于 0")
-            if run.human_input and run.human_input.answer is not None:
-                await self._emit(run, "input.accepted", {
-                    "request_id": run.human_input.request_id,
-                    "answer": run.human_input.answer,
-                    "action": run.human_input.action,
-                })
-                async with observed_operation(
-                    self.observer.client if self.observer else None,
-                    "human_input_received", kind=SpanKind.INTERNAL,
-                    input_data={
-                        "request_id": run.human_input.request_id, "answer": run.human_input.answer,
-                    },
-                ) as span:
-                    if span:
-                        span.output_data = {"application_run_id": run.id, "status": "resuming"}
-                if not run.pending_tool_calls:
-                    call = ToolCall(
-                        id=f"resume_{uuid.uuid4().hex}", name=run.human_input.tool_name,
-                        arguments=run.human_input.tool_arguments,
-                    )
-                    messages.append({"role": "assistant", "content": None, "tool_calls": [{
-                        "id": call.id, "type": "function", "function": {
-                            "name": call.name,
-                            "arguments": json.dumps(call.arguments, ensure_ascii=False),
-                        },
-                    }]})
-                    run.pending_tool_calls = [_serialize_tool_call(call)]
-                    await self._save_checkpoint(
-                        run, messages, iteration=iteration, tool_count=tool_count,
-                        stage="input_resume_pending",
-                    )
-            if run.pending_tool_calls:
-                iteration, tool_count = await self._execute_pending_tools(
-                    run,
-                    messages,
-                    iteration=iteration,
-                    tool_count=tool_count,
-                )
-            if await self._wait_for_input(run, messages):
-                return
-
-            if iteration >= self.max_iterations:
-                iteration = self.max_iterations - 1
-
-            while iteration < self.max_iterations:
-                self._check_cancel(run)
-                repeated_tool_guard = _has_reused_tool_result(run)
-                budget_exhausted = iteration >= self.max_iterations - 1
-                force_summary = budget_exhausted or repeated_tool_guard
-                completion_mode = "duplicate_tool_guard" if repeated_tool_guard else "budget_limit"
-                stage = "summarizing_budget" if force_summary else "calling_model"
-                run.iteration = iteration
-                run.tool_count = tool_count
-                await self._emit(
-                    run,
-                    "stage.changed",
-                    {
-                        "stage": stage,
-                        "iteration": iteration + 1,
-                        "remaining_iterations": max(0, self.max_iterations - iteration - 1),
-                    },
-                    stage=stage,
-                )
-                await self._save_checkpoint(
-                    run,
-                    messages,
-                    iteration=iteration,
-                    tool_count=tool_count,
-                    stage=stage,
-                )
-                assistant_text: list[str] = []
-                pending_calls: list[ToolCall] = []
-                usage = {
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "reasoning_tokens": 0,
-                    "cached_tokens": 0,
-                    "total_tokens": 0,
-                }
-                finish_reason: str | None = None
-                first_token_ms: float | None = None
-                usage_keys: set[str] = set()
-                started = time.perf_counter()
-                model_messages = compact_model_context(
-                    messages,
-                    run.survival_summary,
-                    message_limit=self.context_message_limit,
-                    character_limit=self.context_character_limit,
-                )
-                if force_summary:
-                    model_messages = _inject_budget_summary_prompt(model_messages)
-                tool_choice = "none" if force_summary else "auto"
-                tool_schemas = self.tools.schemas()
-                model_input = {
-                    "messages": model_messages, "tools": tool_schemas, "tool_choice": tool_choice
-                }
-                model_span = (
-                    self.observer.span(
-                        f"model.iteration.{iteration + 1}",
-                        kind=SpanKind.MODEL,
-                        component_name=self.provider.provider_name,
-                        input_data={
-                            "message_count": len(model_messages),
-                            "full_message_count": len(messages),
-                            "tool_schema_count": len(tool_schemas),
-                            "tool_choice": tool_choice,
-                        },
-                    )
-                    if self.observer
-                    else None
-                )
-
-                async def consume_model() -> None:
-                    nonlocal finish_reason, first_token_ms
-                    async for chunk in self.provider.stream(
-                        model_messages,
-                        tool_schemas,
-                        tool_choice=tool_choice,
-                    ):
-                        self._check_cancel(run)
-                        if chunk.text:
-                            if first_token_ms is None:
-                                first_token_ms = round((time.perf_counter() - started) * 1000, 3)
-                            assistant_text.append(chunk.text)
-                            if not force_summary:
-                                await self._emit(run, "message.delta", {"delta": chunk.text})
-                        if chunk.tool_calls:
-                            pending_calls.extend(chunk.tool_calls)
-                        if chunk.finish_reason:
-                            finish_reason = chunk.finish_reason
-                        usage_keys.update(chunk.usage)
-                        for key, value in chunk.usage.items():
-                            usage[key] = max(usage.get(key, 0), int(value or 0))
-
-                if model_span is not None:
-                    async with model_span as span:
-                        try:
-                            await consume_model()
-                        except Exception as exc:
-                            await record_model_failure(
-                                span, exc, component=f"model.{self.provider.provider_name}",
-                                provider=self.provider.provider_name,
-                                model=self.provider.model_name or "unknown",
-                                operation="stream",
-                                latency_ms=round((time.perf_counter() - started) * 1000, 3),
-                                time_to_first_token_ms=first_token_ms,
-                                finish_reason=finish_reason,
-                                input_summary=model_input,
-                                output_summary={"content": "".join(assistant_text)},
-                            )
-                            raise
-                        await span.model_call(
-                            provider=self.provider.provider_name,
-                            model=self.provider.model_name or "unknown",
-                            operation="stream",
-                            **model_usage_fields({key: usage[key] for key in usage_keys}),
-                            latency_ms=round((time.perf_counter() - started) * 1000, 3),
-                            time_to_first_token_ms=first_token_ms,
-                            finish_reason=finish_reason,
-                            input_summary=model_input,
-                            output_summary={
-                                "content": "".join(assistant_text),
-                                "tool_calls": [
-                                    {
-                                        "id": call.id,
-                                        "name": call.name,
-                                        "arguments": call.arguments,
-                                    }
-                                    for call in pending_calls
-                                ],
-                                "text_length": sum(len(part) for part in assistant_text),
-                                "tool_call_count": len(pending_calls),
-                                "iteration": iteration + 1,
-                                "tool_choice": tool_choice,
-                                "selected_tools": [
-                                    call.name if call.name in self.tools.names() else "unknown_tool"
-                                    for call in pending_calls
-                                ],
-                                "decision": (
-                                    "forced_summary" if force_summary else
-                                    "call_tools" if pending_calls else "final_answer"
-                                ),
-                                "decision_reason": completion_mode if force_summary else None,
-                            },
-                        )
-                else:
-                    await consume_model()
-
-                for key, value in usage.items():
-                    run.token_usage[key] = run.token_usage.get(key, 0) + int(value or 0)
-
-                if pending_calls and not force_summary:
-                    assistant_message: dict[str, Any] = {
-                        "role": "assistant",
-                        "content": "".join(assistant_text) or None,
-                        "tool_calls": [
-                            {
-                                "id": call.id,
-                                "type": "function",
-                                "function": {
-                                    "name": call.name,
-                                    "arguments": json.dumps(call.arguments, ensure_ascii=False),
-                                },
-                            }
-                            for call in pending_calls
-                        ],
-                    }
-                    messages.append(assistant_message)
-                    run.pending_tool_calls = [_serialize_tool_call(call) for call in pending_calls]
-                    await self._save_checkpoint(
-                        run,
-                        messages,
-                        iteration=iteration,
-                        tool_count=tool_count,
-                        stage="tools_pending",
-                    )
-                    iteration, tool_count = await self._execute_pending_tools(
-                        run,
-                        messages,
-                        iteration=iteration,
-                        tool_count=tool_count,
-                    )
-                    if await self._wait_for_input(run, messages):
-                        return
-                    continue
-
-                raw_final_text = "".join(assistant_text).strip()
-                sanitized = sanitize_assistant_content(
-                    raw_final_text,
-                    fallback=_budget_fallback(run) if force_summary else None,
-                    discard_body_on_control_markup=force_summary,
-                )
-                final_text = sanitized.content
-                if force_summary:
-                    final_text = _budget_completion_text(
-                        final_text,
-                        run,
-                        completion_mode=completion_mode,
-                    )
-                    run.partial = True
-                    run.completion_mode = completion_mode
-                elif not final_text:
-                    final_text = "模型未生成可展示的文本，请查看已经获取的数据证据。"
-                messages.append({"role": "assistant", "content": final_text})
-                run.messages = [dict(message) for message in messages]
-                await self._emit(run, "message.completed", {"content": final_text})
-                run.status = RunStatus.COMPLETED
-                run.finished_at = datetime.now(UTC)
-                await self._save_checkpoint(
-                    run,
-                    messages,
-                    iteration=iteration + 1,
-                    tool_count=tool_count,
-                    stage="completed",
-                )
-                if self.persistence is not None:
-                    await self.persistence.finalize(run)
-                await self._emit(
-                    run,
-                    "run.completed",
-                    {
-                        "status": run.status.value,
-                        "partial": run.partial,
-                        "completion_mode": run.completion_mode or "normal",
-                    },
-                )
-                return
-            raise RuntimeError("模型循环未能收敛")
+            await (workflow or self.run_turns)(run)
         except asyncio.CancelledError:
             if run.pause_requested:
                 if run.status != RunStatus.WAITING_FOR_INPUT:
                     run.status = RunStatus.RECOVERING
-                await self._save_checkpoint(
-                    run,
-                    messages,
-                    iteration=iteration,
-                    tool_count=tool_count,
-                    stage=("waiting_for_input"
-                           if run.status == RunStatus.WAITING_FOR_INPUT else "paused"),
+                stage = (
+                    "waiting_for_input" if run.status == RunStatus.WAITING_FOR_INPUT else "paused"
                 )
+                await self.checkpoint(run, stage=stage)
             elif not run.terminal:
                 run.status = RunStatus.CANCELLED
                 run.finished_at = datetime.now(UTC)
-                await self._save_checkpoint(
-                    run,
-                    messages,
-                    iteration=iteration,
-                    tool_count=tool_count,
-                    stage="cancelled",
-                )
+                await self.checkpoint(run, stage="cancelled")
                 if self.persistence is not None:
                     await self.persistence.finalize(run)
-                await self._emit(run, "run.cancelled", {"status": run.status.value})
+                await self.emit(run, "run.cancelled", {"status": run.status.value})
             raise
         except _RunCancelledError:
             run.status = RunStatus.CANCELLED
             run.finished_at = datetime.now(UTC)
-            await self._save_checkpoint(
-                run,
-                messages,
-                iteration=iteration,
-                tool_count=tool_count,
-                stage="cancelled",
-            )
+            await self.checkpoint(run, stage="cancelled")
             if self.persistence is not None:
                 await self.persistence.finalize(run)
-            await self._emit(run, "run.cancelled", {"status": run.status.value})
+            await self.emit(run, "run.cancelled", {"status": run.status.value})
         except Exception as exc:
             run.status = RunStatus.FAILED
             run.error = str(exc)
             run.finished_at = datetime.now(UTC)
             try:
-                await self._save_checkpoint(
-                    run, messages, iteration=iteration, tool_count=tool_count, stage="failed"
-                )
+                await self.checkpoint(run, stage="failed")
                 if self.persistence is not None:
                     await self.persistence.finalize(run)
             except Exception as checkpoint_exc:
                 logger.warning("Failed to persist failed run: %s", type(checkpoint_exc).__name__)
             try:
-                await self._emit(
+                await self.emit(
                     run,
                     "run.failed",
                     {"status": run.status.value, "message": str(exc)},
@@ -415,7 +130,7 @@ class AgentLoop:
                 logger.warning("Failed to persist failure event: %s", type(event_exc).__name__)
         finally:
             try:
-                if self.persistence is not None:
+                if self.persistence is not None and run.status != RunStatus.WAITING_FOR_INPUT:
                     await self.persistence.finalize(run)
                 if self.observer is not None:
                     try:
@@ -427,6 +142,303 @@ class AgentLoop:
             finally:
                 if context_token is not None:
                     reset_current_context(context_token)
+
+    async def checkpoint(self, run: AgentRun, *, stage: str) -> None:
+        await self._save_checkpoint(
+            run, run.messages, iteration=run.iteration, tool_count=run.tool_count, stage=stage,
+        )
+
+    async def required_tool(self, run: AgentRun, call: ToolCall) -> ToolResult:
+        """执行工作流指定的取证步骤，恢复时沿用同一调用的成功回执。"""
+        for event in reversed(run.events):
+            if event.type == "tool.completed" and event.payload.get("tool_call_id") == call.id:
+                return ToolResult.model_validate(event.payload["result"])
+        self._check_cancel(run)
+        if run.tool_count >= self.max_tool_calls:
+            raise RuntimeError("超过最大工具调用次数")
+        run.tool_count += 1
+        replies: list[dict[str, Any]] = []
+        await self._execute_tool(run, call, replies)
+        return ToolResult.model_validate_json(replies[-1]["content"])
+
+    async def run_turns(
+        self, run: AgentRun, *,
+        evidence_answer: Callable[[AgentRun], str | None] | None = None,
+    ) -> None:
+        messages = [dict(message) for message in run.messages]
+        iteration = int(run.iteration)
+        tool_count = int(run.tool_count)
+        if run.human_input and run.human_input.answer is not None:
+            await self.emit(run, "input.accepted", {
+                "request_id": run.human_input.request_id,
+                "answer": run.human_input.answer,
+                "action": run.human_input.action,
+            })
+            async with observed_operation(
+                self.observer.client if self.observer else None,
+                "human_input_received", kind=SpanKind.INTERNAL,
+                input_data={
+                    "request_id": run.human_input.request_id, "answer": run.human_input.answer,
+                },
+            ) as span:
+                if span:
+                    span.output_data = {"application_run_id": run.id, "status": "resuming"}
+            if not run.pending_tool_calls:
+                call = ToolCall(
+                    id=f"resume_{uuid.uuid4().hex}", name=run.human_input.tool_name,
+                    arguments=run.human_input.tool_arguments,
+                )
+                messages.append({"role": "assistant", "content": None, "tool_calls": [{
+                    "id": call.id, "type": "function", "function": {
+                        "name": call.name,
+                        "arguments": json.dumps(call.arguments, ensure_ascii=False),
+                    },
+                }]})
+                run.pending_tool_calls = [_serialize_tool_call(call)]
+                await self._save_checkpoint(
+                    run, messages, iteration=iteration, tool_count=tool_count,
+                    stage="input_resume_pending",
+                )
+        if run.pending_tool_calls:
+            iteration, tool_count = await self._execute_pending_tools(
+                run,
+                messages,
+                iteration=iteration,
+                tool_count=tool_count,
+            )
+        if await self._wait_for_input(run, messages):
+            return
+
+        if iteration >= self.max_iterations:
+            iteration = self.max_iterations - 1
+
+        while iteration < self.max_iterations:
+            self._check_cancel(run)
+            if evidence_answer and (answer := evidence_answer(run)) is not None:
+                await self._complete(run, messages, answer, iteration, tool_count)
+                return
+            repeated_tool_guard = _has_reused_tool_result(run)
+            budget_exhausted = iteration >= self.max_iterations - 1
+            force_summary = budget_exhausted or repeated_tool_guard
+            completion_mode = "duplicate_tool_guard" if repeated_tool_guard else "budget_limit"
+            stage = "summarizing_budget" if force_summary else "calling_model"
+            run.iteration = iteration
+            run.tool_count = tool_count
+            await self.emit(
+                run,
+                "stage.changed",
+                {
+                    "stage": stage,
+                    "iteration": iteration + 1,
+                    "remaining_iterations": max(0, self.max_iterations - iteration - 1),
+                },
+                stage=stage,
+            )
+            await self._save_checkpoint(
+                run,
+                messages,
+                iteration=iteration,
+                tool_count=tool_count,
+                stage=stage,
+            )
+            assistant_text: list[str] = []
+            pending_calls: list[ToolCall] = []
+            usage = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_tokens": 0,
+                "cached_tokens": 0,
+                "total_tokens": 0,
+            }
+            finish_reason: str | None = None
+            first_token_ms: float | None = None
+            usage_keys: set[str] = set()
+            started = time.perf_counter()
+            model_messages = compact_model_context(
+                messages,
+                run.survival_summary,
+                message_limit=self.context_message_limit,
+                character_limit=self.context_character_limit,
+            )
+            if force_summary:
+                model_messages = _inject_budget_summary_prompt(model_messages)
+            tool_choice = "none" if force_summary else "required" if evidence_answer else "auto"
+            tool_schemas = self.tools.schemas()
+            model_input = {
+                "messages": model_messages, "tools": tool_schemas, "tool_choice": tool_choice
+            }
+            model_span = (
+                self.observer.span(
+                    f"model.iteration.{iteration + 1}",
+                    kind=SpanKind.MODEL,
+                    component_name=self.provider.provider_name,
+                    input_data={
+                        "message_count": len(model_messages),
+                        "full_message_count": len(messages),
+                        "tool_schema_count": len(tool_schemas),
+                        "tool_choice": tool_choice,
+                    },
+                )
+                if self.observer
+                else None
+            )
+
+            async def consume_model() -> None:
+                nonlocal finish_reason, first_token_ms
+                async for chunk in self.provider.stream(
+                    model_messages,
+                    tool_schemas,
+                    tool_choice=tool_choice,
+                ):
+                    self._check_cancel(run)
+                    if chunk.text:
+                        if first_token_ms is None:
+                            first_token_ms = round((time.perf_counter() - started) * 1000, 3)
+                        assistant_text.append(chunk.text)
+                        if not force_summary and evidence_answer is None:
+                            await self.emit(run, "message.delta", {"delta": chunk.text})
+                    if chunk.tool_calls:
+                        pending_calls.extend(chunk.tool_calls)
+                    if chunk.finish_reason:
+                        finish_reason = chunk.finish_reason
+                    usage_keys.update(chunk.usage)
+                    for key, value in chunk.usage.items():
+                        usage[key] = max(usage.get(key, 0), int(value or 0))
+
+            if model_span is not None:
+                async with model_span as span:
+                    try:
+                        await consume_model()
+                    except Exception as exc:
+                        await record_model_failure(
+                            span, exc, component=f"model.{self.provider.provider_name}",
+                            provider=self.provider.provider_name,
+                            model=self.provider.model_name or "unknown",
+                            operation="stream",
+                            latency_ms=round((time.perf_counter() - started) * 1000, 3),
+                            time_to_first_token_ms=first_token_ms,
+                            finish_reason=finish_reason,
+                            input_summary=model_input,
+                            output_summary={"content": "".join(assistant_text)},
+                        )
+                        raise
+                    await span.model_call(
+                        provider=self.provider.provider_name,
+                        model=self.provider.model_name or "unknown",
+                        operation="stream",
+                        **model_usage_fields({key: usage[key] for key in usage_keys}),
+                        latency_ms=round((time.perf_counter() - started) * 1000, 3),
+                        time_to_first_token_ms=first_token_ms,
+                        finish_reason=finish_reason,
+                        input_summary=model_input,
+                        output_summary={
+                            "content": "".join(assistant_text),
+                            "tool_calls": [
+                                {
+                                    "id": call.id,
+                                    "name": call.name,
+                                    "arguments": call.arguments,
+                                }
+                                for call in pending_calls
+                            ],
+                            "text_length": sum(len(part) for part in assistant_text),
+                            "tool_call_count": len(pending_calls),
+                            "iteration": iteration + 1,
+                            "tool_choice": tool_choice,
+                            "selected_tools": [
+                                call.name if call.name in self.tools.names() else "unknown_tool"
+                                for call in pending_calls
+                            ],
+                            "decision": (
+                                "forced_summary" if force_summary else
+                                "call_tools" if pending_calls else "final_answer"
+                            ),
+                            "decision_reason": completion_mode if force_summary else None,
+                        },
+                    )
+            else:
+                await consume_model()
+
+            for key, value in usage.items():
+                run.token_usage[key] = run.token_usage.get(key, 0) + int(value or 0)
+
+            if pending_calls and not force_summary:
+                assistant_message: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": "".join(assistant_text) or None,
+                    "tool_calls": [
+                        {
+                            "id": call.id,
+                            "type": "function",
+                            "function": {
+                                "name": call.name,
+                                "arguments": json.dumps(call.arguments, ensure_ascii=False),
+                            },
+                        }
+                        for call in pending_calls
+                    ],
+                }
+                messages.append(assistant_message)
+                run.pending_tool_calls = [_serialize_tool_call(call) for call in pending_calls]
+                await self._save_checkpoint(
+                    run,
+                    messages,
+                    iteration=iteration,
+                    tool_count=tool_count,
+                    stage="tools_pending",
+                )
+                iteration, tool_count = await self._execute_pending_tools(
+                    run,
+                    messages,
+                    iteration=iteration,
+                    tool_count=tool_count,
+                )
+                if await self._wait_for_input(run, messages):
+                    return
+                continue
+
+            raw_final_text = "".join(assistant_text).strip()
+            sanitized = sanitize_assistant_content(
+                raw_final_text,
+                fallback=_budget_fallback(run) if force_summary else None,
+                discard_body_on_control_markup=force_summary,
+            )
+            final_text = sanitized.content
+            if evidence_answer:
+                final_text = "本轮没有取得可复核的数据回执。请核对问题条件，或稍后重新查询。"
+            elif force_summary:
+                final_text = _budget_completion_text(
+                    final_text,
+                    run,
+                    completion_mode=completion_mode,
+                )
+                run.partial = True
+                run.completion_mode = completion_mode
+            elif not final_text:
+                final_text = "模型未生成可展示的文本，请查看已经获取的数据证据。"
+            await self._complete(run, messages, final_text, iteration + 1, tool_count)
+            return
+        raise RuntimeError("模型循环未能收敛")
+
+    async def _complete(
+        self, run: AgentRun, messages: list[dict[str, Any]], text: str,
+        iteration: int, tool_count: int,
+    ) -> None:
+        messages.append({"role": "assistant", "content": text})
+        run.messages = [dict(message) for message in messages]
+        await self.emit(run, "message.completed", {"content": text})
+        run.status = RunStatus.COMPLETED
+        run.finished_at = datetime.now(UTC)
+        await self._save_checkpoint(
+            run, messages, iteration=iteration, tool_count=tool_count, stage="completed",
+        )
+        if self.persistence is not None:
+            await self.persistence.finalize(run)
+        await self.emit(run, "run.completed", {
+            "status": run.status.value,
+            "partial": run.partial,
+            "completion_mode": run.completion_mode or "normal",
+        })
 
     async def _execute_pending_tools(
         self,
@@ -456,14 +468,18 @@ class AgentLoop:
                 await self._execute_tool(run, call, messages)
             payload = json.loads(messages[-1]["content"])
             request = (payload.get("metadata") or {}).get("human_input")
-            if request is not None:
+            waiting = run.human_input
+            if request is not None and (waiting is None or waiting.answer is not None):
                 validated = HumanInputRequest.model_validate(request)
                 run.human_input = HumanInputState(
                     **validated.model_dump(), request_id=f"input_{uuid.uuid4().hex}",
                     tool_name=call.name,
                     tool_arguments=call.arguments, tool_result=payload,
                 )
-            elif run.human_input and run.human_input.tool_name == call.name:
+            elif (
+                waiting and waiting.answer is not None and waiting.tool_name == call.name
+                and waiting.tool_arguments == call.arguments
+            ):
                 run.human_input = None
             run.pending_tool_calls = run.pending_tool_calls[1:]
             run.tool_count = tool_count
@@ -489,23 +505,36 @@ class AgentLoop:
         )
         if not messages or messages[-1].get("content") != text:
             messages.append({"role": "assistant", "content": text})
-        run.status = RunStatus.WAITING_FOR_INPUT
+        waiting = {
+            "request_id": pending.request_id, "questions": pending.questions,
+            "allow_use_available": pending.allow_use_available,
+        }
+        events = (
+            AgentEvent(run_id=run.id, sequence=run.sequence + 1, type="message.completed",
+                       payload={"content": text}),
+            AgentEvent(run_id=run.id, sequence=run.sequence + 2, type="run.waiting_for_input",
+                       payload=waiting),
+        )
         async with observed_operation(
             self.observer.client if self.observer else None,
             "wait_for_user_input", kind=SpanKind.INTERNAL,
             input_data={"request_id": pending.request_id, "questions": pending.questions},
         ) as span:
+            if self.persistence is not None:
+                run.survival_summary = await self.persistence.save_waiting(
+                    run, messages=messages, events=events,
+                )
             if span:
-                span.output_data = {"application_run_id": run.id, "status": run.status.value}
-        await self._emit(run, "message.completed", {"content": text})
-        await self._emit(run, "run.waiting_for_input", {
-            "request_id": pending.request_id, "questions": pending.questions,
-            "allow_use_available": pending.allow_use_available,
-        }, stage="waiting_for_input")
-        await self._save_checkpoint(
-            run, messages, iteration=run.iteration, tool_count=run.tool_count,
-            stage="waiting_for_input",
-        )
+                span.output_data = {
+                    "application_run_id": run.id, "status": RunStatus.WAITING_FOR_INPUT.value,
+                }
+        run.messages = messages
+        run.status = RunStatus.WAITING_FOR_INPUT
+        for event in events:
+            run.publish_event(event)
+        if self.observer:
+            await self.observer.event("message.completed", {"content": text})
+            await self.observer.event("run.waiting_for_input", waiting, stage="waiting_for_input")
         return True
 
     async def _reuse_tool_result(
@@ -521,7 +550,7 @@ class AgentLoop:
             tool = self.tools.get(call.name)
         except KeyError:
             tool = None
-        await self._emit(
+        await self.emit(
             run,
             "tool.started",
             {
@@ -544,7 +573,7 @@ class AgentLoop:
             render_hint = resolve_render_hint(tool, result_payload)
             if render_hint is not None:
                 event_payload["render_hint"] = render_hint
-        await self._emit(run, "tool.completed", event_payload)
+        await self.emit(run, "tool.completed", event_payload)
         if self.observer is not None:
             await self.observer.reused_tool(
                 call.name if tool is not None else "unknown_tool", call.arguments, result_payload
@@ -592,7 +621,7 @@ class AgentLoop:
             tool = self.tools.get(call.name)
         except KeyError:
             tool = None
-        await self._emit(
+        await self.emit(
             run,
             "tool.started",
             {"tool_call_id": call.id, "name": call.name, "arguments": call.arguments},
@@ -620,6 +649,15 @@ class AgentLoop:
                     f"未知工具: {call.name}",
                 )
             try:
+                metadata = {}
+                if intent := run.dispatch_state.get("intent"):
+                    metadata["user_intent"] = intent
+                pending = run.human_input
+                if (
+                    pending and pending.answer is not None and pending.tool_name == call.name
+                    and pending.tool_arguments == call.arguments
+                ):
+                    metadata["human_input_resume"] = pending.model_dump(mode="json")
                 result = await asyncio.wait_for(
                     tool.execute(
                         call.arguments,
@@ -629,9 +667,7 @@ class AgentLoop:
                             thread_id=run.thread_id,
                             site_id=run.site_id,
                             conversation_id=run.conversation_id,
-                            metadata={"human_input_resume": run.human_input.model_dump(mode="json")}
-                            if run.human_input and run.human_input.answer is not None
-                            and run.human_input.tool_name == call.name else {},
+                            metadata=metadata,
                         ),
                     ),
                     timeout=timeout,
@@ -694,7 +730,7 @@ class AgentLoop:
             render_hint = resolve_render_hint(tool, result_payload)
             if render_hint is not None:
                 event_payload["render_hint"] = render_hint
-        await self._emit(
+        await self.emit(
             run,
             event_type,
             event_payload,
@@ -709,7 +745,7 @@ class AgentLoop:
             }
         )
 
-    async def _emit(
+    async def emit(
         self,
         run: AgentRun,
         event_type: str,

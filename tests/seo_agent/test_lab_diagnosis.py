@@ -9,12 +9,12 @@ from xml.sax.saxutils import escape
 import pytest
 import pytest_asyncio
 
-from src.agent.loop import AgentLoop
 from src.agent.models import RunStatus
 from src.agent.observability import AgentRunObserver
 from src.agent.providers.base import ModelChunk, ToolCall
 from src.agent.providers.fake import FakeModelProvider
 from src.agent.run_manager import RunManager
+from src.agent.runtime.executor import AgentExecutor
 from src.core.cache import CacheManager
 from src.facade.data_facade import DataFacade
 from src.models.common import Capability
@@ -64,14 +64,14 @@ class LabSession:
 
 
 @pytest_asyncio.fixture
-async def lab(tmp_path, monkeypatch):
+async def lab(pg_url, monkeypatch):
     session = LabSession()
     client = PageMetadataClient()
     client._session = session
     provider = PageMetadataProvider(client=client, analyzer=SimpleNamespace(enabled=False))
     facade = DataFacade()
     facade._capability_map = {capability: [provider] for capability in provider.capabilities}
-    snapshots = CacheManager(tmp_path / "lab-evidence.db")
+    snapshots = CacheManager(pg_url)
     await snapshots.startup()
     module = importlib.import_module("src.facade.data_facade")
     monkeypatch.setattr(module, "cache_manager", snapshots)
@@ -192,10 +192,10 @@ async def test_lab_sitemap_index_reports_children_without_fetching_them(lab):
 
 
 @pytest.mark.asyncio
-async def test_lab_missing_title_diagnostic_baseline_and_recheck(lab, tmp_path):
+async def test_lab_missing_title_diagnostic_baseline_and_recheck(lab, pg_url):
     facade, session, snapshots = lab
     url = ORIGIN + CASES["missing-title"]
-    database = ObservabilityDatabase(tmp_path / "lab-observations.db")
+    database = ObservabilityDatabase(pg_url)
     observer = ObservabilityClient(database, project_key="seo-lab")
     registry = build_seo_agent_registry(facade, SITE, snapshots=snapshots, observability=observer)
 
@@ -206,7 +206,7 @@ async def test_lab_missing_title_diagnostic_baseline_and_recheck(lab, tmp_path):
             {"role": "system", "content": build_seo_system_prompt(SITE, registry.schemas())},
             {"role": "user", "content": question},
         ])
-        await AgentLoop(
+        await AgentExecutor(
             FakeModelProvider(chunks), registry,
             observer=AgentRunObserver(observer, operation_name="seo_agent.chat"),
         ).run(run)
@@ -249,7 +249,10 @@ async def test_lab_missing_title_diagnostic_baseline_and_recheck(lab, tmp_path):
         }
         assert (await snapshots.get_snapshot(baseline_id))["data"]["title"] is None
         assert all(requested == url for requested in session.urls)
-        spans = await database.fetch_all("SELECT operation_name FROM obs_spans")
+        spans = []
+        for trace in await observer.list_traces():
+            detail = await observer.get_trace(trace["id"])
+            spans.extend(span for run in detail["runs"] for span in run["spans"])
         assert {"seo_site_audit", "freeze_page_review_evidence", "compare_page_acceptance"} <= {
             row["operation_name"] for row in spans
         }

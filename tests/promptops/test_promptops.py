@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pathlib import Path
+import asyncio
 from typing import Any
 
 import pytest
@@ -40,8 +40,57 @@ class FakeCandidateGenerator:
 
 
 @pytest.mark.asyncio
-async def test_prompt_versions_evaluation_promotion_and_rollback(tmp_path: Path) -> None:
-    database = ObservabilityDatabase(tmp_path / "promptops.db")
+async def test_concurrent_seed_and_version_edits_preserve_rollout(pg_url: str) -> None:
+    database = ObservabilityDatabase(pg_url)
+    registry = PromptRegistry(database)
+    await registry.startup()
+    try:
+        prompts = await asyncio.gather(
+            *[
+                registry.create_prompt(
+                    prompt_key="workspace.route", name="分工", purpose="派发任务"
+                )
+                for _ in range(4)
+            ]
+        )
+        prompt_id = prompts[0]["id"]
+        assert {p["id"] for p in prompts} == {prompt_id}
+
+        async def version(template: str) -> dict:
+            return await registry.create_version(
+                prompt_id=prompt_id,
+                system_template=template,
+                user_template="{{input}}",
+                output_schema={"type": "object"},
+            )
+
+        first, duplicate, second = await asyncio.gather(
+            version("one"), version("one"), version("two")
+        )
+        assert first["id"] == duplicate["id"]
+        assert {first["version_no"], second["version_no"]} == {1, 2}
+        await asyncio.gather(
+            *[
+                registry.deploy_if_missing(
+                    prompt_id, first["id"], environment="production", reason="bootstrap"
+                )
+                for _ in range(3)
+            ]
+        )
+        await registry.promote(prompt_id, second["id"], environment="production")
+        await registry.start_canary(prompt_id, first["id"], environment="production", percentage=10)
+        await registry.deploy_if_missing(
+            prompt_id, first["id"], environment="production", reason="restart"
+        )
+        assert (await registry.resolve_version("workspace.route"))["id"] == second["id"]
+        assert (await registry.resolve_version("workspace.route", bucket=5))["id"] == first["id"]
+    finally:
+        await database.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_prompt_versions_evaluation_promotion_and_rollback(pg_url: str) -> None:
+    database = ObservabilityDatabase(pg_url)
     await database.startup()
     registry = PromptRegistry(database)
     await registry.startup()
@@ -131,8 +180,8 @@ async def test_prompt_versions_evaluation_promotion_and_rollback(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_optimization_loop_creates_challenger_and_never_auto_promotes(tmp_path: Path) -> None:
-    database = ObservabilityDatabase(tmp_path / "promptops.db")
+async def test_optimization_loop_creates_challenger_and_never_auto_promotes(pg_url: str) -> None:
+    database = ObservabilityDatabase(pg_url)
     await database.startup()
     registry = PromptRegistry(database)
     await registry.startup()
@@ -182,8 +231,8 @@ async def test_optimization_loop_creates_challenger_and_never_auto_promotes(tmp_
 
 
 @pytest.mark.asyncio
-async def test_model_call_can_link_exact_prompt_version(tmp_path: Path) -> None:
-    database = ObservabilityDatabase(tmp_path / "promptops.db")
+async def test_model_call_can_link_exact_prompt_version(pg_url: str) -> None:
+    database = ObservabilityDatabase(pg_url)
     await database.startup()
     registry = PromptRegistry(database)
     await registry.startup()

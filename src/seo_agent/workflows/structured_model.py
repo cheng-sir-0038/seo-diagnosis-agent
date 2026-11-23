@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -30,6 +30,7 @@ class StructuredBusinessResult:
     prompt_key: str
     prompt_version_id: str | None
     trace_id: str | None
+    usage: dict[str, int] = field(default_factory=dict)
 
 
 class StructuredModelRunner:
@@ -143,4 +144,5 @@ class StructuredModelRunner:
                 prompt_key=prompt_key,
                 prompt_version_id=prompt.get("id"),
                 trace_id=span.trace_id if span else None,
+                usage=invocation.usage,
             )

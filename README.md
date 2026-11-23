@@ -1,6 +1,29 @@
 # SEO Diagnosis Agent
 
-选一个网站，直接说你想查什么。DeepSeek 根据问题和取回的证据选择下一步工具，能查页面问题、研究关键词和排名页、拟定 SEO 建议。配置 Cloudflare Workers AI 后，也能在对话里生成页面分享图。
+在工作台提问后，LangGraph 主 Agent 用 DeepSeek 判断本轮业务，再分派给 SEO/GEO 或医药专员。医药专员按任务加载 Skill 和对应工具，按数据回执给出答案。对话会显示谁接手、加载了什么 Skill，以及证据从哪里来。
+
+![多 Agent 工作台首页，含考研、医药和网站业务入口](docs/screenshots/01-chat-overview.png)
+
+## 双专员实跑
+
+用户请 Agent 用医学人文修订通知核对湖北考区的医师资格考试公告。医药专员加载「医考考纲核对」Skill，取出适用范围与公告原文。SEO/GEO 专员接手读取用户指定的网页，对照两份材料后给出结论。截图保留了原始提问、交接顺序和两份依据。[工作流代码](src/agent/workspace/supervisor.py) · [公开报名页](https://www.hbwsrc.cn/news/show-1830.html)
+
+![完整提问、医药与 SEO 专员的交接顺序、核对结论和来源](docs/screenshots/24-healthcare-seo-handoff.png)
+
+## 可以直接试的业务
+
+| 可以这样问 | 会看到什么 |
+| --- | --- |
+| “帮我看看 https://breadtopia.com/how-to-make-a-sourdough-starter/ 的标题和正文是否匹配。” | SEO 专员读取指定页面，追问分享文案时沿用同一地址。 |
+| “二甲双胍在当前国家医保药品目录里是甲类还是乙类？” | 读取国家医保局发布的目录 PDF，按通用名核对西药条目，逐剂型展示分类和页码。 |
+| “找 2024 至 2025 年关于青少年睡眠时长的 3 篇 PubMed 文献。” | 调用 NCBI E-utilities，返回实际匹配的题录、期刊、日期和 PMID。 |
+| “按 2026 年湖北医师资格公告，我 2025 年技能通过、综合没过，还要重考技能吗？” | 医药专员核对考区、年份和考点条件，缺少条件会暂停，等用户补充后继续。 |
+| “对比 2026 年武汉科技大学 105101 和湖北民族大学 105100 的初试科目。” | 医药专员按各校专业代码做 PostgreSQL 全文检索，用命中段落和官方出处生成可核对的回答。 |
+| “用医学人文修订通知核对湖北医师资格考试报名页的适用类别。” | 医药专员查公告，SEO 专员读取用户给出的网页，核对两份原文。[湖北考区报名页](https://www.hbwsrc.cn/news/show-1830.html) |
+
+医考工具使用带年份和出处的官方公告摘录，网页核对直接读取指定的公开页面。[专员编排](src/agent/workspace/supervisor.py) · [医药 Skill](src/healthcare_agent/skills.py)
+
+考研检索目前收录上述两校 2025、2026 年目录中的部分临床医学专硕条目。回执记录本轮 Run、问题、筛选条件、返回上限及实际段落。资料缺失时说明缺口，缺少院校、年份或专业时会追问。固定用例的验收通过率按全部用例计算，Hit@K 按有标注证据的可回答题计算。[收录的资料与来源](src/healthcare_agent/postgraduate_sources.py) · [检索与引用校验](src/healthcare_agent/postgraduate.py) · [评测口径](src/healthcare_agent/postgraduate_eval.py)
 
 **Breadtopia GEO 实跑**　Agent 从 Google 搜索样本中选出一题，核验 DeepSeek 的 5 条外站引用，并找到 3 段适合前置的页面原文。 [完整对话](docs/screenshots/22-geo-breadtopia-conversation.png)
 
@@ -8,7 +31,7 @@
 - **改稿证据校验**　实跑时曾把原文已有的内容写成缺失。修复后，卡片和总结共用核对过的原文，把已有内容写成前置建议。 [修复提交](https://github.com/cheng-sir-0038/seo-diagnosis-agent/commit/832f772b638943bf0664965d592325ad88fa19a2) · [回归用例](tests/seo_agent/test_geo.py)
 - **人工补充与恢复**　页面信息不足时先保存取到的证据并暂停，用户补充或选择继续后接回同一个 Run。 [等待补充截图](docs/screenshots/08-human-input.png) · [恢复代码](src/agent/harness/)
 
-## 真实对话
+## 页面建议与人工确认
 
 用户准备更新首页在搜索结果和分享链接上的文案，希望先拿到一份可评审的草稿。DeepSeek 根据这句需求选择页面建议流程。读到页面后，Agent 发现站点主体和配图需要确认，于是保留证据，等待用户决定。用户选择「先用现有信息生成」，同一次运行继续，交付标题、摘要、分享信息和 JSON-LD 草稿，并标出待确认事项。[完整对话](docs/screenshots/07-page-suggestions.png) · [执行详情](docs/screenshots/11-execution-details.png)
 
@@ -26,25 +49,33 @@ flowchart TD
 
 ## Agent 如何运行
 
-- DeepSeek 根据问题和已有证据选择工具。代码限制模型轮次、工具调用总数和超时，复用本次运行中重复的成功查询。[对话入口](src/api/routes/seo_agent_chat.py) · [工具循环](src/agent/loop.py)
+- 主 Agent 用 LangGraph 决定交给谁处理。医药专员从 `SkillRegistry` 加载本轮业务指令，并只开放该 Skill 对应的工具。工具取得有效回执后，程序直接按证据给出答案。网页联查只传已核实的公开条款。恢复时读取已经选定的业务和目标页。[业务路由](src/agent/workspace/routing.py) · [工作流](src/agent/workspace/supervisor.py)
+- 通用对话使用 POST `/api/v1/chat/runs`，提交 `messages` 和可选的 `conversation_id`。主 Agent 先分派业务，专员再按已有证据选择工具。代码限制模型轮次、工具调用总数和超时，复用本次运行中重复的成功查询。[业务会话 API](src/api/routes/workspace/conversations.py) · [Agent 执行器](src/agent/runtime/executor.py)
 - 工作流安排取证步骤、校验实际来源和结构化产物。需要人工补充时，运行检查点保存已查到的证据。[工作流代码](src/seo_agent/workflows/) · [检查点与恢复](src/agent/harness/)
 - 查询结果和来源紧跟对话结论。「执行详情」默认折叠，展开可查看调用状态、耗时和已取得的参数。配置 Langfuse 后可查看模型和工作流的完整调用树。[观测代码](src/observability/)
 
 ```mermaid
 flowchart TB
-    UI["React 工作台"] --> API["FastAPI"]
-    API --> CHAT["SEO Chat：站点上下文、提示词、可用工具"]
-    CHAT --> LOOP["DeepSeek + 工具循环"]
-    LOOP --> WF["业务工作流：页面 / 搜索 / 关键词 / 草稿"]
-    LOOP --> TOOL["只读 SEO 工具"]
+    UI["React 对话"] --> API["FastAPI"]
+    API --> MAIN["LangGraph 主 Agent / DeepSeek"]
+    MAIN --> MED["医药专员 / 按任务加载 Skill"]
+    MAIN --> SEO["SEO/GEO 专员"]
+    MED -->|公开考纲依据| SEO
+    SEO --> EXEC["Agent 执行器"]
+    MED --> EXEC
+    EXEC --> HEALTH["医考公告 / 考研检索 / 医保目录 / PubMed"]
+    HEALTH --> RUNDB
+    EXEC --> WF["业务工作流：页面 / 搜索 / 关键词 / 草稿"]
+    EXEC --> TOOL["只读 SEO 工具"]
     WF --> TOOL
     WF --> CF["Cloudflare Workers AI（分享图）"]
     TOOL --> DATA["Data Facade + Provider Router"]
     DATA --> EXT["页面 HTML / Serper / DataForSEO / Semrush / PageSpeed"]
-    LOOP <--> HARNESS["Harness：事件、检查点、恢复"]
-    HARNESS --> RUNDB[("运行与业务 SQLite")]
-    LOOP --> OBS["Observability：模型、工具与子步骤"]
-    OBS --> OBSDB[("观测 SQLite")]
+    EXEC <--> HARNESS["Harness：事件、检查点、恢复"]
+    MED --> HARNESS
+    HARNESS --> RUNDB[("PostgreSQL")]
+    EXEC --> OBS["Observability：模型、工具与子步骤"]
+    OBS --> RUNDB
     OBS -.->|可选| LF["Langfuse Cloud"]
     API --> BIZ["机会 / 审批 / 任务 / 发布 / 监控接口"]
     BIZ --> RUNDB
@@ -77,7 +108,20 @@ flowchart TB
 
 ## 工具与业务工作流
 
-[`src/seo_agent/chat/tools.py`](src/seo_agent/chat/tools.py) 定义基础数据工具，并按依赖注册对话工作流。实际可用工具取决于当前数据源和配置。
+在工作台点「专员与工具」，可以查看这次会话里两位专员能调用的工具。对话回复按实际交接顺序展示专员和操作。展开「执行详情」可核对每次调用的状态与耗时。
+
+| 医药 Skill | 注册工具 | 免费公开资料 |
+| --- | --- | --- |
+| 医考报名核对、医考考纲核对 | `medical_exam_registration`、`medical_exam_syllabus` | [按考区和版次核对的公告摘录](src/healthcare_agent/exams.py) |
+| 考研招生核对 | `postgraduate_admissions_search` | [院校官网目录入库，返回分校筛选与命中回执](src/healthcare_agent/postgraduate.py) |
+| 医保药品目录 | `medicare_drug_catalogue` | [国家医保局 2025 年版 PDF](https://www.nhsa.gov.cn/art/2025/12/7/art_53_18971.html) · [2026 年版 PDF](https://www.nhsa.gov.cn/art/2026/11/14/art_104_23384.html) |
+| 医学文献检索 | `pubmed_literature_search` | [NCBI E-utilities API](https://www.ncbi.nlm.nih.gov/home/develop/api/) |
+
+医保工具覆盖两版常规西药目录，默认按公告生效日期选版。PubMed 可匿名查询公开题录，工具按 NCBI 公布的无 Key 速率限制发送请求。两项公开查询无需新增第三方 API Key。[NCBI 接口使用说明](https://www.ncbi.nlm.nih.gov/books/NBK25497/)
+
+「网页与考纲联查」会把医药专员查到的考纲交给 SEO 专员。后者读取用户指定网页，对照原句核对适用类别。[跨专员工作流](src/agent/workspace/supervisor.py)
+
+SEO / GEO 专员按当前数据源、已确认的网址和任务注册工具。[SEO 工具注册表](src/seo_agent/chat/tools.py)
 
 | 分组 | 工具 | 数据来源 |
 | --- | --- | --- |
@@ -143,7 +187,7 @@ seo_site_diagnosis
 
 流程读取当前页的标签、正文摘录和已有 JSON-LD，由模型理解页面实际用途并提出草稿。输入与输出由 [`PageSuggestionInput`、`PageSeoDraft`](src/models/page_suggestions.py) 的 JSON Schema 定义，JSON-LD 直接返回对象。模型使用 JSON Output，后端再校验字段格式、引用原文和 URL 来源，生成 TDK、OG、JSON-LD 与 HTML 片段。
 
-缺少必要信息时进入 Human-in-the-loop：每次询问最多三个具体问题，将页面证据和待答问题保存到检查点，运行变为 `waiting_for_input`，停止继续调用模型。用户在同一对话中回答后，前端通过 `POST /api/v1/seo-agent/chat/runs/{run_id}/input` 提交符合 [`HumanInputAnswer`](src/agent/models.py) Schema 的回答，恢复同一 Run、Task 和 Thread；相同页面复用已保存的证据，调用预算不重置。回答、事件和检查点原子保存，同一请求重复提交复用回执，冲突回答拒绝；服务重启不会自动跳过等待。这个补充步骤不代表机会审批。
+缺少必要信息时进入 Human-in-the-loop：每次询问最多三个具体问题，将页面证据和待答问题保存到检查点，运行变为 `waiting_for_input`，停止继续调用模型。用户在同一对话中回答后，前端通过 `POST /api/v1/chat/runs/{run_id}/input` 提交符合 [`HumanInputAnswer`](src/agent/models.py) Schema 的回答，恢复同一 Run、Task 和 Thread；相同页面复用已保存的证据，调用预算不重置。回答、事件和检查点原子保存，同一请求重复提交复用回执，冲突回答拒绝；服务重启不会自动跳过等待。这个补充步骤不代表机会审批。
 
 生成中刷新页面时，前端使用保存的 Run ID 和本轮起始事件编号，补回本轮进度并继续接收结果。同一个 Run 的各条事件连接独立读取事件。
 
@@ -157,7 +201,7 @@ seo_site_diagnosis
 
 在对话中说「按这页内容帮我生成一张分享图」即可，省略地址时取当前站点首页。工作流从页面的 `og:title`、Title、H1 中依次选取标题，描述取 `og:description` 或 Meta Description。标题都缺失时，同一次运行等待用户输入，恢复后复用页面证据。
 
-DeepSeek 根据页面内容和用户要求选取主体及构图。代码校验 JSON Schema 和引用原文，缺少主体依据时请用户补充。Cloudflare Workers AI 生成 1216 × 640 的图片，图片保存在 SEO 业务 SQLite 文件旁的 `*.share-images` 目录，并在对话中与页面文案一起展示。绘图提示词可在运行的模型调用记录中查看。上游失败时保留已取得的页面证据。[对话截图](docs/screenshots/18-share-image-brief.png) · [工作流](src/seo_agent/workflows/share_image.py) · [Cloudflare 接入](src/seo_agent/workflows/cloudflare_images.py) · [业务测试](tests/seo_agent/test_share_image.py)
+DeepSeek 根据页面内容和用户要求选取主体及构图。代码校验 JSON Schema 和引用原文，缺少主体依据时请用户补充。Cloudflare Workers AI 生成 1216 × 640 的图片，图片保存在 `SHARE_IMAGE_DIRECTORY` 指定的目录，并在对话中与页面文案一起展示。绘图提示词可在运行的模型调用记录中查看。上游失败时保留已取得的页面证据。[对话截图](docs/screenshots/18-share-image-brief.png) · [工作流](src/seo_agent/workflows/share_image.py) · [Cloudflare 接入](src/seo_agent/workflows/cloudflare_images.py) · [业务测试](tests/seo_agent/test_share_image.py)
 
 ### GEO 多 Agent
 
@@ -230,7 +274,7 @@ POST /api/v1/seo-agent/scan-runs/{run_id}/discover-opportunities
 }
 ```
 
-站点范围由扫描记录决定，不能在请求中替换 `site_id`。流程复用关键词研究，将结果冻结到现有 SQLite 证据快照库，再由 DeepSeek 生成结构化候选。代码校验市场、关键词、竞品 URL 和快照引用；搜索量、难度使用首个关键词的实际指标，缺失时保持未知。模型可以明确返回空候选列表。
+站点范围由扫描记录决定，不能在请求中替换 `site_id`。流程复用关键词研究，将结果冻结到PostgreSQL 证据快照库，再由 DeepSeek 生成结构化候选。代码校验市场、关键词、竞品 URL 和快照引用；搜索量、难度使用首个关键词的实际指标，缺失时保持未知。模型可以明确返回空候选列表。
 
 SERP 返回未解析的 Google 跳转地址时，原始快照照常保留，但跳转地址不作为竞品页面入库，竞品数量保持未知。
 
@@ -366,9 +410,12 @@ Agent 读取页面，DeepSeek 根据页面内容规划画面，Cloudflare Worker
 
 需要 Python 3.11+、Node.js 20.19+ 或 22.12+，以及 npm。自然语言诊断至少需要上表中的 DeepSeek 配置，其他数据源按需启用。
 
-macOS / Linux 在仓库根目录运行：
+对话、业务、证据快照、提示词和观测记录使用 PostgreSQL。填写本地 `.env.local` 的 `POSTGRES_PASSWORD` 和 `DATABASE_URL`，两处使用同一口令。项目自带的 Compose 默认只在本机 `55432` 端口开放数据库。若已有独立 PostgreSQL 实例，也可直接将 `DATABASE_URL` 指向它，数据库用户需要在目标 schema 中建表的权限。
+
+macOS / Linux 使用项目自带数据库时，在仓库根目录执行
 
 ```bash
+docker compose --env-file .env.local up -d --wait db
 sh start.sh
 ```
 
@@ -390,11 +437,10 @@ API 没有登录或鉴权，默认仅供本机使用，不要直接暴露到局�
 ### Docker 启动后端
 
 ```bash
-docker build -t seo-diagnosis-agent .
-docker run --rm -p 127.0.0.1:8000:8000 -v seo-agent-data:/app/data seo-diagnosis-agent
+docker compose --env-file .env.local --profile app up -d --build api
 ```
 
-镜像只包含后端，`seo-agent-data` 卷保存运行数据。容器不会自动读取宿主机的 `.env.local`：需要真实调用时，可创建不提交的 `.env.docker`，每行写 `KEY=value`（值不要加引号），并给 `docker run` 添加 `--env-file .env.docker`。
+容器内的 API 通过服务名 `db` 连接 PostgreSQL。`postgres-data` 卷保存数据库，`artifacts` 卷保存图片和交付文件。
 
 前端另开终端启动：
 
@@ -404,11 +450,11 @@ npm ci
 npm run dev
 ```
 
-已在本地验证镜像构建、容器启动、健康接口、工作流路由和隔离 HTML 分析器。未配置可选数据源或 Ahrefs 仍为 pseudo 模式时，`/health` 的总体状态可能为 `degraded`，可查看各数据源状态。
+未配置可选数据源或 Ahrefs 仍为 pseudo 模式时，`/health` 的总体状态可能为 `degraded`，可查看各数据源状态。
 
 ### 可选：Langfuse Cloud
 
-在 `.env.local` 中配置 `LANGFUSE_HOST`、`LANGFUSE_PUBLIC_KEY` 和 `LANGFUSE_SECRET_KEY` 并重启后端。Host 需对应项目所在区域；未配置时仍使用本地 SQLite 记录。
+在 `.env.local` 中配置 `LANGFUSE_HOST`、`LANGFUSE_PUBLIC_KEY` 和 `LANGFUSE_SECRET_KEY` 并重启后端。Host 需对应项目所在区域；本地观测保存在 PostgreSQL。
 
 云端记录每轮模型输入（包括用户问题和系统提示词）、可见回答、工具选择及输入输出、执行或复用、结束原因、状态、耗时和模型返回的 Token 用量。组合工作流还会展示实际执行的子流程与数据工具，PRD 和交付审核也保留模型调用记录。模型内部推理不在记录中。
 
@@ -417,9 +463,23 @@ npm run dev
 ## 目前的边界
 
 - 综合诊断覆盖代表单页、站点文件和有限搜索样本。Google 实际收录、完整搜索历史和整站抓取仍不在检查范围内。机会入池通过独立接口显式触发，完整“诊断 → 机会审批 → 执行 → 复检”仍需真实端到端验收。
-- 这是单机 MVP，SQLite 不适合多实例生产部署。当前尚未接入 GSC 或 GA4 数据源。
+- 当前部署按单个 API 进程运行，进程负责流式事件和本地调度。GSC 与 GA4 目前没有数据适配器。
 
 ## 测试
+
+数据库集成测试从 `TEST_DATABASE_URL` 连接专用 PostgreSQL 测试库，每个用例在独立 schema 中运行，完成后清理该 schema。使用项目自带容器时，首次创建一次测试库。随后导出指向该测试库的连接地址，并运行增量用例。
+
+```bash
+docker compose --env-file .env.local exec db createdb -U seo_agent seo_agent_test
+export TEST_DATABASE_URL='postgresql://seo_agent:your-local-password@127.0.0.1:55432/seo_agent_test'
+.venv/bin/python -m pytest -q tests/agent/test_workspace_chat.py tests/healthcare_agent tests/seo_agent/test_conversation_storage.py
+```
+
+运行考研检索评测并导出逐题回执：
+
+```bash
+.venv/bin/python -m src.healthcare_agent.postgraduate_eval --output /tmp/postgraduate-rag-report.json
+```
 
 页面诊断回归覆盖健康页、缺 Title、重复 Canonical 和 noindex，以及 robots.txt 和 sitemap 读取。复检用例先保存缺 Title 的页面基线，确认目标未达成，再模拟同一页面的标题修复并重新核对结果。以下测试可在本地复跑，无需第三方 API Key。
 
@@ -447,7 +507,7 @@ npm run dev
 
 [`tests/agent_evals/`](tests/agent_evals/)根据实际运行事件检查工具选择、失败和终态；自动化用例使用模拟模型，不代表 DeepSeek 的真实选工具准确率。新增诊断流程见[业务工作流用例](tests/seo_agent/test_business_workflows.py)，关键词接口字段见[DataForSEO 契约用例](tests/providers/test_dataforseo_keyword_overview.py)。其他业务用例可参阅[机会管理](tests/seo_agent/test_opportunities_workbench.py)、[任务与交付](tests/seo_agent/test_tasks_delivery.py)、[发布与监控](tests/seo_agent/test_publishing_monitoring.py)和[自动化集成](tests/seo_agent/test_automation_integration.py)。
 
-配置 DeepSeek 并启动本地后端后，可以用同一组业务问题评测真实运行。将 `<测试站点 ID>` 换成已初始化的测试站点 ID。
+站点专属 SEO 兼容 API 另有一组固定业务问题评测。配置 DeepSeek 并启动本地后端后，将 `<测试站点 ID>` 换成已初始化的测试站点 ID。
 
 ```bash
 .venv/bin/python -m src.agent.evals.seo_chat --site-id '<测试站点 ID>'

@@ -4,10 +4,13 @@ import json
 from collections.abc import Callable
 from typing import Any
 
+from sqlalchemy import select
+
 from src.observability.client import ObservabilityClient
 from src.promptops.registry import PromptRegistry
 from src.seo_agent.automation.models import DeliveryReviewOutput
 from src.seo_agent.db.database import SeoAgentDatabase
+from src.seo_agent.db.models import TABLES
 from src.seo_agent.services.system import SeoAgentSystemService
 from src.seo_agent.tasks.models import TaskPrdContent
 from src.seo_agent.tasks.service import TaskDeliveryService
@@ -110,9 +113,10 @@ class TaskDeliveryWorkflows:
         reviewer_actor_id: str,
         reviewed_by_run_id: str | None = None,
     ) -> dict[str, Any]:
-        delivery = await self.database.fetch_one(
-            "SELECT * FROM deliveries WHERE id = ?", (delivery_id,)
-        )
+        deliveries = TABLES["deliveries"]
+        delivery = await self.database.fetch_one(select(deliveries).where(
+            deliveries.c.id == delivery_id,
+        ))
         if delivery is None:
             raise KeyError(f"交付不存在: {delivery_id}")
         prd = await self.tasks.get_prd_version(delivery["prd_version_id"])

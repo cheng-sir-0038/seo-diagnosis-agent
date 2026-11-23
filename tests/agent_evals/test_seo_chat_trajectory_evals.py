@@ -7,10 +7,10 @@ import pytest
 
 from src.agent.evals.seo_chat import score_run
 from src.agent.evals.trajectory import TrajectoryCase, evaluate_agent_run, evaluate_trajectory
-from src.agent.loop import AgentLoop
 from src.agent.providers.base import ModelChunk, ToolCall
 from src.agent.providers.fake import FakeModelProvider
 from src.agent.run_manager import RunManager
+from src.agent.runtime.executor import AgentExecutor
 from src.agent.tools.base import AgentTool, ToolResult
 from src.agent.tools.registry import ToolRegistry
 
@@ -50,7 +50,7 @@ async def test_evaluates_tools_actually_called_by_agent(chosen_tool, expected_pa
         [ModelChunk(text="完成", finish_reason="stop")],
     ])
     run = RunManager().create_run([{"role": "user", "content": case.user_input}])
-    await AgentLoop(provider, registry).run(run)
+    await AgentExecutor(provider, registry).run(run)
 
     result = evaluate_agent_run(case, run, available_tools=set(registry.names()))
     assert result.tools == [chosen_tool]
@@ -74,7 +74,7 @@ async def test_evaluation_rejects_failed_tool_and_wrong_question() -> None:
         [ModelChunk(text="数据获取失败", finish_reason="stop")],
     ])
     run = RunManager().create_run([{"role": "user", "content": "另一个问题"}])
-    await AgentLoop(provider, registry).run(run)
+    await AgentExecutor(provider, registry).run(run)
 
     result = evaluate_agent_run(case, run, available_tools=set(registry.names()))
     assert not result.passed

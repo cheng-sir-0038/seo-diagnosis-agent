@@ -1,7 +1,18 @@
 import type { Conversation } from '../types/agent'
 
-const STORAGE_KEY = 'agent-workspace-conversations-v1'
-const ACTIVE_CONVERSATION_KEY = 'agent-workspace-active-conversation-v1'
+const STORAGE_KEY = 'agent-workspace-conversations-v2'
+const ACTIVE_CONVERSATION_KEY = 'agent-workspace-active-conversation-v2'
+
+export function clearLegacyWorkspaceStorage(): void {
+  const legacyKeys: [Storage, string][] = [
+    [localStorage, 'agent-workspace-conversations-v1'],
+    [localStorage, 'seo-agent-product-config-v1'],
+    [sessionStorage, 'agent-workspace-active-conversation-v1'],
+  ]
+  for (const [storage, key] of legacyKeys) {
+    if (storage.getItem(key) !== null) storage.removeItem(key)
+  }
+}
 
 export const createConversation = (): Conversation => ({
   id: crypto.randomUUID(),

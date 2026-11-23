@@ -3,11 +3,20 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
+from sqlalchemy import select
+
 from src.observability.client import ObservabilityClient
 from src.observability.instrumentation import observed_operation
 from src.observability.models import SpanKind
 from src.seo_agent.automation.digests import DigestService
 from src.seo_agent.db.database import SeoAgentDatabase
+from src.seo_agent.db.models import (
+    ActorRow,
+    NotificationEventTypeRow,
+    NotificationPreferenceRow,
+    NotificationSubscriptionRow,
+    WorkScheduleRow,
+)
 from src.seo_agent.opportunities.service import ScanRunService
 from src.seo_agent.schedules.provider import LocalScheduleProvider
 from src.seo_agent.services.system import SeoAgentSystemService
@@ -35,8 +44,11 @@ class ScheduleAutomationCoordinator:
 
     async def sync(self) -> int:
         schedules = await self.database.fetch_all(
-            "SELECT * FROM work_schedules WHERE schedule_type = 'OPPORTUNITY_SCAN' "
-            "AND enabled = 1 AND archived_at IS NULL"
+            select(WorkScheduleRow.__table__).where(
+                WorkScheduleRow.schedule_type == "OPPORTUNITY_SCAN",
+                WorkScheduleRow.enabled == 1,
+                WorkScheduleRow.archived_at.is_(None),
+            )
         )
         valid_ids = {f"opportunity-scan:{schedule['id']}" for schedule in schedules}
         for job in self.provider.scheduler.get_jobs():
@@ -68,7 +80,7 @@ class ScheduleAutomationCoordinator:
             trigger_type="scheduled",
         ) as span:
             schedule = await self.database.fetch_one(
-                "SELECT * FROM work_schedules WHERE id = ?", (schedule_id,)
+                select(WorkScheduleRow.__table__).where(WorkScheduleRow.id == schedule_id)
             )
             if schedule is None:
                 raise KeyError(f"工作计划不存在: {schedule_id}")
@@ -82,8 +94,14 @@ class ScheduleAutomationCoordinator:
             actor_id = self.agent_actor_id
             if actor_id is None:
                 actor = await self.database.fetch_one(
-                    "SELECT id FROM actors WHERE actor_type = 'SEO_AGENT' AND status = 'ACTIVE' "
-                    "AND archived_at IS NULL ORDER BY created_at LIMIT 1"
+                    select(ActorRow.id)
+                    .where(
+                        ActorRow.actor_type == "SEO_AGENT",
+                        ActorRow.status == "ACTIVE",
+                        ActorRow.archived_at.is_(None),
+                    )
+                    .order_by(ActorRow.created_at)
+                    .limit(1)
                 )
                 actor_id = actor["id"] if actor else None
             title = "启动机会扫描" if run["status"] == "RUNNING" else "跳过机会扫描"
@@ -135,12 +153,27 @@ class DigestScheduleCoordinator:
 
     async def sync(self) -> int:
         preferences = await self.database.fetch_all(
-            "SELECT DISTINCT s.site_id, t.event_key, p.schedule_json "
-            "FROM notification_preferences p "
-            "JOIN notification_subscriptions s ON s.id = p.subscription_id "
-            "JOIN notification_event_types t ON t.id = p.event_type_id "
-            "WHERE s.enabled = 1 AND s.archived_at IS NULL AND p.enabled = 1 "
-            "AND t.event_key IN ('daily_digest', 'weekly_digest')"
+            select(
+                NotificationSubscriptionRow.site_id,
+                NotificationEventTypeRow.event_key,
+                NotificationPreferenceRow.schedule_json,
+            )
+            .distinct()
+            .select_from(NotificationPreferenceRow)
+            .join(
+                NotificationSubscriptionRow,
+                NotificationSubscriptionRow.id == NotificationPreferenceRow.subscription_id,
+            )
+            .join(
+                NotificationEventTypeRow,
+                NotificationEventTypeRow.id == NotificationPreferenceRow.event_type_id,
+            )
+            .where(
+                NotificationSubscriptionRow.enabled == 1,
+                NotificationSubscriptionRow.archived_at.is_(None),
+                NotificationPreferenceRow.enabled == 1,
+                NotificationEventTypeRow.event_key.in_(("daily_digest", "weekly_digest")),
+            )
         )
         valid_ids: set[str] = set()
         for preference in preferences:

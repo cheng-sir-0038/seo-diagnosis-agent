@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from pydantic import SecretStr
 
 from src.agent.tools.base import ToolRuntimeContext, resolve_render_hint
-from src.api.routes import seo_agent_chat
+from src.api.routes.workspace import conversations
 from src.core.config import Settings
 from src.models.common import Capability, DataSource
 from src.models.page_metadata import PageMetadataReport
@@ -102,10 +102,10 @@ async def test_share_image_serves_only_generated_assets(
         _env_file=None,
         cloudflare_account_id="a" * 32,
         cloudflare_api_token=SecretStr("test-token"),
-        seo_agent_sqlite_path=tmp_path / "seo-agent.db",
+        share_image_directory=tmp_path / "share-images",
     )
     generator = CloudflareShareImages(config)
-    monkeypatch.setattr(seo_agent_chat, "cloudflare_share_images", generator)
+    monkeypatch.setattr(conversations, "cloudflare_share_images", generator)
     calls = []
 
     def cloudflare(request: httpx.Request) -> httpx.Response:
@@ -163,7 +163,7 @@ async def test_share_image_serves_only_generated_assets(
     assert card["title"] == "手冲咖啡入门"
     assert resolve_render_hint(tool, payload) == "cards"
     app = FastAPI()
-    app.include_router(seo_agent_chat.router, prefix="/api/v1")
+    app.include_router(conversations.site_chat_router, prefix="/api/v1")
     transport = httpx.ASGITransport(app=app)
     async with real_client(transport=transport, base_url="http://test") as client:
         response = await client.get(card["image_url"])

@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import pytest
 
-from src.agent.loop import AgentLoop
 from src.agent.models import RunStatus
 from src.agent.providers.fake import FakeModelProvider
 from src.agent.run_manager import RunManager
+from src.agent.runtime.executor import AgentExecutor
 from src.agent.tools.registry import build_default_registry
 
 
@@ -14,7 +14,7 @@ async def test_agent_loop_streams_text_and_completes() -> None:
     manager = RunManager()
     run = manager.create_run([{"role": "user", "content": "你好"}])
     provider = FakeModelProvider.text("你好，我是测试 Agent。")
-    await AgentLoop(provider, build_default_registry()).run(run)
+    await AgentExecutor(provider, build_default_registry()).run(run)
     types = [event.type for event in run.events]
     assert "message.delta" in types
     assert types[-1] == "run.completed"
@@ -26,7 +26,7 @@ async def test_agent_loop_executes_tool_then_continues() -> None:
     manager = RunManager()
     run = manager.create_run([{"role": "user", "content": "1234 * 56"}])
     provider = FakeModelProvider.calculator_then_text("1234 * 56", "结果是 69104。")
-    await AgentLoop(provider, build_default_registry()).run(run)
+    await AgentExecutor(provider, build_default_registry()).run(run)
     types = [event.type for event in run.events]
     assert "tool.started" in types
     assert "tool.completed" in types
@@ -39,7 +39,7 @@ async def test_agent_loop_failure_sets_finished_at() -> None:
     run = manager.create_run([{"role": "user", "content": "test"}])
     provider = FakeModelProvider.text("unused")
 
-    await AgentLoop(provider, build_default_registry(), max_iterations=0).run(run)
+    await AgentExecutor(provider, build_default_registry(), max_iterations=0).run(run)
 
     assert run.status == RunStatus.FAILED
     assert run.finished_at is not None
@@ -103,7 +103,7 @@ async def test_agent_loop_reuses_identical_successful_tool_call() -> None:
     )
     run = RunManager().create_run([{"role": "user", "content": "重复工具测试"}])
 
-    await AgentLoop(provider, ToolRegistry([tool]), max_iterations=4).run(run)
+    await AgentExecutor(provider, ToolRegistry([tool]), max_iterations=4).run(run)
 
     assert run.status == RunStatus.COMPLETED
     assert tool.calls == 1
@@ -137,7 +137,7 @@ async def test_agent_loop_reserves_last_iteration_for_forced_summary() -> None:
     )
     run = RunManager().create_run([{"role": "user", "content": "两轮完成"}])
 
-    await AgentLoop(provider, ToolRegistry([tool]), max_iterations=2).run(run)
+    await AgentExecutor(provider, ToolRegistry([tool]), max_iterations=2).run(run)
 
     assert run.status == RunStatus.COMPLETED
     assert provider.tool_choices == ["auto", "none"]
@@ -173,7 +173,7 @@ async def test_agent_loop_recovers_exhausted_run_by_summarizing_without_tools() 
     run.tool_count = 11
     run.error = "超过最大模型循环次数"
 
-    await AgentLoop(provider, ToolRegistry([tool]), max_iterations=8).run(run)
+    await AgentExecutor(provider, ToolRegistry([tool]), max_iterations=8).run(run)
 
     assert run.status == RunStatus.COMPLETED
     assert run.error is None
@@ -213,7 +213,7 @@ async def test_budget_summary_hides_textual_dsml_tool_markup() -> None:
         "limitations": ["缺少长期历史趋势"],
     }
 
-    await AgentLoop(provider, ToolRegistry([]), max_iterations=8).run(run)
+    await AgentExecutor(provider, ToolRegistry([]), max_iterations=8).run(run)
 
     assert run.status == RunStatus.COMPLETED
     completed = next(event for event in run.events if event.type == "message.completed")

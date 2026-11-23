@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 
-import aiosqlite
 import pytest
+from sqlalchemy import CheckConstraint, Column, MetaData, String, Table, func, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.schema import AddConstraint
 
 from src.models.common import Capability
 from src.observability.client import ObservabilityClient
+from src.observability.schema import SpanRow, ToolCallRow
 from src.observability.storage import ObservabilityDatabase
 from src.seo_agent.approvals.service import ApprovalService
 from src.seo_agent.db.database import SeoAgentDatabase
+from src.seo_agent.db.models import TABLES, OpportunityStatusHistoryRow
 from src.seo_agent.notifications.service import NotificationService
 from src.seo_agent.opportunities.models import OpportunityCandidate, OpportunityScoreFactors
 from src.seo_agent.opportunities.service import OpportunityService, ScanRunService
@@ -18,6 +21,11 @@ from src.seo_agent.schedules.service import WorkScheduleService
 from src.seo_agent.services.system import SeoAgentSystemService
 from src.seo_agent.tools.seo_data import SeoDataToolBridge
 from src.seo_agent.workbench.service import WorkbenchService
+
+
+async def row_count(database, table_name: str, **filters) -> int:
+    table = TABLES[table_name]
+    return await database.fetch_value(select(func.count()).select_from(table).filter_by(**filters))
 
 
 class FakeFacade:
@@ -30,8 +38,8 @@ class FakeFacade:
 
 
 @pytest.fixture
-async def context(tmp_path: Path):
-    db = SeoAgentDatabase(tmp_path / "seo-agent.db")
+async def context(pg_url: str):
+    db = SeoAgentDatabase(pg_url)
     await db.startup()
     system = SeoAgentSystemService(db)
     site = await system.create_site(
@@ -109,6 +117,33 @@ async def test_scan_run_forbids_overlap_and_records_skip(context) -> None:
 
 
 @pytest.mark.asyncio
+async def test_concurrent_ingest_retries_share_observations_and_one_approval(context) -> None:
+    db, site, owner, agent, schedule, approvals, notifications = context
+    scans = ScanRunService(db)
+    first, retry = await asyncio.gather(*(
+        scans.start(
+            schedule_id=schedule["id"], trigger_type="SCHEDULED", idempotency_key="scan:parallel"
+        )
+        for _ in range(2)
+    ))
+    assert retry["id"] == first["id"]
+    service = OpportunityService(db, approvals=approvals, notifications=notifications)
+    results = await asyncio.gather(*(
+        service.upsert_candidate(
+            site_id=site["id"], scan_run_id=first["id"], candidate=candidate(),
+            changed_by_actor_id=agent["id"], idempotency_key=key,
+            default_approver_actor_id=owner["id"],
+        )
+        for key in ("candidate:parallel:1", "candidate:parallel:1", "candidate:parallel:2")
+    ))
+    assert len({result["id"] for result in results}) == 1
+    detail = await service.get_detail(results[0]["id"])
+    assert detail["seen_count"] == len(detail["observations"]) == 2
+    assert len(detail["approval_actions"]) == 1
+    assert await row_count(db, "notification_events") == 1
+
+
+@pytest.mark.asyncio
 async def test_seo_data_tool_bridge_calls_facade_with_standard_capability() -> None:
     facade = FakeFacade()
     bridge = SeoDataToolBridge(facade)
@@ -125,8 +160,8 @@ async def test_seo_data_tool_bridge_calls_facade_with_standard_capability() -> N
 
 
 @pytest.mark.asyncio
-async def test_seo_data_tool_bridge_persists_adapter_observation(tmp_path: Path) -> None:
-    database = ObservabilityDatabase(tmp_path / "seo-data-observability.db")
+async def test_seo_data_tool_bridge_persists_adapter_observation(pg_url: str) -> None:
+    database = ObservabilityDatabase(pg_url)
     await database.startup()
     client = ObservabilityClient(database, project_key="seo-agent")
     facade = FakeFacade()
@@ -138,8 +173,8 @@ async def test_seo_data_tool_bridge_persists_adapter_observation(tmp_path: Path)
             params={"country": "us"},
             task_id="run-observed",
         )
-        call = await database.fetch_one("SELECT * FROM obs_tool_calls")
-        span = await database.fetch_one("SELECT * FROM obs_spans WHERE kind = 'ADAPTER'")
+        call = await database.fetch_one(select(ToolCallRow.__table__))
+        span = await database.fetch_one(select(SpanRow.__table__).where(SpanRow.kind == "ADAPTER"))
         assert result["meta"]["source"] == "dataforseo"
         assert call is not None
         assert call["tool_name"] == "seo_data.organic_keywords"
@@ -162,6 +197,7 @@ async def test_ingest_candidate_api_preserves_validated_candidate(context, monke
         schedule_id=schedule["id"], trigger_type="MANUAL", idempotency_key="scan:api-ingest"
     )
     service = OpportunityService(db, approvals=approvals, notifications=notifications)
+    monkeypatch.setattr(seo_agent_opportunities, "scan_run_service", ScanRunService(db))
     monkeypatch.setattr(seo_agent_opportunities, "opportunity_service", service)
     app = FastAPI()
     app.include_router(seo_agent_opportunities.router)
@@ -171,6 +207,20 @@ async def test_ingest_candidate_api_preserves_validated_candidate(context, monke
         "idempotency_key": "candidate:api-ingest",
     }
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        start = {
+            "schedule_id": schedule["id"], "trigger_type": "MANUAL",
+            "idempotency_key": "scan:api-ingest",
+        }
+        replay = await client.post("/seo-agent/scan-runs", json=start)
+        assert replay.status_code == 201 and replay.json()["id"] == scan["id"]
+        missing = await client.post(
+            "/seo-agent/scan-runs", json={**start, "schedule_id": "missing"}
+        )
+        assert missing.status_code == 404
+        conflict = await client.post(
+            "/seo-agent/scan-runs", json={**start, "trigger_type": "SCHEDULED"}
+        )
+        assert conflict.status_code == 409
         first = await client.post("/seo-agent/opportunities/ingest", json=payload)
         assert first.status_code == 201
         repeated = await client.post("/seo-agent/opportunities/ingest", json=payload)
@@ -180,7 +230,16 @@ async def test_ingest_candidate_api_preserves_validated_candidate(context, monke
             "/seo-agent/opportunities/ingest", json={**payload, "candidate": {"title": "bad"}}
         )
         assert invalid.status_code == 422
-    assert await db.fetch_value("SELECT COUNT(*) FROM opportunities") == 1
+        missing = await client.post(
+            "/seo-agent/opportunities/ingest", json={**payload, "site_id": "missing"}
+        )
+        assert missing.status_code == 404
+        conflict = await client.post(
+            "/seo-agent/opportunities/ingest",
+            json={**payload, "candidate": {**payload["candidate"], "normalized_intent": "new"}},
+        )
+        assert conflict.status_code == 409
+    assert await row_count(db, "opportunities") == 1
 
 
 @pytest.mark.asyncio
@@ -212,39 +271,25 @@ async def test_opportunity_upsert_adds_observation_keywords_approval_and_notific
     assert opportunity["priority_level"] == "HIGH"
     assert opportunity["status"] == "WAITING_FOR_DECISION"
     assert (
-        await db.fetch_value(
-            "SELECT COUNT(*) FROM opportunity_observations WHERE opportunity_id = ?",
-            (opportunity["id"],),
-        )
+        await row_count(db, "opportunity_observations", opportunity_id=opportunity["id"])
         == 1
     )
     assert (
-        await db.fetch_value(
-            "SELECT COUNT(*) FROM opportunity_keywords WHERE opportunity_id = ?",
-            (opportunity["id"],),
-        )
+        await row_count(db, "opportunity_keywords", opportunity_id=opportunity["id"])
         == 2
     )
     assert (
-        await db.fetch_value(
-            "SELECT COUNT(*) FROM opportunity_competitor_pages WHERE opportunity_id = ?",
-            (opportunity["id"],),
-        )
+        await row_count(db, "opportunity_competitor_pages", opportunity_id=opportunity["id"])
         == 1
     )
     detail = await service.get_detail(opportunity["id"])
     assert detail["competitor_pages"][0]["url"] == "https://competitor.com/Guide"
     assert (
-        await db.fetch_value(
-            "SELECT COUNT(*) FROM approval_actions WHERE target_id = ?", (opportunity["id"],)
-        )
+        await row_count(db, "approval_actions", target_id=opportunity["id"])
         == 1
     )
     assert (
-        await db.fetch_value(
-            "SELECT COUNT(*) FROM notification_events WHERE business_object_id = ?",
-            (opportunity["id"],),
-        )
+        await row_count(db, "notification_events", business_object_id=opportunity["id"])
         == 1
     )
 
@@ -288,8 +333,11 @@ async def test_opportunity_decision_does_not_request_approval_again(
     if decision == "REJECT":
         assert updated["rejection_reason"] == "test decision"
     history = await db.fetch_all(
-        "SELECT from_status, to_status, changed_by_actor_id FROM opportunity_status_history "
-        "WHERE opportunity_id = ? ORDER BY created_at", (opportunity["id"],)
+        select(
+            OpportunityStatusHistoryRow.from_status, OpportunityStatusHistoryRow.to_status,
+            OpportunityStatusHistoryRow.changed_by_actor_id,
+        ).where(OpportunityStatusHistoryRow.opportunity_id == opportunity["id"])
+        .order_by(OpportunityStatusHistoryRow.created_at)
     )
     assert history[-1] == {
         "from_status": "WAITING_FOR_DECISION", "to_status": expected_status,
@@ -389,11 +437,10 @@ async def test_opportunity_decision_rolls_back_if_status_update_fails(context) -
         default_approver_actor_id=owner["id"],
     )
     action = (await approvals.list_pending(site["id"]))[0]
-    await db.execute(
-        "CREATE TRIGGER reject_test_update BEFORE UPDATE OF status ON opportunities "
-        "WHEN NEW.status = 'APPROVED' BEGIN SELECT RAISE(ABORT, 'forced failure'); END"
-    )
-    with pytest.raises(aiosqlite.IntegrityError, match="forced failure"):
+    guard_table = Table("opportunities", MetaData(), Column("status", String))
+    guard = CheckConstraint(guard_table.c.status != "APPROVED", name="reject_test_update")
+    await db.execute(AddConstraint(guard))
+    with pytest.raises(IntegrityError, match="reject_test_update"):
         await approvals.decide(action_id=action["id"], actor_id=owner["id"], decision="APPROVE")
     assert (await approvals.get_action(action["id"]))["status"] == "WAITING_FOR_APPROVAL"
     assert (await service.get(opportunity["id"]))["status"] == "WAITING_FOR_DECISION"
@@ -586,3 +633,9 @@ async def test_workbench_summary_reads_business_tables(context) -> None:
     assert summary["pending_approvals"] == 1
     assert summary["high_value_opportunities"] == 1
     assert summary["active_scan_runs"] == 1
+    empty = await WorkbenchService(db).summary("another-site")
+    assert empty == {
+        "pending_approvals": 0, "high_value_opportunities": 0, "medium_opportunities": 0,
+        "active_tasks": 0, "active_scan_runs": 0, "active_monitoring_plans": 0,
+        "recent_work_records": [],
+    }

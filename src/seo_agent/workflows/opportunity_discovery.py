@@ -7,6 +7,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from pydantic import Field
+from sqlalchemy import select
 
 from src.agent.observability import run_observed_tool
 from src.agent.tools.base import ToolRuntimeContext
@@ -20,10 +21,15 @@ from src.core.exceptions import (
 from src.observability.client import ObservabilityClient
 from src.observability.instrumentation import observed_operation
 from src.observability.models import SpanKind
-from src.seo_agent.approvals.service import ApprovalService
 from src.seo_agent.chat.tools import FacadeProtocol, build_seo_agent_registry
 from src.seo_agent.db.database import SeoAgentDatabase
-from src.seo_agent.notifications.service import NotificationService
+from src.seo_agent.db.models import (
+    ActorRow,
+    ScheduleRunRow,
+    SiteRow,
+    WorkRecordRow,
+    WorkScheduleRow,
+)
 from src.seo_agent.opportunities.models import OpportunityCandidate, OpportunityDiscoveryOutput
 from src.seo_agent.opportunities.service import OpportunityService, ScanRunService
 from src.seo_agent.services.system import SeoAgentSystemService
@@ -70,7 +76,8 @@ class OpportunityDiscoveryWorkflow:
         key = f"opportunity-discovery:{scan_run_id}:{request.idempotency_key}"
         request_hash = hashlib.sha256(request.model_dump_json().encode()).hexdigest()
         async with self._lock:
-            existing = await self._receipt(self.database, key, request_hash)
+            async with self.database.transaction() as tx:
+                existing, site = await self._prepare(tx, scan_run_id, request, key, request_hash)
             if existing is not None:
                 async with observed_operation(
                     self.observability,
@@ -82,7 +89,7 @@ class OpportunityDiscoveryWorkflow:
                     if replay is not None:
                         replay.output_data = existing
                 return existing
-            site = await self._context(self.database, scan_run_id, request)
+            assert site is not None
             market = {
                 "country": (request.country or site["default_country"]).upper(),
                 "language": (request.language or site["default_language"])
@@ -190,7 +197,9 @@ class OpportunityDiscoveryWorkflow:
                     input_data={"scan_run_id": scan_run_id, "candidate_count": len(candidates)},
                 ) as write:
                     async with self.database.transaction() as transaction:
-                        existing = await self._receipt(transaction, key, request_hash)
+                        existing, _ = await self._prepare(
+                            transaction, scan_run_id, request, key, request_hash
+                        )
                         if existing is not None:
                             if write is not None:
                                 write.output_data = {
@@ -200,8 +209,7 @@ class OpportunityDiscoveryWorkflow:
                             if span is not None:
                                 span.output_data = existing
                             return existing
-                        await self._context(transaction, scan_run_id, request)
-                        service = self._service(transaction)
+                        service = self.opportunities.using(transaction)
                         ids = []
                         states = []
                         for candidate in candidates:
@@ -247,70 +255,60 @@ class OpportunityDiscoveryWorkflow:
                     span.output_data = result
                 return result
 
-    async def _context(
+    async def _prepare(
         self,
         database: SeoAgentDatabase,
         scan_run_id: str,
         request: OpportunityDiscoveryRequest,
-    ) -> dict[str, Any]:
+        key: str,
+        request_hash: str,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        # Lock first, then read the committed receipt in a separate READ COMMITTED statement.
         scan = await database.fetch_one(
-            "SELECT s.status, w.site_id, w.schedule_type, w.archived_at FROM schedule_runs s "
-            "JOIN work_schedules w ON w.id = s.schedule_id WHERE s.id = ?",
-            (scan_run_id,),
+            select(ScheduleRunRow.status, WorkScheduleRow.site_id,
+                   WorkScheduleRow.schedule_type, WorkScheduleRow.archived_at)
+            .join_from(
+                ScheduleRunRow, WorkScheduleRow, WorkScheduleRow.id == ScheduleRunRow.schedule_id
+            )
+            .where(ScheduleRunRow.id == scan_run_id)
+            .with_for_update()
         )
         if scan is None:
             raise KeyError("扫描运行不存在")
+        payload_json = await database.fetch_value(
+            select(WorkRecordRow.payload_json).where(WorkRecordRow.idempotency_key == key)
+        )
+        if payload_json is not None:
+            payload = json.loads(payload_json)
+            if payload.get("request_hash") != request_hash:
+                raise ValueError("幂等键已被不同的请求内容使用")
+            return payload["result"], None
         if (
             scan["status"] != "RUNNING"
             or scan["archived_at"] is not None
             or scan["schedule_type"] != "OPPORTUNITY_SCAN"
         ):
             raise ValueError("扫描运行当前不可执行机会发现")
-        site = await SeoAgentSystemService(database).get_site(scan["site_id"])
+        site = await database.fetch_one(
+            select(SiteRow.__table__).where(SiteRow.id == scan["site_id"])
+            .with_for_update(key_share=True)
+        )
+        if site is None:
+            raise KeyError("站点不存在")
         if site["status"] != "ACTIVE" or site.get("archived_at") is not None:
             raise ValueError("站点当前不可用于机会发现")
         for actor_id in (request.changed_by_actor_id, request.default_approver_actor_id):
             if actor_id is None:
                 continue
             actor = await database.fetch_one(
-                "SELECT status, archived_at FROM actors WHERE id = ?", (actor_id,)
+                select(ActorRow.status, ActorRow.archived_at).where(ActorRow.id == actor_id)
+                .with_for_update(read=True)
             )
             if actor is None:
                 raise KeyError("操作人或审批人不存在")
             if actor["status"] != "ACTIVE" or actor["archived_at"] is not None:
                 raise ValueError("操作人或审批人当前不可用")
-        return site
-
-    @staticmethod
-    async def _receipt(
-        database: SeoAgentDatabase,
-        key: str,
-        request_hash: str,
-    ) -> dict[str, Any] | None:
-        row = await database.fetch_one(
-            "SELECT payload_json FROM work_records WHERE idempotency_key = ?", (key,)
-        )
-        if row is None:
-            return None
-        payload = json.loads(row["payload_json"])
-        if payload.get("request_hash") != request_hash:
-            raise ValueError("幂等键已被不同的请求内容使用")
-        return payload["result"]
-
-    def _service(self, database: SeoAgentDatabase) -> OpportunityService:
-        original = self.opportunities
-        return OpportunityService(
-            database,
-            policy=original.policy,
-            normalizer=original.normalizer,
-            action_policy=original.action_policy,
-            approvals=ApprovalService(database, reminder_hours=original.approvals.reminder_hours)
-            if original.approvals
-            else None,
-            notifications=NotificationService(database, original.notifications.provider)
-            if original.notifications
-            else None,
-        )
+        return None, site
 
     def _validate(
         self,

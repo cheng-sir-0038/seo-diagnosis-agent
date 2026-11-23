@@ -37,18 +37,12 @@ class NotificationOutboxWorker:
             return OutboxRunResult(skipped_not_configured=len(deliveries))
         sent = failed = exhausted = 0
         for delivery in deliveries:
-            attempt_count = int(
-                await self.database.fetch_value(
-                    "SELECT COUNT(*) FROM notification_attempts WHERE notification_delivery_id = ?",
-                    (delivery["id"],),
-                )
-                or 0
+            result = await self.notifications.send_delivery(
+                delivery["id"], max_attempts=self.max_attempts
             )
-            if attempt_count >= self.max_attempts:
+            if result.status == "EXHAUSTED":
                 exhausted += 1
-                continue
-            result = await self.notifications.send_delivery(delivery["id"])
-            if result.success:
+            elif result.success:
                 sent += 1
             else:
                 failed += 1

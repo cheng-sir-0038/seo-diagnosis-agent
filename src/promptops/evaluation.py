@@ -2,22 +2,20 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import UTC, datetime
+from asyncio import CancelledError
 from typing import Any, Protocol
 
 from pydantic import BaseModel, Field
+from sqlalchemy import select, update
 
 from src.observability.storage import ObservabilityDatabase
 from src.promptops.models import EvaluationScore
 from src.promptops.registry import PromptRegistry
+from src.promptops.schema import DatasetCase, EvaluationResult, EvaluationRun, now, record
 
 
 def _id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
-
-
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
 
 
 def _get_path(value: Any, path: str) -> tuple[bool, Any]:
@@ -60,20 +58,18 @@ class EvaluationService:
         version = await self.registry.get_version(prompt_version_id)
         cases = await self.registry.list_cases(dataset_id)
         run_id = _id("eval")
-        started_at = _now()
-        await self.database.execute(
-            "INSERT INTO prompt_evaluation_runs(id, prompt_version_id, dataset_id, model_provider, "
-            "model_name, status, case_count, started_at) VALUES (?, ?, ?, ?, ?, 'RUNNING', ?, ?)",
-            (
-                run_id,
-                prompt_version_id,
-                dataset_id,
-                model_provider,
-                model_name,
-                len(cases),
-                started_at,
-            ),
-        )
+        async with self.database.orm_session(write=True) as session:
+            session.add(
+                EvaluationRun(
+                    id=run_id,
+                    prompt_version_id=prompt_version_id,
+                    dataset_id=dataset_id,
+                    model_provider=model_provider,
+                    model_name=model_name,
+                    status="RUNNING",
+                    case_count=len(cases),
+                )
+            )
         passed_count = 0
         scores: list[float] = []
         costs: list[float] = []
@@ -89,55 +85,46 @@ class EvaluationService:
                     costs.append(result.estimated_cost)
                 if result.latency_ms is not None:
                     latencies.append(result.latency_ms)
-                await self.database.execute(
-                    "INSERT INTO prompt_evaluation_results(id, evaluation_run_id, case_id, "
-                    "status, output_json, scores_json, total_score, passed, input_tokens, "
-                    "output_tokens, estimated_cost, latency_ms, error_message, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        _id("evalresult"),
-                        run_id,
-                        case["id"],
-                        "COMPLETED" if not result.error_message else "FAILED",
-                        json.dumps(result.output, ensure_ascii=False),
-                        score.model_dump_json(),
-                        score.total_score,
-                        int(score.passed),
-                        result.input_tokens,
-                        result.output_tokens,
-                        result.estimated_cost,
-                        result.latency_ms,
-                        result.error_message,
-                        _now(),
-                    ),
-                )
+                async with self.database.orm_session(write=True) as session:
+                    session.add(
+                        EvaluationResult(
+                            id=_id("evalresult"),
+                            evaluation_run_id=run_id,
+                            case_id=case["id"],
+                            status="FAILED" if result.error_message else "COMPLETED",
+                            output_json=result.output,
+                            scores_json=score.model_dump(mode="json"),
+                            total_score=score.total_score,
+                            passed=int(score.passed),
+                            input_tokens=result.input_tokens,
+                            output_tokens=result.output_tokens,
+                            estimated_cost=result.estimated_cost,
+                            latency_ms=result.latency_ms,
+                            error_message=result.error_message,
+                        )
+                    )
             case_count = len(cases)
             await self.database.execute(
-                "UPDATE prompt_evaluation_runs SET status = 'COMPLETED', passed_count = ?, "
-                "pass_rate = ?, average_score = ?, total_cost = ?, average_latency_ms = ?, "
-                "completed_at = ? WHERE id = ?",
-                (
-                    passed_count,
-                    (passed_count / case_count) if case_count else 0,
-                    (sum(scores) / len(scores)) if scores else 0,
-                    sum(costs),
-                    (sum(latencies) / len(latencies)) if latencies else 0,
-                    _now(),
-                    run_id,
-                ),
+                update(EvaluationRun)
+                .where(EvaluationRun.id == run_id)
+                .values(
+                    status="COMPLETED",
+                    passed_count=passed_count,
+                    pass_rate=passed_count / case_count if case_count else 0,
+                    average_score=sum(scores) / case_count if case_count else 0,
+                    total_cost=sum(costs),
+                    average_latency_ms=sum(latencies) / len(latencies) if latencies else 0,
+                    completed_at=now(),
+                )
             )
-        except Exception as exc:
+        except (Exception, CancelledError) as exc:
             await self.database.execute(
-                "UPDATE prompt_evaluation_runs SET status = 'FAILED', error_message = ?, "
-                "completed_at = ? WHERE id = ?",
-                (str(exc)[:2000], _now(), run_id),
+                update(EvaluationRun)
+                .where(EvaluationRun.id == run_id)
+                .values(status="FAILED", error_message=str(exc)[:2000], completed_at=now())
             )
             raise
-        row = await self.database.fetch_one(
-            "SELECT * FROM prompt_evaluation_runs WHERE id = ?", (run_id,)
-        )
-        assert row is not None
-        return row
+        return await self._summary(run_id)
 
     async def list_runs(
         self,
@@ -145,30 +132,31 @@ class EvaluationService:
         prompt_version_id: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
-        if prompt_version_id:
-            return await self.database.fetch_all(
-                "SELECT * FROM prompt_evaluation_runs WHERE prompt_version_id = ? "
-                "ORDER BY started_at DESC LIMIT ?",
-                (prompt_version_id, max(1, min(limit, 500))),
-            )
-        return await self.database.fetch_all(
-            "SELECT * FROM prompt_evaluation_runs ORDER BY started_at DESC LIMIT ?",
-            (max(1, min(limit, 500)),),
+        query = (
+            select(EvaluationRun)
+            .order_by(EvaluationRun.started_at.desc())
+            .limit(max(1, min(limit, 500)))
         )
+        if prompt_version_id:
+            query = query.where(EvaluationRun.prompt_version_id == prompt_version_id)
+        async with self.database.orm_session() as session:
+            return [record(row) for row in await session.scalars(query)]
 
     async def get_run(self, run_id: str) -> dict[str, Any]:
-        row = await self.database.fetch_one(
-            "SELECT * FROM prompt_evaluation_runs WHERE id = ?", (run_id,)
-        )
-        if row is None:
-            raise KeyError(f"评测运行不存在: {run_id}")
-        row["results"] = await self.database.fetch_all(
-            "SELECT r.*, c.name AS case_name FROM prompt_evaluation_results r "
-            "JOIN prompt_dataset_cases c ON c.id = r.case_id "
-            "WHERE r.evaluation_run_id = ? ORDER BY c.created_at",
-            (run_id,),
-        )
-        return row
+        async with self.database.orm_session() as session:
+            run = await session.get(EvaluationRun, run_id)
+            if run is None:
+                raise KeyError(f"评测运行不存在: {run_id}")
+            results = await session.execute(
+                select(EvaluationResult, DatasetCase.name)
+                .join(DatasetCase, DatasetCase.id == EvaluationResult.case_id)
+                .where(EvaluationResult.evaluation_run_id == run_id)
+                .order_by(DatasetCase.created_at)
+            )
+            return {
+                **record(run),
+                "results": [{**record(row), "case_name": name} for row, name in results],
+            }
 
     def grade(
         self,
@@ -253,9 +241,8 @@ class EvaluationService:
         }
 
     async def _summary(self, run_id: str) -> dict[str, Any]:
-        row = await self.database.fetch_one(
-            "SELECT * FROM prompt_evaluation_runs WHERE id = ?", (run_id,)
-        )
-        if row is None:
-            raise KeyError(f"评测运行不存在: {run_id}")
-        return row
+        async with self.database.orm_session() as session:
+            row = await session.get(EvaluationRun, run_id)
+            if row is None:
+                raise KeyError(f"评测运行不存在: {run_id}")
+            return record(row)

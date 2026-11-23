@@ -1,23 +1,25 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 from src.observability.client import ObservabilityClient
+from src.observability.schema import IssueRow, ToolCallRow
 from src.observability.storage import ObservabilityDatabase
 from src.seo_agent.approvals.graph import build_approval_graph
 from src.seo_agent.approvals.service import ApprovalService
 from src.seo_agent.checkpoints import CheckpointManager
 from src.seo_agent.db.database import SeoAgentDatabase
+from src.seo_agent.db.models import TABLES
 from src.seo_agent.notifications.email import EmailMessage, SmtpEmailProvider, SmtpSettings
 from src.seo_agent.notifications.service import NotificationService
 from src.seo_agent.services.system import SeoAgentSystemService
 
 
 @pytest.fixture
-async def context(tmp_path: Path):
-    db = SeoAgentDatabase(tmp_path / "seo-agent.db")
+async def context(pg_url):
+    db = SeoAgentDatabase(pg_url)
     await db.startup()
     system = SeoAgentSystemService(db)
     site = await system.create_site(
@@ -81,8 +83,21 @@ async def test_opportunity_approval_rejects_missing_target(context) -> None:
 
 
 @pytest.mark.asyncio
-async def test_langgraph_approval_interrupt_and_resume(tmp_path: Path) -> None:
-    manager = CheckpointManager(tmp_path / "checkpoint.db")
+async def test_failed_approver_assignment_rolls_back_the_application(context) -> None:
+    db, site, _ = context
+    service = ApprovalService(db)
+    with pytest.raises(IntegrityError):
+        await service.create_action(
+            site_id=site["id"], action_type="PUBLISH_CONTENT", risk_level="HIGH",
+            target_type="delivery", target_id="sample", requested_payload={},
+            approver_actor_id="missing-approver", idempotency_key="missing-approver",
+        )
+    assert await service.list_pending(site["id"]) == []
+
+
+@pytest.mark.asyncio
+async def test_langgraph_approval_interrupt_and_resume(pg_url) -> None:
+    manager = CheckpointManager(pg_url)
     await manager.startup()
     try:
         graph = build_approval_graph(manager.require_saver())
@@ -146,9 +161,9 @@ async def test_smtp_provider_uses_injected_transport_without_network() -> None:
 
 @pytest.mark.asyncio
 async def test_smtp_provider_persists_success_and_failure_observations(
-    tmp_path: Path,
+    pg_url,
 ) -> None:
-    database = ObservabilityDatabase(tmp_path / "smtp-observability.db")
+    database = ObservabilityDatabase(pg_url)
     await database.startup()
     client = ObservabilityClient(database, project_key="seo-agent")
     settings = SmtpSettings(
@@ -178,8 +193,10 @@ async def test_smtp_provider_persists_success_and_failure_observations(
             transport=FailingSMTP(),
             observability=client,
         ).send(message.model_copy(update={"idempotency_key": "mail:failed"}))
-        calls = await database.fetch_all("SELECT * FROM obs_tool_calls ORDER BY started_at")
-        issue = await database.fetch_one("SELECT * FROM obs_issues")
+        calls = await database.fetch_all(
+            select(ToolCallRow.__table__).order_by(ToolCallRow.started_at)
+        )
+        issue = await database.fetch_one(select(IssueRow.__table__))
         assert success.success is True
         assert failure.success is False
         assert [call["status"] for call in calls] == ["COMPLETED", "FAILED"]
@@ -247,8 +264,9 @@ async def test_notification_event_creates_delivery_and_attempt_history(context) 
     result = await service.send_delivery(deliveries[0]["id"])
     assert result.success is True
     attempt_count = await db.fetch_value(
-        "SELECT COUNT(*) FROM notification_attempts WHERE notification_delivery_id = ?",
-        (deliveries[0]["id"],),
+        select(func.count()).select_from(TABLES["notification_attempts"]).where(
+            TABLES["notification_attempts"].c.notification_delivery_id == deliveries[0]["id"],
+        )
     )
     assert attempt_count == 1
     repeated = await service.create_event(
@@ -291,7 +309,8 @@ async def test_reminder_coordinator_creates_one_event_per_due_window(context) ->
     )
     coordinator = ApprovalReminderCoordinator(approvals, notifications)
     assert await coordinator.run_once() == 1
-    assert await db.fetch_value("SELECT COUNT(*) FROM notification_events") == 1
+    events = TABLES["notification_events"]
+    assert await db.fetch_value(select(func.count()).select_from(events)) == 1
 
 
 @pytest.mark.asyncio
@@ -307,7 +326,7 @@ async def test_mvp_allows_only_one_active_opportunity_schedule(context) -> None:
         frequency="DAILY",
         timezone="UTC",
     )
-    with pytest.raises(Exception, match="UNIQUE constraint failed"):
+    with pytest.raises(IntegrityError, match="ux_active_opportunity_schedule"):
         await service.create_schedule(
             site_id=site["id"],
             schedule_type="OPPORTUNITY_SCAN",

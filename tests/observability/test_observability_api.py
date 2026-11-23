@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 from httpx import ASGITransport, AsyncClient
 
@@ -12,8 +10,8 @@ from src.server import app
 
 
 @pytest.mark.asyncio
-async def test_observability_api_lists_trace_and_updates_issue(tmp_path: Path, monkeypatch) -> None:
-    database = ObservabilityDatabase(tmp_path / "api.db")
+async def test_observability_api_lists_trace_and_updates_issue(pg_url: str, monkeypatch) -> None:
+    database = ObservabilityDatabase(pg_url)
     await database.startup()
     client = ObservabilityClient(database, project_key="api-test")
     await client.startup()

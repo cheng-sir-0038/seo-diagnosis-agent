@@ -1,22 +1,23 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 from typing import Any
 
 import pytest
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from sqlalchemy import select
 
-from src.agent.loop import AgentLoop
 from src.agent.models import RunStatus
 from src.agent.observability import AgentRunObserver
 from src.agent.providers.base import ModelChunk, ToolCall
 from src.agent.providers.fake import FakeModelProvider
 from src.agent.run_manager import RunManager
+from src.agent.runtime.executor import AgentExecutor
 from src.core.exceptions import InternalProviderRequestError
 from src.models.common import Capability
 from src.observability.client import ObservabilityClient
 from src.observability.exporters import OpenTelemetryExporter
+from src.observability.schema import ModelCallRow, SpanRow
 from src.observability.storage import ObservabilityDatabase
 from src.seo_agent.chat.runtime import build_seo_system_prompt
 from src.seo_agent.chat.tools import build_seo_agent_registry
@@ -39,7 +40,7 @@ CAPABILITIES = {
 @pytest.mark.parametrize("unexpected", [False, True])
 @pytest.mark.parametrize("observed", [False, True])
 async def test_workflow_preserves_explicit_error_codes_and_handles_unexpected_errors(
-    unexpected, observed, tmp_path,
+    unexpected, observed, pg_url,
 ):
     from src.agent.tools.base import ToolResult
     from src.seo_agent.workflows.execution import WorkflowSteps
@@ -55,7 +56,7 @@ async def test_workflow_preserves_explicit_error_codes_and_handles_unexpected_er
                 raise RuntimeError("private external detail")
             return ToolResult(success=False, error="没有数据", error_code="DATA_NOT_AVAILABLE")
 
-    database = ObservabilityDatabase(tmp_path / "observations.db") if observed else None
+    database = ObservabilityDatabase(pg_url) if observed else None
     observer = ObservabilityClient(database, project_key="seo-agent") if observed else None
     try:
         steps = WorkflowSteps({"failed_source": FailedTool()}, 1, observer, None)
@@ -65,7 +66,7 @@ async def test_workflow_preserves_explicit_error_codes_and_handles_unexpected_er
         )
         if observed and not unexpected:
             row = await database.fetch_one(
-                "SELECT error_code FROM obs_spans WHERE operation_name='failed_source'"
+                select(SpanRow.error_code).where(SpanRow.operation_name == 'failed_source')
             )
             assert row["error_code"] == "DATA_NOT_AVAILABLE"
     finally:
@@ -320,7 +321,7 @@ async def test_nested_timeout_keeps_page_evidence_in_real_agent_loop(monkeypatch
         ]
     )
     run = RunManager().create_run([{"role": "user", "content": "诊断站点"}])
-    await AgentLoop(model, registry, tool_timeout=0.3).run(run)
+    await AgentExecutor(model, registry, tool_timeout=0.3).run(run)
     assert run.status == RunStatus.COMPLETED
     event = next(event for event in run.events if event.type == "tool.completed")
     report = event.payload["result"]["data"]
@@ -329,9 +330,9 @@ async def test_nested_timeout_keeps_page_evidence_in_real_agent_loop(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_report_records_real_nested_tools_and_model_choice(tmp_path: Path) -> None:
+async def test_report_records_real_nested_tools_and_model_choice(pg_url) -> None:
     memory = InMemorySpanExporter()
-    database = ObservabilityDatabase(tmp_path / "observability.db")
+    database = ObservabilityDatabase(pg_url)
     exporter = OpenTelemetryExporter(
         service_name="seo-agent", endpoint=None, span_exporter=memory, database=database
     )
@@ -356,10 +357,10 @@ async def test_report_records_real_nested_tools_and_model_choice(tmp_path: Path)
         ]
     )
     try:
-        await AgentLoop(
+        await AgentExecutor(
             model, registry, observer=AgentRunObserver(observer, operation_name="seo_agent.chat")
         ).run(run)
-        spans = await database.fetch_all("SELECT * FROM obs_spans")
+        spans = await database.fetch_all(select(SpanRow.__table__))
         names = {row["operation_name"] for row in spans}
         assert {
             "seo_site_diagnosis",
@@ -385,7 +386,7 @@ async def test_report_records_real_nested_tools_and_model_choice(tmp_path: Path)
         ):
             assert by_name[child]["parent_span_id"] == by_name[parent]["id"]
             assert by_name[child]["trace_id"] == by_name[parent]["trace_id"]
-        calls = await database.fetch_all("SELECT * FROM obs_model_calls")
+        calls = await database.fetch_all(select(ModelCallRow.__table__))
         assert "seo_site_diagnosis" in str(calls) and "诊断本站" in str(calls)
         assert "可用 SEO 数据工具" in str(calls)
     finally:

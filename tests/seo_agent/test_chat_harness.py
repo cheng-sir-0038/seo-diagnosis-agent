@@ -2,19 +2,27 @@ from __future__ import annotations
 
 import asyncio
 import json
-from pathlib import Path
 from typing import Any
 
 import pytest
 
-from src.agent.loop import AgentLoop
 from src.agent.models import AgentRun, RunStatus
 from src.agent.providers.base import ModelChunk, ToolCall
 from src.agent.providers.fake import FakeModelProvider
 from src.agent.run_manager import RunManager
+from src.agent.runtime.executor import AgentExecutor
 from src.agent.tools.base import AgentTool, ToolResult, ToolRuntimeContext
 from src.agent.tools.registry import ToolRegistry
 from src.seo_agent.db.database import SeoAgentDatabase
+from src.seo_agent.services.system import SeoAgentSystemService
+
+
+async def _create_site(database: SeoAgentDatabase) -> str:
+    site = await SeoAgentSystemService(database).create_site(
+        name="Demo", domain="example.com", default_country="US", default_language="en-US",
+        timezone="UTC",
+    )
+    return site["id"]
 
 
 class CountingTool(AgentTool):
@@ -49,30 +57,17 @@ class CountingTool(AgentTool):
 
 @pytest.mark.asyncio
 async def test_chat_harness_persists_task_thread_run_event_checkpoint_and_summary(
-    tmp_path: Path,
+    pg_url: str,
 ) -> None:
     from src.agent.harness.store import AgentChatHarnessStore
 
-    database = SeoAgentDatabase(tmp_path / "seo-agent.db")
+    database = SeoAgentDatabase(pg_url)
     await database.startup()
     store = AgentChatHarnessStore(database)
     try:
-        await database.execute(
-            "INSERT INTO sites(id, name, domain, default_country, default_language, timezone, "
-            "status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?)",
-            (
-                "site_1",
-                "Demo",
-                "example.com",
-                "US",
-                "en-US",
-                "UTC",
-                "2026-07-27T00:00:00Z",
-                "2026-07-27T00:00:00Z",
-            ),
-        )
+        site_id = await _create_site(database)
         created = await store.create_task_run(
-            site_id="site_1",
+            site_id=site_id,
             conversation_id="conversation_1",
             title="分析自然流量下降",
             user_intent="分析自然流量下降",
@@ -89,7 +84,7 @@ async def test_chat_harness_persists_task_thread_run_event_checkpoint_and_summar
             messages=[{"role": "user", "content": "分析自然流量下降"}],
             task_id=created.task_id,
             thread_id=created.thread_id,
-            site_id="site_1",
+            site_id=site_id,
             conversation_id="conversation_1",
         )
         run.status = RunStatus.RUNNING
@@ -113,35 +108,22 @@ async def test_chat_harness_persists_task_thread_run_event_checkpoint_and_summar
         assert detail["events"][0]["event_type"] == "stage.changed"
         assert detail["checkpoint"]["iteration"] == 0
         assert detail["checkpoint"]["survival_summary"]["objective"] == "分析自然流量下降"
-        assert len(await store.list_tasks(site_id="site_1", status_group="running")) == 1
+        assert len(await store.list_tasks(site_id=site_id, status_group="running")) == 1
     finally:
         await database.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_restart_resumes_after_completed_tool_without_repeating_it(tmp_path: Path) -> None:
+async def test_restart_resumes_after_completed_tool_without_repeating_it(pg_url: str) -> None:
     from src.agent.harness.persistence import StoreRunPersistence
     from src.agent.harness.store import AgentChatHarnessStore
 
-    database = SeoAgentDatabase(tmp_path / "seo-agent.db")
+    database = SeoAgentDatabase(pg_url)
     await database.startup()
     store = AgentChatHarnessStore(database)
-    await database.execute(
-        "INSERT INTO sites(id, name, domain, default_country, default_language, timezone, "
-        "status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?)",
-        (
-            "site_1",
-            "Demo",
-            "example.com",
-            "US",
-            "en-US",
-            "UTC",
-            "2026-07-27T00:00:00Z",
-            "2026-07-27T00:00:00Z",
-        ),
-    )
+    site_id = await _create_site(database)
     created = await store.create_task_run(
-        site_id="site_1",
+        site_id=site_id,
         conversation_id="conversation_1",
         title="恢复测试",
         user_intent="查询一次工具后继续",
@@ -157,7 +139,7 @@ async def test_restart_resumes_after_completed_tool_without_repeating_it(tmp_pat
         run_id=created.run_id,
         task_id=created.task_id,
         thread_id=created.thread_id,
-        site_id="site_1",
+        site_id=site_id,
         conversation_id="conversation_1",
     )
     first_provider = FakeModelProvider(
@@ -183,14 +165,14 @@ async def test_restart_resumes_after_completed_tool_without_repeating_it(tmp_pat
 
     persistence.save_checkpoint = pause_after_tool  # type: ignore[method-assign]
     first_task = asyncio.create_task(
-        AgentLoop(first_provider, registry, persistence=persistence).run(run)
+        AgentExecutor(first_provider, registry, persistence=persistence).run(run)
     )
     with pytest.raises(asyncio.CancelledError):
         await first_task
     assert tool.calls == 1
 
     await database.shutdown()
-    database = SeoAgentDatabase(tmp_path / "seo-agent.db")
+    database = SeoAgentDatabase(pg_url)
     await database.startup()
     store = AgentChatHarnessStore(database)
     restored = await store.restore_run(created.run_id)
@@ -201,7 +183,7 @@ async def test_restart_resumes_after_completed_tool_without_repeating_it(tmp_pat
     second_provider = FakeModelProvider(
         [[ModelChunk(text="基于已有工具结果完成。"), ModelChunk(finish_reason="stop")]]
     )
-    await AgentLoop(
+    await AgentExecutor(
         second_provider,
         registry,
         persistence=StoreRunPersistence(store),
@@ -293,15 +275,14 @@ def test_survival_summary_compacts_long_context_without_losing_current_turn() ->
 
 
 @pytest.mark.asyncio
-async def test_durable_chat_api_exposes_task_and_run_status(tmp_path: Path, monkeypatch) -> None:
+async def test_durable_chat_api_exposes_task_and_run_status(pg_url: str, monkeypatch) -> None:
     from httpx import ASGITransport, AsyncClient
 
     from src.agent.harness.store import AgentChatHarnessStore
-    from src.api.routes import seo_agent_chat as route
-    from src.seo_agent.services.system import SeoAgentSystemService
+    from src.api.routes.workspace import conversations as route
     from src.server import app
 
-    database = SeoAgentDatabase(tmp_path / "api-harness.db")
+    database = SeoAgentDatabase(pg_url)
     await database.startup()
     system = SeoAgentSystemService(database)
     site = await system.create_site(
@@ -315,7 +296,7 @@ async def test_durable_chat_api_exposes_task_and_run_status(tmp_path: Path, monk
     monkeypatch.setattr(route, "seo_agent_system_service", system)
     monkeypatch.setattr(route, "seo_chat_harness_store", store)
     monkeypatch.setattr(route, "configured_citation_client", lambda *_: None)
-    monkeypatch.setattr(route, "build_seo_model_provider", lambda: FakeModelProvider.text("完成"))
+    monkeypatch.setattr(route, "build_conversation_model", lambda: FakeModelProvider.text("完成"))
 
     class LiveFacade:
         def live_capabilities(self) -> set[Any]:
@@ -371,30 +352,17 @@ async def test_durable_chat_api_exposes_task_and_run_status(tmp_path: Path, monk
 
 
 @pytest.mark.asyncio
-async def test_recovery_service_loads_pending_runs_for_scheduler(tmp_path: Path) -> None:
+async def test_recovery_service_loads_pending_runs_for_scheduler(pg_url: str) -> None:
     from src.agent.harness.store import AgentChatHarnessStore
     from src.agent.run_manager import RunManager
     from src.seo_agent.chat.service import SeoChatRecoveryService
 
-    database = SeoAgentDatabase(tmp_path / "recover.db")
+    database = SeoAgentDatabase(pg_url)
     await database.startup()
-    await database.execute(
-        "INSERT INTO sites(id, name, domain, default_country, default_language, timezone, "
-        "status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?)",
-        (
-            "site_1",
-            "Demo",
-            "example.com",
-            "US",
-            "en-US",
-            "UTC",
-            "2026-07-27T00:00:00Z",
-            "2026-07-27T00:00:00Z",
-        ),
-    )
+    site_id = await _create_site(database)
     store = AgentChatHarnessStore(database)
     created = await store.create_task_run(
-        site_id="site_1",
+        site_id=site_id,
         conversation_id="conversation_1",
         title="待恢复",
         user_intent="待恢复",
@@ -419,28 +387,15 @@ async def test_recovery_service_loads_pending_runs_for_scheduler(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_store_does_not_persist_streaming_token_deltas(tmp_path: Path) -> None:
+async def test_store_does_not_persist_streaming_token_deltas(pg_url: str) -> None:
     from src.agent.harness.store import AgentChatHarnessStore
 
-    database = SeoAgentDatabase(tmp_path / "delta.db")
+    database = SeoAgentDatabase(pg_url)
     await database.startup()
-    await database.execute(
-        "INSERT INTO sites(id, name, domain, default_country, default_language, timezone, "
-        "status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?)",
-        (
-            "site_1",
-            "Demo",
-            "example.com",
-            "US",
-            "en-US",
-            "UTC",
-            "2026-07-27T00:00:00Z",
-            "2026-07-27T00:00:00Z",
-        ),
-    )
+    site_id = await _create_site(database)
     store = AgentChatHarnessStore(database)
     created = await store.create_task_run(
-        site_id="site_1",
+        site_id=site_id,
         conversation_id="conversation_1",
         title="delta",
         user_intent="delta",
@@ -453,22 +408,59 @@ async def test_store_does_not_persist_streaming_token_deltas(tmp_path: Path) -> 
         messages=[{"role": "user", "content": "delta"}],
         task_id=created.task_id,
         thread_id=created.thread_id,
-        site_id="site_1",
+        site_id=site_id,
     )
     await store.persist_event(run, run.emit("message.delta", {"delta": "一"}))
     await store.persist_event(run, run.emit("message.completed", {"content": "一"}))
 
-    rows = await database.fetch_all(
-        "SELECT event_type FROM agent_run_events WHERE agent_run_id = ? ORDER BY sequence",
-        (created.run_id,),
-    )
-    assert [row["event_type"] for row in rows] == ["message.completed"]
+    detail = await store.get_run(created.run_id)
+    assert [event["event_type"] for event in detail["events"]] == ["message.completed"]
     await database.shutdown()
 
 
 @pytest.mark.asyncio
+async def test_concurrent_resume_requests_schedule_only_one_retry(pg_url: str, monkeypatch) -> None:
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+
+    from src.agent.harness.store import AgentChatHarnessStore
+    from src.api.routes.workspace import conversations as chat
+
+    database = SeoAgentDatabase(pg_url)
+    await database.startup()
+    try:
+        store = AgentChatHarnessStore(database)
+        created = await store.create_task_run(
+            conversation_id="retry",
+            title="检查首页",
+            user_intent="检查首页",
+            messages=[{"role": "user", "content": "检查首页"}],
+            model_name="test",
+            model_provider="test",
+        )
+        await store.mark_recovery_blocked(created.run_id, "测试依赖暂不可用")
+        scheduled = []
+
+        async def record_schedule(run: AgentRun) -> None:
+            scheduled.append(run.id)
+
+        monkeypatch.setattr(chat, "seo_chat_harness_store", store)
+        monkeypatch.setattr(chat, "run_manager", RunManager())
+        monkeypatch.setattr(chat, "_schedule_restored_run", record_schedule)
+        app = FastAPI()
+        app.include_router(chat.router, prefix="/api/v1")
+        path = f"/api/v1/chat/runs/{created.run_id}/resume"
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            first, second = await asyncio.gather(client.post(path), client.post(path))
+            assert sorted([first.status_code, second.status_code]) == [200, 409]
+            assert scheduled == [created.run_id]
+    finally:
+        await database.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_concurrent_event_streams_receive_the_same_live_events(monkeypatch) -> None:
-    from src.api.routes import seo_agent_chat as route
+    from src.api.routes.workspace import conversations as route
 
     manager = RunManager()
     monkeypatch.setattr(route, "run_manager", manager)
@@ -503,7 +495,7 @@ async def test_event_stream_reconnect_replays_only_stable_events_after_cursor() 
     from datetime import UTC, datetime
 
     from src.agent.models import AgentEvent
-    from src.api.routes import seo_agent_chat as route
+    from src.api.routes.workspace import conversations as route
 
     run_id = "run_reconnect_cursor"
     run = AgentRun(
@@ -581,7 +573,7 @@ async def test_events_endpoint_accepts_last_event_id_header() -> None:
     from httpx import ASGITransport, AsyncClient
 
     from src.agent.models import AgentEvent
-    from src.api.routes import seo_agent_chat as route
+    from src.api.routes.workspace import conversations as route
     from src.server import app
 
     run_id = "run_last_event_header"

@@ -6,10 +6,16 @@ from datetime import UTC, datetime
 from typing import Protocol
 
 from pydantic import BaseModel, Field
+from sqlalchemy import func, select, update
 
 from src.observability.client import ObservabilityClient
 from src.observability.models import SpanKind
 from src.seo_agent.db.database import SeoAgentDatabase
+from src.seo_agent.db.models import (
+    MonitoringCheckRow,
+    MonitoringPlanRow,
+    PublishRecordRow,
+)
 from src.seo_agent.monitoring.service import MonitoringService
 
 
@@ -274,12 +280,15 @@ class MonitoringExecutionService:
 
     async def _get_context(self, check_id: str, *, expected_type: str) -> dict:
         row = await self.database.fetch_one(
-            "SELECT c.*, p.publish_record_id, p.origin_trace_id, r.published_url "
-            "FROM monitoring_checks c "
-            "JOIN monitoring_plans p ON p.id = c.monitoring_plan_id "
-            "JOIN publish_records r ON r.id = p.publish_record_id "
-            "WHERE c.id = ?",
-            (check_id,),
+            select(
+                MonitoringCheckRow.__table__,
+                MonitoringPlanRow.publish_record_id,
+                MonitoringPlanRow.origin_trace_id,
+                PublishRecordRow.published_url,
+            )
+            .join(MonitoringPlanRow, MonitoringPlanRow.id == MonitoringCheckRow.monitoring_plan_id)
+            .join(PublishRecordRow, PublishRecordRow.id == MonitoringPlanRow.publish_record_id)
+            .where(MonitoringCheckRow.id == check_id)
         )
         if row is None:
             raise KeyError(f"监控检查不存在: {check_id}")
@@ -292,9 +301,13 @@ class MonitoringExecutionService:
     async def _start_check(self, check_id: str, trace_id: str) -> None:
         now = datetime.now(UTC).isoformat()
         await self.database.execute(
-            "UPDATE monitoring_checks SET status = 'RUNNING', "
-            "started_at = COALESCE(started_at, ?), trace_id = ? WHERE id = ?",
-            (now, trace_id, check_id),
+            update(MonitoringCheckRow)
+            .where(MonitoringCheckRow.id == check_id)
+            .values(
+                status="RUNNING",
+                started_at=func.coalesce(MonitoringCheckRow.started_at, now),
+                trace_id=trace_id,
+            )
         )
 
     async def _link_origin(self, context: dict, trace_id: str, check_id: str) -> None:
@@ -314,7 +327,11 @@ class MonitoringExecutionService:
 
     async def _fail_check(self, check_id: str, exc: Exception) -> None:
         await self.database.execute(
-            "UPDATE monitoring_checks SET status = 'FAILED', completed_at = ?, "
-            "error_code = ? WHERE id = ?",
-            (datetime.now(UTC).isoformat(), type(exc).__name__, check_id),
+            update(MonitoringCheckRow)
+            .where(MonitoringCheckRow.id == check_id)
+            .values(
+                status="FAILED",
+                completed_at=datetime.now(UTC).isoformat(),
+                error_code=type(exc).__name__,
+            )
         )

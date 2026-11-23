@@ -58,12 +58,6 @@ from src.api.routes.promptops import router as promptops_router
 from src.api.routes.query import router as query_router
 from src.api.routes.seo_agent_approvals import router as seo_agent_approval_router
 from src.api.routes.seo_agent_automation import router as seo_agent_automation_router
-from src.api.routes.seo_agent_chat import (
-    recover_active_seo_chat_runs,
-)
-from src.api.routes.seo_agent_chat import (
-    router as seo_agent_chat_router,
-)
 from src.api.routes.seo_agent_monitoring import router as seo_agent_monitoring_router
 from src.api.routes.seo_agent_notifications import router as seo_agent_notification_router
 from src.api.routes.seo_agent_opportunities import router as seo_agent_opportunity_router
@@ -72,10 +66,18 @@ from src.api.routes.seo_agent_schedules import router as seo_agent_schedule_rout
 from src.api.routes.seo_agent_system import router as seo_agent_system_router
 from src.api.routes.seo_agent_tasks import router as seo_agent_task_router
 from src.api.routes.seo_agent_workbench import router as seo_agent_workbench_router
+from src.api.routes.workspace.conversations import (
+    recover_active_conversations,
+    site_chat_router,
+)
+from src.api.routes.workspace.conversations import (
+    router as conversation_router,
+)
 from src.core.cache import cache_manager
 from src.core.config import settings
 from src.core.exceptions import ErrorResponse, InternalAdapterError, to_error_response
 from src.facade.data_facade import facade
+from src.healthcare_agent.postgraduate import seed_postgraduate_corpus
 from src.observability.runtime import observability_client
 from src.promptops.runtime import prompt_registry
 from src.seo_agent.runtime import (
@@ -99,7 +101,7 @@ async def lifespan(app: FastAPI):
 
     Startup:
       1. 配置日志
-      2. 初始化缓存管理器（Redis + SQLite）
+      2. 初始化进程内缓存与 PostgreSQL 证据存储
       3. 初始化 Facade（加载所有 Provider）
 
     Shutdown:
@@ -125,11 +127,12 @@ async def lifespan(app: FastAPI):
 
     # 初始化 SEO Agent 业务库与 LangGraph Checkpointer
     await seo_agent_database.startup()
+    await seed_postgraduate_corpus(seo_agent_database)
     await checkpoint_manager.startup()
     await notification_service.seed_event_types()
-    recovery = await recover_active_seo_chat_runs()
+    recovery = await recover_active_conversations()
     logger.info(
-        "SEO Chat 恢复完成 | recovered={} | blocked={}",
+        "业务会话恢复完成 | recovered={} | blocked={}",
         recovery["recovered"],
         recovery["blocked"],
     )
@@ -167,15 +170,15 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=settings.project_name,
     description="""
-    ## SEO 诊断 Agent
+    ## 多 Agent 业务工作台
 
-    提供 SEO Chat、只读工具调用、审批工作流，以及多数据源的统一查询接口。
+    通过主 Agent 调度 SEO/GEO 和医药业务，提供流式对话、网站诊断和业务审批。
 
     ### 核心特性
     - **SEO Chat**: Agent 自主选择只读工具并通过 SSE 返回运行过程
     - **统一查询**: `POST /api/v1/query` 路由到可用的数据源
     - **统一数据模型**: 按能力整理不同数据来源的结果
-    - **缓存 + 快照**: 进程内 TTL 缓存和 SQLite 快照已实现，Redis 未接入
+    - **缓存 + 快照**: 进程内 TTL 缓存和 PostgreSQL 快照已实现，Redis 未接入
     - **标准错误响应**: 对内异常消毒后再对外暴露
 
     ### 当前注册的数据源
@@ -300,6 +303,7 @@ def _get_http_status(error_code: str) -> int:
 
 app.include_router(query_router, prefix="/api/v1")
 app.include_router(agent_router, prefix="/api/v1")
+app.include_router(conversation_router, prefix="/api/v1")
 app.include_router(observability_router, prefix="/api/v1")
 app.include_router(promptops_router, prefix="/api/v1")
 app.include_router(seo_agent_system_router, prefix="/api/v1")
@@ -312,7 +316,7 @@ app.include_router(seo_agent_monitoring_router, prefix="/api/v1")
 app.include_router(seo_agent_opportunity_router, prefix="/api/v1")
 app.include_router(seo_agent_workbench_router, prefix="/api/v1")
 app.include_router(seo_agent_automation_router, prefix="/api/v1")
-app.include_router(seo_agent_chat_router, prefix="/api/v1")
+app.include_router(site_chat_router, prefix="/api/v1")
 
 
 # ============================================================

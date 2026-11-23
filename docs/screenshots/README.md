@@ -118,11 +118,20 @@
 ## 对话与人工补充
 
 <details>
-<summary>对话入口：从业务问题开始</summary>
+<summary>业务会话：直接提问</summary>
 
-入口提供页面体检、关键词机会和页面建议等自然语言示例，点击后填入输入框，由用户发送。
+新会话可直接提问。示例涵盖考研、医保药品目录、PubMed、医考报名、页面检查和网页与考纲联查。侧栏的「专员与工具」显示已注册能力。
 
-![自然语言对话入口](01-chat-overview.png)
+![新版工作台首页](01-chat-overview.png)
+
+</details>
+
+<details>
+<summary>双专员实跑：用考纲核对公开网页</summary>
+
+医药专员取得考纲公告原文，SEO/GEO 专员读取湖北考区公告。对话保留了提问、Skill、交接顺序和核对结论。
+
+![双专员实际对话与两份来源](24-healthcare-seo-handoff.png)
 
 </details>
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import func, select
 
 from src.core.cache import CacheManager
 from src.core.exceptions import InternalProviderRequestError
@@ -63,8 +64,8 @@ class PageSource:
 
 
 @pytest.fixture
-async def review(tmp_path):
-    snapshots = CacheManager(tmp_path / "evidence.db")
+async def review(pg_url):
+    snapshots = CacheManager(pg_url)
     await snapshots.startup()
     source = PageSource()
     try:
@@ -188,16 +189,9 @@ async def test_invalid_baseline_is_rejected_before_fetch(review, problem):
     key = await snapshots.save_snapshot(
         "bad-baseline",
         "page_metadata",
-        {**raw, "meta": {}} if problem == "malformed_meta" else raw,
+        raw,
         "page_html",
     )
-    if problem == "malformed_meta":
-        import json
-
-        await snapshots._db.execute(
-            "UPDATE evidence_snapshots SET data_json=? WHERE id=?", (json.dumps(raw), key)
-        )
-        await snapshots._db.commit()
     with pytest.raises(ValueError):
         await tool.execute({"baseline_snapshot_id": key, **args})
     assert len(source.calls) == 1
@@ -258,7 +252,7 @@ async def test_missing_baseline_and_unsupported_actions_fail_before_network(revi
 
 @pytest.mark.asyncio
 async def test_review_chat_api_runs_registered_workflow_and_records_correlated_steps(
-    review, tmp_path, monkeypatch
+    review, pg_url, monkeypatch
 ):
     import json
 
@@ -270,15 +264,16 @@ async def test_review_chat_api_runs_registered_workflow_and_records_correlated_s
     from src.agent.providers.base import ModelChunk, ToolCall
     from src.agent.providers.fake import FakeModelProvider
     from src.agent.run_manager import RunManager
-    from src.api.routes import seo_agent_chat
+    from src.api.routes.workspace import conversations
     from src.observability.client import ObservabilityClient
     from src.observability.exporters import OpenTelemetryExporter
     from src.observability.storage import ObservabilityDatabase
     from src.seo_agent.db.database import SeoAgentDatabase
+    from src.seo_agent.db.models import ROWS
     from src.seo_agent.services.system import SeoAgentSystemService
 
     source, snapshots, _ = review
-    db = SeoAgentDatabase(tmp_path / "chat.db")
+    db = SeoAgentDatabase(pg_url)
     await db.startup()
     system = SeoAgentSystemService(db)
     site = await system.create_site(
@@ -294,7 +289,7 @@ async def test_review_chat_api_runs_registered_workflow_and_records_correlated_s
         .execute({"action": "capture_baseline"})
     )
     source.transport.html = "<title>After</title><h1>After</h1>"
-    observations = ObservabilityDatabase(tmp_path / "observations.db")
+    observations = ObservabilityDatabase(pg_url)
     memory = InMemorySpanExporter()
     exporter = OpenTelemetryExporter(
         service_name="test", endpoint=None, span_exporter=memory, database=observations
@@ -333,11 +328,11 @@ async def test_review_chat_api_runs_registered_workflow_and_records_correlated_s
         "run_manager": manager,
         "observability_client": observer,
         "observability_database": observations,
-        "build_seo_model_provider": lambda: model,
+        "build_conversation_model": lambda: model,
     }.items():
-        monkeypatch.setattr(seo_agent_chat, name, value)
+        monkeypatch.setattr(conversations, name, value)
     app = FastAPI()
-    app.include_router(seo_agent_chat.router, prefix="/api/v1")
+    app.include_router(conversations.site_chat_router, prefix="/api/v1")
     try:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.post(
@@ -357,9 +352,10 @@ async def test_review_chat_api_runs_registered_workflow_and_records_correlated_s
             completed = next(item for item in payloads if item["type"] == "tool.completed")
             assert completed["payload"]["render_hint"] == "cards"
             assert completed["payload"]["result"]["data"]["review_status"] == "passed"
-        traces = await observations.fetch_all("SELECT * FROM obs_traces")
-        spans = await observations.fetch_all("SELECT * FROM obs_spans")
+        traces = await observer.list_traces()
         assert len(traces) == 1
+        detail = await observer.get_trace(traces[0]["id"])
+        spans = [span for run in detail["runs"] for span in run["spans"]]
         assert {row["operation_name"] for row in spans} >= {
             "seo_page_change_review",
             "load_page_review_baseline",
@@ -374,7 +370,7 @@ async def test_review_chat_api_runs_registered_workflow_and_records_correlated_s
         )
         assert "passed" in comparison.attributes["langfuse.observation.output"]
         for table in ("approval_actions", "execution_tasks", "publish_records"):
-            assert await db.fetch_value(f"SELECT COUNT(*) FROM {table}") == 0
+            assert await db.fetch_value(select(func.count()).select_from(ROWS[table])) == 0
     finally:
         await manager.shutdown()
         await observer.shutdown()

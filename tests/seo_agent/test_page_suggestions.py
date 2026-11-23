@@ -5,11 +5,14 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import func, select
 
 from src.models.common import Capability
+from src.observability.schema import ModelCallRow, SpanRow, TraceRow
 from src.providers.page_metadata.client import FetchedHtmlPage
 from src.providers.page_metadata.provider import PageMetadataProvider
 from src.seo_agent.chat.tools import build_seo_agent_registry
+from src.seo_agent.db.models import TABLES
 from src.seo_agent.workflows.structured_model import StructuredModelRunner
 
 SITE = {"id": "site-suggest", "domain": "example.com"}
@@ -289,7 +292,7 @@ def test_registry_requires_both_page_data_and_model_runner():
 
 @pytest.mark.asyncio
 async def test_chat_sse_followup_and_restored_run_keep_user_facts_and_observation_tree(
-    tmp_path, monkeypatch
+    pg_url, monkeypatch
 ):
     from fastapi import FastAPI
     from httpx import ASGITransport, AsyncClient
@@ -299,14 +302,14 @@ async def test_chat_sse_followup_and_restored_run_keep_user_facts_and_observatio
     from src.agent.providers.base import ModelChunk, ToolCall
     from src.agent.providers.fake import FakeModelProvider
     from src.agent.run_manager import RunManager
-    from src.api.routes import seo_agent_chat
+    from src.api.routes.workspace import conversations
     from src.observability.client import ObservabilityClient
     from src.observability.exporters import OpenTelemetryExporter
     from src.observability.storage import ObservabilityDatabase
     from src.seo_agent.db.database import SeoAgentDatabase
     from src.seo_agent.services.system import SeoAgentSystemService
 
-    db = SeoAgentDatabase(tmp_path / "business.db")
+    db = SeoAgentDatabase(pg_url)
     await db.startup()
     system = SeoAgentSystemService(db)
     site = await system.create_site(
@@ -316,7 +319,7 @@ async def test_chat_sse_followup_and_restored_run_keep_user_facts_and_observatio
         default_language="en",
         timezone="UTC",
     )
-    observations = ObservabilityDatabase(tmp_path / "observations.db")
+    observations = ObservabilityDatabase(pg_url)
     memory = InMemorySpanExporter()
     exporter = OpenTelemetryExporter(
         service_name="test", endpoint=None, span_exporter=memory, database=observations
@@ -356,12 +359,12 @@ async def test_chat_sse_followup_and_restored_run_keep_user_facts_and_observatio
         "run_manager": manager,
         "observability_client": observer,
         "observability_database": observations,
-        "build_seo_model_provider": chat_model,
+        "build_conversation_model": chat_model,
         "structured_model_automation": SimpleNamespace(model_runner=runner),
     }.items():
-        monkeypatch.setattr(seo_agent_chat, name, value)
+        monkeypatch.setattr(conversations, name, value)
     app = FastAPI()
-    app.include_router(seo_agent_chat.router, prefix="/api/v1")
+    app.include_router(conversations.site_chat_router, prefix="/api/v1")
     messages = [{"role": "user", "content": "请根据当前页面内容给我一份 SEO 信息建议。"}]
     try:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -387,13 +390,13 @@ async def test_chat_sse_followup_and_restored_run_keep_user_facts_and_observatio
             request_id = waiting["payload"]["request_id"]
             assert manager.get(run_id).status.value == "waiting_for_input"
             assert len(model.contexts) == 1 and len(source.calls) == 1
-            assert run_id not in await seo_agent_chat.seo_chat_harness_store.list_recoverable_runs()
+            assert run_id not in await conversations.seo_chat_harness_store.list_recoverable_runs()
             assert (
                 await client.post(f"/api/v1/seo-agent/chat/runs/{run_id}/resume")
             ).status_code == 409
             await manager.shutdown()
             manager = RunManager()
-            monkeypatch.setattr(seo_agent_chat, "run_manager", manager)
+            monkeypatch.setattr(conversations, "run_manager", manager)
             assert (await client.get(f"/api/v1/seo-agent/chat/runs/{run_id}")).json()[
                 "status"
             ] == "WAITING_FOR_INPUT"
@@ -404,20 +407,24 @@ async def test_chat_sse_followup_and_restored_run_keep_user_facts_and_observatio
             assert (
                 await client.post(endpoint, json={"request_id": request_id, "answer": "  "})
             ).status_code == 422
-            original_save = AgentChatHarnessStore.save_checkpoint
+            from sqlalchemy import event
 
-            async def fail_input_save(self, run, **kwargs):
-                if kwargs.get("stage") == "input_submitted":
+            from src.seo_agent.db.models import AgentRunCheckpointRow
+
+            def fail_input_save(mapper, connection, checkpoint):
+                if checkpoint.stage == "input_submitted":
                     raise RuntimeError("checkpoint fixture failure")
-                return await original_save(self, run, **kwargs)
 
-            monkeypatch.setattr(AgentChatHarnessStore, "save_checkpoint", fail_input_save)
-            with pytest.raises(RuntimeError, match="checkpoint fixture failure"):
-                await client.post(
-                    endpoint, json={"request_id": request_id, "answer": "这里汇总野外观察笔记。"}
-                )
-            monkeypatch.setattr(AgentChatHarnessStore, "save_checkpoint", original_save)
-            saved = await seo_agent_chat.seo_chat_harness_store.get_run(run_id)
+            event.listen(AgentRunCheckpointRow, "before_insert", fail_input_save)
+            try:
+                with pytest.raises(RuntimeError, match="checkpoint fixture failure"):
+                    await client.post(
+                        endpoint,
+                        json={"request_id": request_id, "answer": "这里汇总野外观察笔记。"},
+                    )
+            finally:
+                event.remove(AgentRunCheckpointRow, "before_insert", fail_input_save)
+            saved = await conversations.seo_chat_harness_store.get_run(run_id)
             assert saved["status"] == "WAITING_FOR_INPUT"
             assert not any(item["event_type"] == "input.submitted" for item in saved["events"])
             model.output = draft("CollectionPage")
@@ -455,7 +462,12 @@ async def test_chat_sse_followup_and_restored_run_keep_user_facts_and_observatio
             assert (
                 await client.post(endpoint, json={**answer, "answer": "different"})
             ).status_code == 409
-            assert await db.fetch_value("SELECT COUNT(*) FROM agent_runtime_tasks") == 1
+            assert (
+                await db.fetch_value(
+                    select(func.count()).select_from(TABLES["agent_runtime_tasks"])
+                )
+                == 1
+            )
             messages.append({"role": "user", "content": answer["answer"]})
             assert model.contexts[-1]["page"]["user_supplied"] == [
                 message["content"] for message in messages if message["role"] == "user"
@@ -466,11 +478,11 @@ async def test_chat_sse_followup_and_restored_run_keep_user_facts_and_observatio
             async def restored_execute(run_id, provider, registry, conversation_id):
                 captured.extend(registry.get("seo_page_suggestions").user_messages)
 
-            monkeypatch.setattr(seo_agent_chat, "_execute", restored_execute)
-            await seo_agent_chat._schedule_restored_run(restored)
+            monkeypatch.setattr(conversations, "_execute", restored_execute)
+            await conversations._schedule_restored_run(restored)
             await restored.task
             assert captured == model.contexts[-1]["page"]["user_supplied"]
-            pending = await seo_agent_chat.seo_chat_harness_store.restore_run(
+            pending = await conversations.seo_chat_harness_store.restore_run(
                 run_id, mark_recovering=False
             )
             from src.agent.models import HumanInputState, RunStatus
@@ -483,7 +495,7 @@ async def test_chat_sse_followup_and_restored_run_keep_user_facts_and_observatio
                 tool_arguments={},
                 tool_result={},
             )
-            await seo_agent_chat.seo_chat_harness_store.save_checkpoint(
+            await conversations.seo_chat_harness_store.save_checkpoint(
                 pending,
                 messages=pending.messages,
                 iteration=pending.iteration,
@@ -493,15 +505,15 @@ async def test_chat_sse_followup_and_restored_run_keep_user_facts_and_observatio
                 token_usage=pending.token_usage,
             )
             manager = RunManager()
-            monkeypatch.setattr(seo_agent_chat, "run_manager", manager)
+            monkeypatch.setattr(conversations, "run_manager", manager)
             cancelled = await client.post(f"/api/v1/seo-agent/chat/runs/{run_id}/cancel")
             assert cancelled.status_code == 200 and cancelled.json()["status"] == "cancelled"
             assert (
                 await client.post(endpoint, json={"request_id": "cancel-pending", "answer": "late"})
             ).status_code == 409
-        traces = await observations.fetch_all("SELECT * FROM obs_traces")
+        traces = await observations.fetch_all(select(TraceRow.__table__))
         assert len(traces) == 2
-        spans = await observations.fetch_all("SELECT * FROM obs_spans")
+        spans = await observations.fetch_all(select(SpanRow.__table__))
         for trace in traces:
             names = {row["operation_name"] for row in spans if row["trace_id"] == trace["id"]}
             assert {
@@ -517,7 +529,7 @@ async def test_chat_sse_followup_and_restored_run_keep_user_facts_and_observatio
             "human_input_received",
         } <= names
         calls = await observations.fetch_all(
-            "SELECT * FROM obs_model_calls WHERE prompt_key='seo.page.suggestions'"
+            select(ModelCallRow.__table__).where(ModelCallRow.prompt_key == 'seo.page.suggestions')
         )
         assert len(calls) == 2
         assert "这里汇总野外观察笔记" in calls[1]["input_summary_json"]
@@ -528,7 +540,7 @@ async def test_chat_sse_followup_and_restored_run_keep_user_facts_and_observatio
         assert all(span.parent is not None for span in validated)
         assert "CollectionPage" in validated[-1].attributes["langfuse.observation.output"]
         for table in ("approval_actions", "execution_tasks", "publish_records"):
-            assert await db.fetch_value(f"SELECT COUNT(*) FROM {table}") == 0
+            assert await db.fetch_value(select(func.count()).select_from(TABLES[table])) == 0
     finally:
         await manager.shutdown()
         await observer.shutdown()
@@ -537,7 +549,7 @@ async def test_chat_sse_followup_and_restored_run_keep_user_facts_and_observatio
 
 @pytest.mark.asyncio
 async def test_json_schema_requires_an_object_and_failure_observations_keep_response_and_tokens(
-    tmp_path,
+    pg_url,
 ):
     from langchain_core.messages import AIMessage
 
@@ -552,7 +564,7 @@ async def test_json_schema_requires_an_object_and_failure_observations_keep_resp
         "/PageSuggestionEvidence"
     )
     observer = ObservabilityClient(
-        ObservabilityDatabase(tmp_path / "observations.db"), project_key="test"
+        ObservabilityDatabase(pg_url), project_key="test"
     )
     await observer.startup()
     raw = AIMessage(
@@ -580,7 +592,7 @@ async def test_json_schema_requires_an_object_and_failure_observations_keep_resp
                 operation="test",
                 business_object={},
             )
-        call = await observer.database.fetch_one("SELECT * FROM obs_model_calls")
+        call = await observer.database.fetch_one(select(ModelCallRow.__table__))
         assert call["status"] == "FAILED" and call["total_tokens"] == 25
         assert "invalid-json" in call["output_summary_json"]
     finally:

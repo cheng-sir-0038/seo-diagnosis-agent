@@ -5,10 +5,10 @@ import json
 
 import pytest
 
-from src.agent.loop import AgentLoop
 from src.agent.providers.base import ModelChunk, ToolCall
 from src.agent.providers.fake import FakeModelProvider
 from src.agent.run_manager import RunManager
+from src.agent.runtime.executor import AgentExecutor
 from src.agent.tools.base import ToolResult
 from src.agent.tools.registry import ToolRegistry
 from src.core.exceptions import (
@@ -62,7 +62,7 @@ class RecordingModel(FakeModelProvider):
 async def test_error_code_reaches_model_and_matches_runtime_event(failure, code):
     model = RecordingModel()
     run = RunManager().create_run([{"role": "user", "content": "检查数据"}])
-    await AgentLoop(model, ToolRegistry([FailingTool(failure)]), max_iterations=3).run(run)
+    await AgentExecutor(model, ToolRegistry([FailingTool(failure)]), max_iterations=3).run(run)
     message = next(item for item in model.inputs[1] if item["role"] == "tool")
     payload = json.loads(message["content"])
     assert payload["success"] is False
@@ -78,7 +78,7 @@ async def test_explicit_tool_failure_keeps_its_error_code():
     model = RecordingModel()
     run = RunManager().create_run([{"role": "user", "content": "检查数据"}])
     result = ToolResult(success=False, error="本次没有数据", error_code="DATA_NOT_AVAILABLE")
-    await AgentLoop(model, ToolRegistry([FailingTool(result)]), max_iterations=3).run(run)
+    await AgentExecutor(model, ToolRegistry([FailingTool(result)]), max_iterations=3).run(run)
     event = next(event for event in run.events if event.type == "tool.failed")
     assert event.payload["result"]["error_code"] == "DATA_NOT_AVAILABLE"
     assert event.payload["error_code"] == "DATA_NOT_AVAILABLE"

@@ -402,7 +402,7 @@ class SeoFacadeTool(AgentTool):
         params = self._params(arguments)
         response = await self.facade.query_live(
             capability=self.definition.capability,
-            site_id=str(self.site["domain"]),
+            site_id=self.site.get("domain"),
             params=params,
             force_refresh=bool(arguments.get("force_refresh", False)),
             task_id=runtime.task_id if runtime else None,
@@ -468,7 +468,9 @@ class SeoFacadeTool(AgentTool):
         site_domain = _hostname(str(self.site.get("domain") or ""))
         if not site_domain:
             raise ValueError("当前站点域名无效，无法检查页面元信息")
-        target_url = _normalize_target_url(str(params.get("url") or f"https://{site_domain}/"))
+        target_url = _normalize_target_url(str(
+            params.get("url") or self.site.get("target_url") or f"https://{site_domain}/"
+        ))
         if _hostname(target_url) != site_domain:
             raise ValueError("页面元信息只允许检查当前站点域名下的页面")
         return {"url": target_url}
@@ -477,7 +479,9 @@ class SeoFacadeTool(AgentTool):
         site_domain = _hostname(str(self.site.get("domain") or ""))
         if not site_domain:
             raise ValueError("当前站点域名无效，无法执行 PageSpeed 检测")
-        target_url = _normalize_target_url(str(params.get("url") or f"https://{site_domain}/"))
+        target_url = _normalize_target_url(str(
+            params.get("url") or self.site.get("target_url") or f"https://{site_domain}/"
+        ))
         if _hostname(target_url) != site_domain:
             raise ValueError("PageSpeed 只允许检测当前站点域名下的页面")
 
@@ -531,6 +535,11 @@ def build_seo_agent_registry(
     geo_citation_client: GeoCitationClient | None = None,
 ) -> ToolRegistry:
     live_capabilities = facade.live_capabilities()
+    if not site.get("domain"):
+        live_capabilities = live_capabilities & {
+            Capability.SERP_OVERVIEW, Capability.AUTOCOMPLETE, Capability.KEYWORD_OVERVIEW,
+            Capability.NEWS_SEARCH, Capability.IMAGE_SEARCH,
+        }
     if (
         Capability.ORGANIC_KEYWORDS in live_capabilities
         and user_messages
@@ -575,7 +584,7 @@ def build_seo_agent_registry(
         researcher = GeoQuestionWorkflow(tools, model_runner, geo_timeout, observability)
         registry.register(researcher)
         tools = {**tools, researcher.name: researcher}
-    if geo_citation_client is not None:
+    if geo_citation_client is not None and site.get("domain"):
         verifier = GeoCitationWorkflow(
             geo_citation_client, _hostname(str(site["domain"])), geo_timeout,
         )
@@ -594,7 +603,7 @@ def build_seo_agent_registry(
         registry.register(SearchDiagnosisWorkflow(
             dict(tools), settings.agent_tool_timeout, observability=observability,
         ))
-    if getattr(facade, "semrush_available", False):
+    if site.get("domain") and getattr(facade, "semrush_available", False):
         semrush_tools = {
             definition.name: SeoFacadeTool(facade, site, definition, use_semrush=True)
             for definition in SEO_TOOL_DEFINITIONS if definition.capability in {
@@ -626,7 +635,8 @@ def build_seo_agent_registry(
             ))
             steps[resource.name] = resource
         registry.register(SiteDiagnosisWorkflow(
-            steps, settings.agent_tool_timeout, site_domain=str(site["domain"]),
+            steps, settings.agent_tool_timeout,
+            site_domain=str(site.get("target_url") or site["domain"]),
             observability=observability,
         ))
     return registry

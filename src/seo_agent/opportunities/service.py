@@ -1,17 +1,34 @@
 from __future__ import annotations
 
-# ruff: noqa: E501
 import json
 import uuid
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
 
-import aiosqlite
+from sqlalchemy import case, func, insert, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.seo_agent.approvals.policy import ActionPolicy
 from src.seo_agent.approvals.service import ApprovalService
 from src.seo_agent.db.database import SeoAgentDatabase
+from src.seo_agent.db.models import (
+    ApprovalActionRow,
+    CompetitorPageRow,
+    ExecutionTaskRow,
+    KeywordRow,
+    OpportunityCompetitorPageRow,
+    OpportunityKeywordRow,
+    OpportunityObservationEvidenceRow,
+    OpportunityObservationRow,
+    OpportunityRow,
+    OpportunityStatusHistoryRow,
+    ScheduleRunRow,
+    SiteRow,
+    TaskOpportunityRow,
+    WorkRecordRow,
+    WorkScheduleRow,
+)
 from src.seo_agent.notifications.service import NotificationService
 from src.seo_agent.opportunities.models import OpportunityCandidate
 from src.seo_agent.opportunities.normalizer import OpportunityCandidateNormalizer
@@ -27,6 +44,10 @@ def _id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
 
 
+class OpportunityRequestConflictError(ValueError):
+    """An idempotency key already belongs to another scan or ingestion request."""
+
+
 class ScanRunService:
     def __init__(self, database: SeoAgentDatabase) -> None:
         self.database = database
@@ -39,108 +60,77 @@ class ScanRunService:
         idempotency_key: str,
         scheduled_at: str | None = None,
     ) -> dict[str, Any]:
-        existing_key = await self.database.fetch_one(
-            "SELECT * FROM schedule_runs WHERE idempotency_key = ?", (idempotency_key,)
-        )
-        if existing_key is not None:
-            return existing_key
-        running = await self.database.fetch_one(
-            "SELECT * FROM schedule_runs WHERE schedule_id = ? AND status = 'RUNNING' "
-            "ORDER BY started_at DESC LIMIT 1",
-            (schedule_id,),
-        )
-        if running is not None:
-            if trigger_type.upper() == "MANUAL":
-                return running
-            return await self._record_skipped(
-                schedule_id=schedule_id,
-                trigger_type=trigger_type,
-                idempotency_key=idempotency_key,
-                existing_run_id=running["id"],
-                scheduled_at=scheduled_at,
+        trigger = trigger_type.upper()
+        async with self.database.transaction() as tx:
+            # Serialize starts for this schedule, including runs skipped during an overlap.
+            schedule = await tx.fetch_value(
+                select(WorkScheduleRow.id)
+                .where(WorkScheduleRow.id == schedule_id)
+                .with_for_update()
             )
-        run_id = _id("scan")
-        now = _now()
-        try:
-            await self.database.execute(
-                "INSERT INTO schedule_runs(id, schedule_id, trigger_type, scheduled_at, started_at, "
-                "status, idempotency_key, created_at) VALUES (?, ?, ?, ?, ?, 'RUNNING', ?, ?)",
-                (
-                    run_id,
-                    schedule_id,
-                    trigger_type.upper(),
-                    scheduled_at,
-                    now,
-                    idempotency_key,
-                    now,
-                ),
+            if schedule is None:
+                raise KeyError(f"计划不存在: {schedule_id}")
+            by_key = select(ScheduleRunRow.__table__).where(
+                ScheduleRunRow.idempotency_key == idempotency_key
             )
-        except aiosqlite.IntegrityError:
-            concurrent = await self.database.fetch_one(
-                "SELECT * FROM schedule_runs WHERE schedule_id = ? AND status = 'RUNNING' "
-                "ORDER BY started_at DESC LIMIT 1",
-                (schedule_id,),
-            )
-            if concurrent is None:
-                raise
-            if trigger_type.upper() == "MANUAL":
-                return concurrent
-            return await self._record_skipped(
-                schedule_id=schedule_id,
-                trigger_type=trigger_type,
-                idempotency_key=idempotency_key,
-                existing_run_id=concurrent["id"],
-                scheduled_at=scheduled_at,
-            )
-        row = await self.get(run_id)
-        return row
-
-    async def _record_skipped(
-        self,
-        *,
-        schedule_id: str,
-        trigger_type: str,
-        idempotency_key: str,
-        existing_run_id: str,
-        scheduled_at: str | None,
-    ) -> dict[str, Any]:
-        run_id = _id("scan")
-        now = _now()
-        await self.database.execute(
-            "INSERT INTO schedule_runs(id, schedule_id, trigger_type, scheduled_at, completed_at, "
-            "status, skip_reason, existing_run_id, idempotency_key, created_at) "
-            "VALUES (?, ?, ?, ?, ?, 'SKIPPED_ALREADY_RUNNING', 'already_running', ?, ?, ?)",
-            (
-                run_id,
-                schedule_id,
-                trigger_type.upper(),
-                scheduled_at,
-                now,
-                existing_run_id,
-                idempotency_key,
-                now,
-            ),
-        )
-        return await self.get(run_id)
+            result = await tx.fetch_one(by_key)
+            if result is None:
+                running = await tx.fetch_one(
+                    select(ScheduleRunRow.__table__).where(
+                        ScheduleRunRow.schedule_id == schedule_id,
+                        ScheduleRunRow.status == "RUNNING",
+                    )
+                )
+                if running is not None and trigger == "MANUAL":
+                    return running
+                now = _now()
+                values = {
+                    "id": _id("scan"), "schedule_id": schedule_id,
+                    "trigger_type": trigger, "scheduled_at": scheduled_at,
+                    "idempotency_key": idempotency_key, "created_at": now,
+                }
+                if running is None:
+                    values.update(status="RUNNING", started_at=now)
+                else:
+                    values.update(
+                        status="SKIPPED_ALREADY_RUNNING", skip_reason="already_running",
+                        existing_run_id=running["id"], completed_at=now,
+                    )
+                await tx.execute(
+                    pg_insert(ScheduleRunRow).values(**values)
+                    .on_conflict_do_nothing(index_elements=[ScheduleRunRow.idempotency_key])
+                )
+                result = await tx.fetch_one(by_key)
+                assert result is not None
+            if (result["schedule_id"], result["trigger_type"], result["scheduled_at"]) != (
+                schedule_id, trigger, scheduled_at,
+            ):
+                raise OpportunityRequestConflictError("幂等键已被其他扫描请求使用")
+            return result
 
     async def get(self, run_id: str) -> dict[str, Any]:
-        row = await self.database.fetch_one("SELECT * FROM schedule_runs WHERE id = ?", (run_id,))
+        row = await self.database.fetch_one(
+            select(ScheduleRunRow.__table__).where(ScheduleRunRow.id == run_id)
+        )
         if row is None:
             raise KeyError(f"扫描运行不存在: {run_id}")
         return row
 
     async def complete(self, run_id: str, *, status: str = "COMPLETED") -> dict[str, Any]:
-        run = await self.get(run_id)
-        now = _now()
-        await self.database.execute(
-            "UPDATE schedule_runs SET status = ?, completed_at = ? WHERE id = ?",
-            (status, now, run_id),
-        )
-        await self.database.execute(
-            "UPDATE work_schedules SET last_run_at = ?, updated_at = ? WHERE id = ?",
-            (now, now, run["schedule_id"]),
-        )
-        return await self.get(run_id)
+        async with self.database.transaction() as tx:
+            now = _now()
+            run = await tx.fetch_one(
+                update(ScheduleRunRow).where(ScheduleRunRow.id == run_id)
+                .values(status=status, completed_at=now)
+                .returning(*ScheduleRunRow.__table__.columns)
+            )
+            if run is None:
+                raise KeyError(f"扫描运行不存在: {run_id}")
+            await tx.execute(
+                update(WorkScheduleRow).where(WorkScheduleRow.id == run["schedule_id"])
+                .values(last_run_at=now, updated_at=now)
+            )
+            return run
 
 
 class OpportunityService:
@@ -165,6 +155,18 @@ class OpportunityService:
     def fingerprint(self, site_id: str, candidate: OpportunityCandidate) -> str:
         return self.normalizer.fingerprint(site_id, candidate)
 
+    def using(self, database: SeoAgentDatabase) -> OpportunityService:
+        if database is self.database:
+            return self
+        return OpportunityService(
+            database,
+            approvals=ApprovalService(database, reminder_hours=self.approvals.reminder_hours)
+            if self.approvals else None,
+            notifications=NotificationService(database, self.notifications.provider)
+            if self.notifications else None,
+            policy=self.policy, normalizer=self.normalizer, action_policy=self.action_policy,
+        )
+
     async def upsert_candidate(
         self,
         *,
@@ -175,24 +177,59 @@ class OpportunityService:
         idempotency_key: str,
         default_approver_actor_id: str | None = None,
     ) -> dict[str, Any]:
+        async with self.database.transaction() as tx:
+            # Lock the site before comparing observations or creating a new fingerprint.
+            if await tx.fetch_value(
+                select(SiteRow.id).where(SiteRow.id == site_id).with_for_update(key_share=True)
+            ) is None:
+                raise KeyError(f"站点不存在: {site_id}")
+            # Work record keys are globally unique, including across different sites.
+            await tx.fetch_value(select(func.pg_advisory_xact_lock(
+                func.hashtextextended(f"candidate:{idempotency_key}", 0)
+            )))
+            return await self.using(tx)._ingest(
+                site_id=site_id, scan_run_id=scan_run_id, candidate=candidate,
+                changed_by_actor_id=changed_by_actor_id, idempotency_key=idempotency_key,
+                default_approver_actor_id=default_approver_actor_id,
+            )
+
+    async def _ingest(
+        self,
+        *,
+        site_id: str,
+        scan_run_id: str,
+        candidate: OpportunityCandidate,
+        changed_by_actor_id: str,
+        idempotency_key: str,
+        default_approver_actor_id: str | None,
+    ) -> dict[str, Any]:
         candidate = self.normalizer.normalize(candidate)
+        fingerprint = self.fingerprint(site_id, candidate)
         journal = await self.database.fetch_one(
-            "SELECT payload_json FROM work_records WHERE idempotency_key = ?", (idempotency_key,)
+            select(WorkRecordRow.site_id, WorkRecordRow.payload_json).where(
+                WorkRecordRow.idempotency_key == idempotency_key
+            )
         )
         if journal is not None:
             payload = json.loads(journal["payload_json"])
-            return await self.get(payload["opportunity_id"])
-        fingerprint = self.fingerprint(site_id, candidate)
+            if (journal["site_id"] != site_id or payload.get("scan_run_id") != scan_run_id
+                    or not payload.get("opportunity_id")):
+                raise OpportunityRequestConflictError("幂等键已被其他入池请求使用")
+            opportunity = await self.get(payload["opportunity_id"])
+            if opportunity["fingerprint"] != fingerprint:
+                raise OpportunityRequestConflictError("幂等键已被其他入池请求使用")
+            return opportunity
         existing = await self.database.fetch_one(
-            "SELECT * FROM opportunities WHERE site_id = ? AND fingerprint = ?",
-            (site_id, fingerprint),
+            select(OpportunityRow.__table__).where(
+                OpportunityRow.site_id == site_id, OpportunityRow.fingerprint == fingerprint
+            ).with_for_update()
         )
         previous_observation = None
-        if existing is not None:
+        if existing is not None and existing["status"] == "REJECTED":
             previous_observation = await self.database.fetch_one(
-                "SELECT * FROM opportunity_observations WHERE opportunity_id = ? "
-                "ORDER BY observed_at DESC LIMIT 1",
-                (existing["id"],),
+                select(OpportunityObservationRow.__table__)
+                .where(OpportunityObservationRow.opportunity_id == existing["id"])
+                .order_by(OpportunityObservationRow.observed_at.desc()).limit(1)
             )
         score = self.policy.score(candidate)
         priority_status = {
@@ -206,30 +243,17 @@ class OpportunityService:
         if existing is None:
             opportunity_id = _id("opportunity")
             await self.database.execute(
-                "INSERT INTO opportunities(id, site_id, fingerprint, normalized_intent, "
-                "opportunity_type, target_country, target_language, title, current_score, "
-                "priority_level, status, current_summary, policy_version, first_seen_at, "
-                "last_seen_at, seen_count, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
-                (
-                    opportunity_id,
-                    site_id,
-                    fingerprint,
-                    candidate.normalized_intent,
-                    candidate.opportunity_type.upper(),
-                    candidate.target_country.upper(),
-                    candidate.target_language.lower(),
-                    candidate.title,
-                    score.total,
-                    score.priority,
-                    priority_status,
-                    candidate.summary,
-                    self.policy.version,
-                    now,
-                    now,
-                    now,
-                    now,
-                ),
+                insert(OpportunityRow).values(
+                    id=opportunity_id, site_id=site_id, fingerprint=fingerprint,
+                    normalized_intent=candidate.normalized_intent,
+                    opportunity_type=candidate.opportunity_type,
+                    target_country=candidate.target_country,
+                    target_language=candidate.target_language,
+                    title=candidate.title, current_score=score.total, priority_level=score.priority,
+                    status=priority_status, current_summary=candidate.summary,
+                    policy_version=self.policy.version, first_seen_at=now, last_seen_at=now,
+                    seen_count=1, created_at=now, updated_at=now,
+                )
             )
             await self._status_history(
                 opportunity_id,
@@ -264,23 +288,13 @@ class OpportunityService:
             elif existing["status"] in {"OBSERVED", "OPPORTUNITY_POOL", "WAITING_FOR_DECISION"}:
                 target_status = priority_status
             await self.database.execute(
-                "UPDATE opportunities SET title = ?, current_score = ?, priority_level = ?, "
-                "status = ?, current_summary = ?, policy_version = ?, last_seen_at = ?, "
-                "seen_count = seen_count + 1, reopened_at = CASE WHEN ? = 1 THEN ? ELSE reopened_at END, "
-                "updated_at = ? WHERE id = ?",
-                (
-                    candidate.title,
-                    score.total,
-                    score.priority,
-                    target_status,
-                    candidate.summary,
-                    self.policy.version,
-                    now,
-                    int(reopened),
-                    now,
-                    now,
-                    opportunity_id,
-                ),
+                update(OpportunityRow).where(OpportunityRow.id == opportunity_id).values(
+                    title=candidate.title, current_score=score.total, priority_level=score.priority,
+                    status=target_status, current_summary=candidate.summary,
+                    policy_version=self.policy.version, last_seen_at=now,
+                    seen_count=OpportunityRow.seen_count + 1, updated_at=now,
+                    **({"reopened_at": now} if reopened else {}),
+                )
             )
             if target_status != existing["status"]:
                 if reopened:
@@ -311,39 +325,33 @@ class OpportunityService:
                     )
         observation_id = _id("observation")
         await self.database.execute(
-            "INSERT INTO opportunity_observations(id, opportunity_id, score, priority_level, "
-            "search_volume, keyword_difficulty, competitor_count, gap_summary, score_factors_json, "
-            "policy_version, threshold_snapshot_json, observed_at, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                observation_id,
-                opportunity_id,
-                score.total,
-                score.priority,
-                candidate.search_volume,
-                candidate.keyword_difficulty,
-                candidate.competitor_count,
-                candidate.summary,
-                score.factors.model_dump_json(),
-                self.policy.version,
-                json.dumps(
-                    {
-                        "high": self.policy.high_threshold,
-                        "medium": self.policy.medium_threshold,
-                        "reopen_score": self.policy.reopen_score_increase,
-                        "reopen_volume_percent": self.policy.reopen_search_volume_growth_percent,
-                    }
-                ),
-                now,
-                now,
-            ),
+            insert(OpportunityObservationRow).values(
+                id=observation_id, opportunity_id=opportunity_id, score=score.total,
+                priority_level=score.priority, search_volume=candidate.search_volume,
+                keyword_difficulty=candidate.keyword_difficulty,
+                competitor_count=candidate.competitor_count, gap_summary=candidate.summary,
+                score_factors_json=score.factors.model_dump_json(),
+                policy_version=self.policy.version,
+                threshold_snapshot_json=json.dumps({
+                    "high": self.policy.high_threshold,
+                    "medium": self.policy.medium_threshold,
+                    "reopen_score": self.policy.reopen_score_increase,
+                    "reopen_volume_percent": self.policy.reopen_search_volume_growth_percent,
+                }),
+                observed_at=now, created_at=now,
+            )
         )
         for evidence_id in candidate.evidence_snapshot_ids:
             await self.database.execute(
-                "INSERT OR IGNORE INTO opportunity_observation_evidence(id, observation_id, "
-                "evidence_snapshot_id, evidence_role, contribution_weight, created_at) "
-                "VALUES (?, ?, ?, 'SCORE_INPUT', 1.0, ?)",
-                (_id("oppevidence"), observation_id, evidence_id, now),
+                pg_insert(OpportunityObservationEvidenceRow).values(
+                    id=_id("oppevidence"), observation_id=observation_id,
+                    evidence_snapshot_id=evidence_id, evidence_role="SCORE_INPUT",
+                    contribution_weight=1.0, created_at=now,
+                ).on_conflict_do_nothing(index_elements=[
+                    OpportunityObservationEvidenceRow.observation_id,
+                    OpportunityObservationEvidenceRow.evidence_snapshot_id,
+                    OpportunityObservationEvidenceRow.evidence_role,
+                ])
             )
         await self._link_keywords(opportunity_id, candidate, now)
         await self._link_competitor_pages(site_id, opportunity_id, candidate, now)
@@ -384,46 +392,37 @@ class OpportunityService:
         candidate: OpportunityCandidate,
         now: str,
     ) -> None:
-        for index, keyword in enumerate(candidate.keywords):
-            row = await self.database.fetch_one(
-                "SELECT * FROM keywords WHERE normalized_keyword = ? AND language = ? AND country = ?",
-                (keyword, candidate.target_language.lower(), candidate.target_country.upper()),
-            )
-            if row is None:
-                keyword_id = _id("keyword")
-                await self.database.execute(
-                    "INSERT INTO keywords(id, normalized_keyword, language, country, created_at, "
-                    "updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        keyword_id,
-                        keyword,
-                        candidate.target_language.lower(),
-                        candidate.target_country.upper(),
-                        now,
-                        now,
-                    ),
-                )
-            else:
-                keyword_id = row["id"]
+        # Acquire global keyword rows in a consistent order when different sites share keywords.
+        for index, keyword in sorted(enumerate(candidate.keywords), key=lambda item: item[1]):
+            scope = {
+                "normalized_keyword": keyword,
+                "language": candidate.target_language,
+                "country": candidate.target_country,
+            }
             await self.database.execute(
-                "INSERT OR IGNORE INTO opportunity_keywords(id, opportunity_id, keyword_id, "
-                "keyword_role, relevance_score, first_seen_at, last_seen_at, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    _id("oppkeyword"),
-                    opportunity_id,
-                    keyword_id,
-                    "PRIMARY" if index == 0 else "SECONDARY",
-                    1.0 if index == 0 else 0.8,
-                    now,
-                    now,
-                    now,
-                ),
+                pg_insert(KeywordRow)
+                .values(id=_id("keyword"), **scope, created_at=now, updated_at=now)
+                .on_conflict_do_nothing(index_elements=[
+                    KeywordRow.normalized_keyword, KeywordRow.language, KeywordRow.country,
+                ])
+            )
+            keyword_id = await self.database.fetch_value(select(KeywordRow.id).filter_by(**scope))
+            await self.database.execute(
+                pg_insert(OpportunityKeywordRow).values(
+                    id=_id("oppkeyword"), opportunity_id=opportunity_id, keyword_id=keyword_id,
+                    keyword_role="PRIMARY" if index == 0 else "SECONDARY",
+                    relevance_score=1.0 if index == 0 else 0.8, first_seen_at=now,
+                    last_seen_at=now, created_at=now,
+                ).on_conflict_do_nothing(index_elements=[
+                    OpportunityKeywordRow.opportunity_id, OpportunityKeywordRow.keyword_id,
+                    OpportunityKeywordRow.keyword_role,
+                ])
             )
             await self.database.execute(
-                "UPDATE opportunity_keywords SET last_seen_at = ? WHERE opportunity_id = ? "
-                "AND keyword_id = ?",
-                (now, opportunity_id, keyword_id),
+                update(OpportunityKeywordRow).where(
+                    OpportunityKeywordRow.opportunity_id == opportunity_id,
+                    OpportunityKeywordRow.keyword_id == keyword_id,
+                ).values(last_seen_at=now)
             )
 
     async def _link_competitor_pages(
@@ -438,36 +437,25 @@ class OpportunityService:
         )
         for url in candidate.competitor_pages:
             domain = (urlsplit(url).hostname or "unknown").lower()
-            row = await self.database.fetch_one(
-                "SELECT * FROM competitor_pages WHERE site_id = ? AND url = ?",
-                (site_id, url),
+            page_id = await self.database.fetch_value(
+                pg_insert(CompetitorPageRow).values(
+                    id=_id("competitor_page"), site_id=site_id, competitor_domain=domain, url=url,
+                    first_seen_at=now, last_seen_at=now, created_at=now, updated_at=now,
+                ).on_conflict_do_update(
+                    index_elements=[CompetitorPageRow.site_id, CompetitorPageRow.url],
+                    set_={"last_seen_at": now, "updated_at": now},
+                ).returning(CompetitorPageRow.id)
             )
-            if row is None:
-                page_id = _id("competitor_page")
-                await self.database.execute(
-                    "INSERT INTO competitor_pages(id, site_id, competitor_domain, url, "
-                    "first_seen_at, last_seen_at, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (page_id, site_id, domain, url, now, now, now, now),
-                )
-            else:
-                page_id = row["id"]
-                await self.database.execute(
-                    "UPDATE competitor_pages SET last_seen_at = ?, updated_at = ? WHERE id = ?",
-                    (now, now, page_id),
-                )
             await self.database.execute(
-                "INSERT OR IGNORE INTO opportunity_competitor_pages(id, opportunity_id, "
-                "competitor_page_id, gap_type, relevance_score, evidence_snapshot_id, "
-                "created_at) VALUES (?, ?, ?, ?, 1.0, ?, ?)",
-                (
-                    _id("opp_competitor"),
-                    opportunity_id,
-                    page_id,
-                    candidate.opportunity_type,
-                    evidence_snapshot_id,
-                    now,
-                ),
+                pg_insert(OpportunityCompetitorPageRow).values(
+                    id=_id("opp_competitor"), opportunity_id=opportunity_id,
+                    competitor_page_id=page_id, gap_type=candidate.opportunity_type,
+                    relevance_score=1.0, evidence_snapshot_id=evidence_snapshot_id, created_at=now,
+                ).on_conflict_do_nothing(index_elements=[
+                    OpportunityCompetitorPageRow.opportunity_id,
+                    OpportunityCompetitorPageRow.competitor_page_id,
+                    OpportunityCompetitorPageRow.gap_type,
+                ])
             )
 
     async def _ensure_decision_request(
@@ -480,10 +468,12 @@ class OpportunityService:
     ) -> None:
         if self.approvals is None:
             return
-        active = await self.database.fetch_one(
-            "SELECT * FROM approval_actions WHERE target_type = 'opportunity' AND target_id = ? "
-            "AND status = 'WAITING_FOR_APPROVAL' ORDER BY requested_at DESC LIMIT 1",
-            (opportunity["id"],),
+        active = await self.database.fetch_value(
+            select(ApprovalActionRow.id).where(
+                ApprovalActionRow.target_type == "opportunity",
+                ApprovalActionRow.target_id == opportunity["id"],
+                ApprovalActionRow.status == "WAITING_FOR_APPROVAL",
+            ).order_by(ApprovalActionRow.requested_at.desc()).limit(1)
         )
         if active is not None:
             return
@@ -529,38 +519,41 @@ class OpportunityService:
     async def reject_opportunity(
         self, opportunity_id: str, *, reason: str, actor_id: str
     ) -> dict[str, Any]:
-        opportunity = await self.get(opportunity_id)
-        if self.approvals is not None:
-            action = await self.database.fetch_one(
-                "SELECT id FROM approval_actions WHERE target_type = 'opportunity' "
-                "AND target_id = ? AND action_type = 'ADD_OPPORTUNITY_TO_PRODUCTION' "
-                "AND status = 'WAITING_FOR_APPROVAL' ORDER BY requested_at DESC LIMIT 1",
-                (opportunity_id,),
+        async with self.database.transaction() as tx:
+            service = self.using(tx)
+            previous = await tx.fetch_value(
+                select(OpportunityRow.status).where(OpportunityRow.id == opportunity_id)
+                .with_for_update()
             )
-            if action is not None:
-                await self.approvals.decide(
-                    action_id=action["id"], actor_id=actor_id, decision="REJECT", reason=reason
+            if previous is None:
+                raise KeyError(f"机会不存在: {opportunity_id}")
+            if service.approvals is not None:
+                action = await tx.fetch_value(
+                    select(ApprovalActionRow.id).where(
+                        ApprovalActionRow.target_type == "opportunity",
+                        ApprovalActionRow.target_id == opportunity_id,
+                        ApprovalActionRow.action_type == "ADD_OPPORTUNITY_TO_PRODUCTION",
+                        ApprovalActionRow.status == "WAITING_FOR_APPROVAL",
+                    ).order_by(ApprovalActionRow.requested_at.desc()).limit(1)
                 )
-                return await self.get(opportunity_id)
-        now = _now()
-        await self.database.execute(
-            "UPDATE opportunities SET status = 'REJECTED', rejected_at = ?, rejection_reason = ?, "
-            "updated_at = ? WHERE id = ?",
-            (now, reason, now, opportunity_id),
-        )
-        await self._status_history(
-            opportunity_id,
-            opportunity["status"],
-            "REJECTED",
-            reason,
-            actor_id,
-            [],
-        )
-        return await self.get(opportunity_id)
+                if action is not None:
+                    await service.approvals.decide(
+                        action_id=action, actor_id=actor_id, decision="REJECT", reason=reason
+                    )
+                    return await service.get(opportunity_id)
+            now = _now()
+            await tx.execute(
+                update(OpportunityRow).where(OpportunityRow.id == opportunity_id)
+                .values(status="REJECTED", rejected_at=now, rejection_reason=reason, updated_at=now)
+            )
+            await service._status_history(
+                opportunity_id, previous, "REJECTED", reason, actor_id, []
+            )
+            return await service.get(opportunity_id)
 
     async def get(self, opportunity_id: str) -> dict[str, Any]:
         row = await self.database.fetch_one(
-            "SELECT * FROM opportunities WHERE id = ?", (opportunity_id,)
+            select(OpportunityRow.__table__).where(OpportunityRow.id == opportunity_id)
         )
         if row is None:
             raise KeyError(f"机会不存在: {opportunity_id}")
@@ -569,37 +562,58 @@ class OpportunityService:
     async def get_detail(self, opportunity_id: str) -> dict[str, Any]:
         opportunity = await self.get(opportunity_id)
         opportunity["observations"] = await self.database.fetch_all(
-            "SELECT * FROM opportunity_observations WHERE opportunity_id = ? "
-            "ORDER BY observed_at DESC",
-            (opportunity_id,),
+            select(OpportunityObservationRow.__table__)
+            .where(OpportunityObservationRow.opportunity_id == opportunity_id)
+            .order_by(OpportunityObservationRow.observed_at.desc())
         )
         opportunity["keywords"] = await self.database.fetch_all(
-            "SELECT k.*, r.keyword_role, r.relevance_score FROM opportunity_keywords r "
-            "JOIN keywords k ON k.id = r.keyword_id WHERE r.opportunity_id = ? "
-            "ORDER BY CASE r.keyword_role WHEN 'PRIMARY' THEN 0 ELSE 1 END, k.normalized_keyword",
-            (opportunity_id,),
+            select(
+                KeywordRow.__table__, OpportunityKeywordRow.keyword_role,
+                OpportunityKeywordRow.relevance_score,
+            )
+            .join_from(KeywordRow, OpportunityKeywordRow,
+                       OpportunityKeywordRow.keyword_id == KeywordRow.id)
+            .where(OpportunityKeywordRow.opportunity_id == opportunity_id)
+            .order_by(
+                case((OpportunityKeywordRow.keyword_role == "PRIMARY", 0), else_=1),
+                KeywordRow.normalized_keyword,
+            )
         )
         opportunity["competitor_pages"] = await self.database.fetch_all(
-            "SELECT p.*, r.gap_type, r.relevance_score, r.evidence_snapshot_id "
-            "FROM opportunity_competitor_pages r "
-            "JOIN competitor_pages p ON p.id = r.competitor_page_id "
-            "WHERE r.opportunity_id = ? ORDER BY p.url",
-            (opportunity_id,),
+            select(
+                CompetitorPageRow.__table__, OpportunityCompetitorPageRow.gap_type,
+                OpportunityCompetitorPageRow.relevance_score,
+                OpportunityCompetitorPageRow.evidence_snapshot_id,
+            )
+            .join_from(
+                CompetitorPageRow, OpportunityCompetitorPageRow,
+                OpportunityCompetitorPageRow.competitor_page_id == CompetitorPageRow.id,
+            )
+            .where(OpportunityCompetitorPageRow.opportunity_id == opportunity_id)
+            .order_by(CompetitorPageRow.url)
         )
         opportunity["status_history"] = await self.database.fetch_all(
-            "SELECT * FROM opportunity_status_history WHERE opportunity_id = ? ORDER BY created_at",
-            (opportunity_id,),
+            select(OpportunityStatusHistoryRow.__table__)
+            .where(OpportunityStatusHistoryRow.opportunity_id == opportunity_id)
+            .order_by(OpportunityStatusHistoryRow.created_at)
         )
         opportunity["approval_actions"] = await self.database.fetch_all(
-            "SELECT * FROM approval_actions WHERE target_type = 'opportunity' AND target_id = ? "
-            "ORDER BY requested_at DESC",
-            (opportunity_id,),
+            select(ApprovalActionRow.__table__).where(
+                ApprovalActionRow.target_type == "opportunity",
+                ApprovalActionRow.target_id == opportunity_id,
+            ).order_by(ApprovalActionRow.requested_at.desc())
         )
         opportunity["tasks"] = await self.database.fetch_all(
-            "SELECT t.*, r.relation_type, r.is_primary FROM task_opportunities r "
-            "JOIN execution_tasks t ON t.id = r.task_id WHERE r.opportunity_id = ? "
-            "ORDER BY t.created_at DESC",
-            (opportunity_id,),
+            select(
+                ExecutionTaskRow.__table__, TaskOpportunityRow.relation_type,
+                TaskOpportunityRow.is_primary,
+            )
+            .join_from(
+                ExecutionTaskRow, TaskOpportunityRow,
+                TaskOpportunityRow.task_id == ExecutionTaskRow.id,
+            )
+            .where(TaskOpportunityRow.opportunity_id == opportunity_id)
+            .order_by(ExecutionTaskRow.created_at.desc())
         )
         return opportunity
 
@@ -611,19 +625,18 @@ class OpportunityService:
         priority: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
-        clauses = ["site_id = ?", "archived_at IS NULL"]
-        params: list[Any] = [site_id]
+        query = select(OpportunityRow.__table__).where(
+            OpportunityRow.site_id == site_id, OpportunityRow.archived_at.is_(None)
+        )
         if status:
-            clauses.append("status = ?")
-            params.append(status)
+            query = query.where(OpportunityRow.status == status)
         if priority:
-            clauses.append("priority_level = ?")
-            params.append(priority)
-        params.append(max(1, min(limit, 500)))
+            query = query.where(OpportunityRow.priority_level == priority)
         return await self.database.fetch_all(
-            f"SELECT * FROM opportunities WHERE {' AND '.join(clauses)} "
-            "ORDER BY current_score DESC, last_seen_at DESC LIMIT ?",
-            tuple(params),
+            query.order_by(
+                OpportunityRow.current_score.desc().nulls_last(),
+                OpportunityRow.last_seen_at.desc(),
+            ).limit(max(1, min(limit, 500)))
         )
 
     async def _status_history(
@@ -636,24 +649,14 @@ class OpportunityService:
         triggered: list[str],
     ) -> None:
         await self.database.execute(
-            "INSERT INTO opportunity_status_history(id, opportunity_id, from_status, to_status, "
-            "reason, policy_version, threshold_snapshot_json, triggered_conditions_json, "
-            "changed_by_actor_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                _id("oppstatus"),
-                opportunity_id,
-                from_status,
-                to_status,
-                reason,
-                self.policy.version,
-                json.dumps(
-                    {
-                        "high": self.policy.high_threshold,
-                        "medium": self.policy.medium_threshold,
-                    }
-                ),
-                json.dumps(triggered, ensure_ascii=False),
-                actor_id,
-                _now(),
-            ),
+            insert(OpportunityStatusHistoryRow).values(
+                id=_id("oppstatus"), opportunity_id=opportunity_id, from_status=from_status,
+                to_status=to_status, reason=reason, policy_version=self.policy.version,
+                threshold_snapshot_json=json.dumps({
+                    "high": self.policy.high_threshold,
+                    "medium": self.policy.medium_threshold,
+                }),
+                triggered_conditions_json=json.dumps(triggered, ensure_ascii=False),
+                changed_by_actor_id=actor_id, created_at=_now(),
+            )
         )

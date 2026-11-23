@@ -1,9 +1,12 @@
-import type { AgentEvent, RenderHint, RunState, ToolRun } from '../types/agent'
+import type { AgentEvent, AppliedSkill, RenderHint, RunState, Specialist, ToolRun } from '../types/agent'
+import { specialistNames } from '../types/agent'
 
 export const initialRunState: RunState = {
   status: 'idle',
   stage: '等待输入',
   assistantText: '',
+  agents: [],
+  skills: [],
   tools: [],
   events: [],
   lastSequence: 0,
@@ -12,18 +15,30 @@ export const initialRunState: RunState = {
 
 const renderHints = new Set<RenderHint>(['chart', 'table', 'tree', 'cards'])
 
+const isSpecialist = (value: unknown): value is Specialist =>
+  typeof value === 'string' && Object.hasOwn(specialistNames, value)
+
+const isAppliedSkill = (value: unknown): value is AppliedSkill =>
+  value !== null && typeof value === 'object' && 'agent' in value && 'name' in value && 'label' in value
+    && isSpecialist(value.agent) && typeof value.name === 'string' && typeof value.label === 'string'
+
 const parseRenderHint = (value: unknown): RenderHint | undefined =>
   typeof value === 'string' && renderHints.has(value as RenderHint) ? value as RenderHint : undefined
 
-const upsertTool = (tools: ToolRun[], next: ToolRun): ToolRun[] => {
+const upsertTool = (tools: ToolRun[], next: ToolRun, agent?: Specialist): ToolRun[] => {
   const index = tools.findIndex((tool) => tool.id === next.id)
-  if (index === -1) return [...tools, next]
-  return tools.map((tool, position) => (position === index ? { ...tool, ...next } : tool))
+  if (index === -1) return [...tools, { ...next, agent }]
+  return tools.map((tool, position) => (position === index ? { ...tool, ...next, agent: tool.agent ?? agent } : tool))
 }
 
 export function reduceAgentEvent(state: RunState, event: AgentEvent): RunState {
   if (event.type === 'run.reset') {
-    return { ...initialRunState, status: String(event.payload.status ?? 'idle') as RunState['status'] }
+    return {
+      ...initialRunState,
+      status: String(event.payload.status ?? 'idle') as RunState['status'],
+      agents: Array.isArray(event.payload.priorAgents) ? event.payload.priorAgents.filter(isSpecialist) : [],
+      skills: Array.isArray(event.payload.priorSkills) ? event.payload.priorSkills.filter(isAppliedSkill) : [],
+    }
   }
   const deltaEvent = event.type === 'message.delta'
   const stableEvent = event.type !== 'heartbeat' && !deltaEvent
@@ -56,6 +71,16 @@ export function reduceAgentEvent(state: RunState, event: AgentEvent): RunState {
       }
     case 'stage.changed':
       return { ...base, stage: String(event.payload.stage ?? '处理中') }
+    case 'agent.dispatched': {
+      const agent = event.payload.agent
+      if (!isSpecialist(agent) || state.agents.at(-1) === agent) return base
+      return { ...base, agents: [...state.agents, agent] }
+    }
+    case 'skill.loaded': {
+      const skill = { agent: event.payload.agent, name: event.payload.skill, label: event.payload.label }
+      if (!isAppliedSkill(skill) || state.skills.some(item => item.name === skill.name && item.agent === skill.agent)) return base
+      return { ...base, skills: [...state.skills, skill] }
+    }
     case 'message.delta':
       return { ...base, assistantText: state.assistantText + String(event.payload.delta ?? ''), stage: '正在生成回答' }
     case 'message.completed':
@@ -65,7 +90,7 @@ export function reduceAgentEvent(state: RunState, event: AgentEvent): RunState {
       return {
         ...base,
         stage: '正在调用工具',
-        tools: upsertTool(state.tools, { id, name: String(event.payload.name ?? 'tool'), status: 'running', arguments: event.payload.arguments }),
+        tools: upsertTool(state.tools, { id, name: String(event.payload.name ?? 'tool'), status: 'running', arguments: event.payload.arguments }, state.agents.at(-1)),
       }
     }
     case 'tool.completed':
@@ -82,7 +107,7 @@ export function reduceAgentEvent(state: RunState, event: AgentEvent): RunState {
           render_hint: parseRenderHint(event.payload.render_hint),
           error: event.type === 'tool.failed' ? String(event.payload.error ?? '') : undefined,
           latencyMs: typeof event.payload.latency_ms === 'number' ? event.payload.latency_ms : undefined,
-        }),
+        }, state.agents.at(-1)),
       }
     }
     case 'run.completed': {

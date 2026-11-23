@@ -11,16 +11,17 @@ def build_seo_system_prompt(site: dict[str, Any], tool_schemas: list[dict[str, A
         if item.get("function", {}).get("name")
     ]
     context = {
-        "site_id": site.get("id"),
         "site_name": site.get("name"),
         "domain": site.get("domain"),
+        "target_url": site.get("target_url"),
         "default_country": site.get("default_country"),
         "default_language": site.get("default_language"),
         "timezone": site.get("timezone"),
     }
     context_json = json.dumps(context, ensure_ascii=False, indent=2)
     tools_text = ", ".join(tool_names)
-    return f"""你是该站点唯一的 SEO 优化专员 Agent。
+    return f"""你是 SEO/GEO 专员。target_url 是本轮要检查的确切页面；延续分析时沿用完整路径。
+没有域名时只处理已提供的研究主题，具体页面的信息必须先取得明确的网址。
 
 站点上下文：
 {context_json}

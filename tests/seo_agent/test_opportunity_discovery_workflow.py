@@ -6,16 +6,19 @@ import json
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import func, select, update
 
 from src.core.cache import CacheManager
 from src.core.exceptions import InternalDataNotAvailableError, InternalProviderResponseError
 from src.models.common import Capability
 from src.observability.client import ObservabilityClient
+from src.observability.schema import ModelCallRow, SpanRow
 from src.observability.storage import ObservabilityDatabase
 from src.promptops.registry import PromptRegistry
 from src.seo_agent.approvals.service import ApprovalService
 from src.seo_agent.automation.prompts import SeoPromptSeeder
 from src.seo_agent.db.database import SeoAgentDatabase
+from src.seo_agent.db.models import TABLES, OpportunityObservationRow, SiteRow
 from src.seo_agent.notifications.service import NotificationService
 from src.seo_agent.opportunities.service import OpportunityService, ScanRunService
 from src.seo_agent.schedules.service import WorkScheduleService
@@ -26,6 +29,10 @@ from src.seo_agent.workflows.opportunity_discovery import (
     OpportunityDiscoveryWorkflow,
 )
 from src.seo_agent.workflows.structured_model import StructuredModelRunner
+
+
+async def row_count(database, table_name: str) -> int:
+    return await database.fetch_value(select(func.count()).select_from(TABLES[table_name]))
 
 
 class ResearchData:
@@ -123,10 +130,10 @@ class CandidateModel:
 
 
 @pytest.fixture
-async def context(tmp_path):
-    database = SeoAgentDatabase(tmp_path / "business.db")
+async def context(pg_url):
+    database = SeoAgentDatabase(pg_url)
     await database.startup()
-    snapshots = CacheManager(tmp_path / "evidence.db")
+    snapshots = CacheManager(pg_url)
     await snapshots.startup()
     system = SeoAgentSystemService(database)
     site = await system.create_site(
@@ -177,7 +184,7 @@ async def test_discovery_freezes_evidence_uses_existing_policy_and_reuses_receip
     assert result["opportunity_ids"] and len(result["evidence_snapshot_ids"]) == 3
     opportunity = await OpportunityService(database).get(result["opportunity_ids"][0])
     assert opportunity["status"] == "WAITING_FOR_DECISION"
-    observation = await database.fetch_one("SELECT * FROM opportunity_observations")
+    observation = await database.fetch_one(select(OpportunityObservationRow.__table__))
     assert observation["search_volume"] == 100 and observation["keyword_difficulty"] == 30
     for evidence_id in result["evidence_snapshot_ids"]:
         evidence = await snapshots.get_snapshot(evidence_id)
@@ -185,9 +192,9 @@ async def test_discovery_freezes_evidence_uses_existing_policy_and_reuses_receip
     repeated = await workflow.execute(scan["id"], request)
     assert repeated["opportunity_ids"] == result["opportunity_ids"]
     assert model.calls == 1 and len(facade.calls) == 3
-    assert await database.fetch_value("SELECT COUNT(*) FROM opportunity_observations") == 1
-    assert await database.fetch_value("SELECT COUNT(*) FROM approval_actions") == 1
-    assert await database.fetch_value("SELECT COUNT(*) FROM execution_tasks") == 0
+    assert await row_count(database, "opportunity_observations") == 1
+    assert await row_count(database, "approval_actions") == 1
+    assert await row_count(database, "execution_tasks") == 0
     tasks = TaskDeliveryService(database)
     with pytest.raises(ValueError, match="审批"):
         await tasks.create_task(
@@ -229,8 +236,8 @@ async def test_invalid_candidate_never_writes_opportunities_or_approvals(context
     expected = InternalProviderResponseError if mode == "invalid_schema" else ValueError
     with pytest.raises(expected):
         await workflow.execute(scan["id"], request)
-    assert await database.fetch_value("SELECT COUNT(*) FROM opportunities") == 0
-    assert await database.fetch_value("SELECT COUNT(*) FROM approval_actions") == 0
+    assert await row_count(database, "opportunities") == 0
+    assert await row_count(database, "approval_actions") == 0
     assert (await ScanRunService(database).get(scan["id"]))["status"] == "RUNNING"
 
 
@@ -244,7 +251,7 @@ async def test_discovery_serializes_duplicate_requests_and_rejects_changed_key(c
     assert model.calls == 1 and len(facade.calls) == 3
     with pytest.raises(ValueError, match="幂等"):
         await workflow.execute(scan["id"], request.model_copy(update={"query": "other"}))
-    assert await database.fetch_value("SELECT COUNT(*) FROM opportunities") == 1
+    assert await row_count(database, "opportunities") == 1
 
 
 @pytest.mark.asyncio
@@ -259,7 +266,7 @@ async def test_two_workflow_instances_cannot_duplicate_business_writes(context):
     assert first["opportunity_ids"] == second["opportunity_ids"]
     assert model.calls <= 2
     for table in ("opportunities", "opportunity_observations", "approval_actions"):
-        assert await database.fetch_value(f"SELECT COUNT(*) FROM {table}") == 1
+        assert await row_count(database, table) == 1
 
 
 @pytest.mark.asyncio
@@ -268,7 +275,7 @@ async def test_completed_scan_rejects_new_request_and_model_respects_candidate_b
     model.count = 2
     with pytest.raises(ValueError, match="数量"):
         await workflow.execute(scan["id"], request.model_copy(update={"max_opportunities": 1}))
-    assert await database.fetch_value("SELECT COUNT(*) FROM opportunities") == 0
+    assert await row_count(database, "opportunities") == 0
     model.count = 1
     await workflow.execute(scan["id"], request)
     calls = len(facade.calls)
@@ -306,12 +313,12 @@ async def test_database_failure_rolls_back_entire_batch_and_approval_queue(
         "notification_events",
         "work_records",
     ):
-        assert await database.fetch_value(f"SELECT COUNT(*) FROM {table}") == 0
+        assert await row_count(database, table) == 0
     assert (await ScanRunService(database).get(scan["id"]))["status"] == "RUNNING"
     monkeypatch.setattr(OpportunityService, "upsert_candidate", original)
     result = await workflow.execute(scan["id"], request)
     assert len(result["opportunity_ids"]) == 2
-    assert await database.fetch_value("SELECT COUNT(*) FROM opportunity_observations") == 2
+    assert await row_count(database, "opportunity_observations") == 2
 
 
 @pytest.mark.asyncio
@@ -322,8 +329,8 @@ async def test_low_and_medium_opportunities_keep_existing_approval_rules(context
     result = await workflow.execute(scan["id"], request)
     opportunity = await OpportunityService(database).get(result["opportunity_ids"][0])
     assert opportunity["status"] == status
-    assert await database.fetch_value("SELECT COUNT(*) FROM approval_actions") == 0
-    assert await database.fetch_value("SELECT COUNT(*) FROM execution_tasks") == 0
+    assert await row_count(database, "approval_actions") == 0
+    assert await row_count(database, "execution_tasks") == 0
 
 
 @pytest.mark.asyncio
@@ -334,8 +341,8 @@ async def test_high_opportunity_without_selected_approver_only_enters_pool(conte
     )
     opportunity = await OpportunityService(database).get(result["opportunity_ids"][0])
     assert opportunity["status"] == "WAITING_FOR_DECISION"
-    assert await database.fetch_value("SELECT COUNT(*) FROM approval_actions") == 0
-    assert await database.fetch_value("SELECT COUNT(*) FROM execution_tasks") == 0
+    assert await row_count(database, "approval_actions") == 0
+    assert await row_count(database, "execution_tasks") == 0
 
 
 @pytest.mark.asyncio
@@ -345,7 +352,7 @@ async def test_empty_generation_completes_without_manufacturing_opportunities(co
     result = await workflow.execute(scan["id"], request)
     assert result["opportunity_ids"] == []
     assert (await ScanRunService(database).get(scan["id"]))["status"] == "COMPLETED"
-    assert await database.fetch_value("SELECT COUNT(*) FROM approval_actions") == 0
+    assert await row_count(database, "approval_actions") == 0
 
 
 @pytest.mark.asyncio
@@ -363,7 +370,7 @@ async def test_missing_model_or_data_configuration_does_not_spend_queries(contex
     with pytest.raises(InternalDataNotAvailableError):
         await workflow.execute(scan["id"], request)
     assert not facade.calls
-    assert await database.fetch_value("SELECT COUNT(*) FROM opportunities") == 0
+    assert await row_count(database, "opportunities") == 0
 
 
 @pytest.mark.asyncio
@@ -375,7 +382,7 @@ async def test_partial_research_keeps_unknown_metrics_without_zero_filling(conte
     result = await workflow.execute(scan["id"], request)
     assert result["workflow_status"] == "partial"
     assert len(result["evidence_snapshot_ids"]) == 2
-    observation = await database.fetch_one("SELECT * FROM opportunity_observations")
+    observation = await database.fetch_one(select(OpportunityObservationRow.__table__))
     assert observation["search_volume"] is None and observation["keyword_difficulty"] is None
 
 
@@ -394,10 +401,10 @@ async def test_search_redirect_is_kept_as_raw_evidence_but_not_a_competitor(cont
     model.mode = 'search_redirect'
     result = await workflow.execute(scan['id'], request)
     assert result['opportunity_ids']
-    observation = await database.fetch_one('SELECT * FROM opportunity_observations')
+    observation = await database.fetch_one(select(OpportunityObservationRow.__table__))
     assert observation['competitor_count'] is None
     assert '未确认真实竞品' in observation['gap_summary']
-    assert await database.fetch_value('SELECT COUNT(*) FROM competitor_pages') == 0
+    assert await row_count(database, "competitor_pages") == 0
     frozen = [await snapshots.get_snapshot(key) for key in result['evidence_snapshot_ids']]
     assert 'https://google.com/goto?url=opaque' in str(frozen)
 
@@ -409,16 +416,18 @@ async def test_inactive_scope_and_unknown_actor_fail_before_external_queries(con
         await workflow.execute(
             scan["id"], request.model_copy(update={"changed_by_actor_id": "unknown"})
         )
-    await database.execute("UPDATE sites SET status='INACTIVE' WHERE id=?", (site["id"],))
+    await database.execute(
+        update(SiteRow).where(SiteRow.id == site["id"]).values(status="INACTIVE")
+    )
     with pytest.raises(ValueError):
         await workflow.execute(scan["id"], request)
     assert not facade.calls and model.calls == 0
 
 
 @pytest.mark.asyncio
-async def test_discovery_keeps_research_model_and_writes_in_one_trace(context, tmp_path):
+async def test_discovery_keeps_research_model_and_writes_in_one_trace(context, pg_url):
     _, _, _, _, scan, _, _, model, workflow, request = context
-    observations = ObservabilityDatabase(tmp_path / "observations.db")
+    observations = ObservabilityDatabase(pg_url)
     observer = ObservabilityClient(observations, project_key="seo-agent")
     workflow.observability = observer
     workflow.model_runner.observability = observer
@@ -428,7 +437,7 @@ async def test_discovery_keeps_research_model_and_writes_in_one_trace(context, t
         seeded = await SeoPromptSeeder(registry).seed()
         workflow.model_runner.prompt_registry = registry
         result = await workflow.execute(scan["id"], request)
-        spans = await observations.fetch_all("SELECT * FROM obs_spans")
+        spans = await observations.fetch_all(select(SpanRow.__table__))
         by_name = {row["operation_name"]: row for row in spans}
         root = by_name["seo.opportunity_discovery"]
         for name in (
@@ -440,7 +449,7 @@ async def test_discovery_keeps_research_model_and_writes_in_one_trace(context, t
         ):
             assert by_name[name]["trace_id"] == root["trace_id"]
             assert by_name[name]["parent_span_id"] == root["id"]
-        calls = await observations.fetch_all("SELECT * FROM obs_model_calls")
+        calls = await observations.fetch_all(select(ModelCallRow.__table__))
         assert len(calls) == 1 and "evidence_snapshot_ids" in str(calls)
         assert calls[0]["prompt_version_id"] == seeded["seo.opportunity.discover"]["id"]
         assert "waterjet" in str(calls) and "SystemMessage" not in str(calls)
@@ -448,7 +457,9 @@ async def test_discovery_keeps_research_model_and_writes_in_one_trace(context, t
         await workflow.execute(scan["id"], request)
         assert model.calls == 1
         assert await observations.fetch_one(
-            "SELECT * FROM obs_spans WHERE operation_name='seo.opportunity_discovery.reused'"
+            select(SpanRow.__table__).where(
+                SpanRow.operation_name == "seo.opportunity_discovery.reused"
+            )
         )
     finally:
         await observer.shutdown()
@@ -490,5 +501,5 @@ async def test_discovery_api_reports_model_failure_without_partial_business_writ
         )
     assert response.status_code == 503
     assert "private" not in response.text
-    assert await database.fetch_value("SELECT COUNT(*) FROM opportunities") == 0
-    assert await database.fetch_value("SELECT COUNT(*) FROM approval_actions") == 0
+    assert await row_count(database, "opportunities") == 0
+    assert await row_count(database, "approval_actions") == 0

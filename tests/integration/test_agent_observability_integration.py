@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -11,17 +10,19 @@ from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from sqlalchemy import func, insert, select
 
-from src.agent.loop import AgentLoop
 from src.agent.observability import AgentRunObserver
 from src.agent.providers.base import ModelChunk, ToolCall
 from src.agent.providers.deepseek import DeepSeekProvider, DeepSeekRequestError
 from src.agent.providers.fake import FakeModelProvider
 from src.agent.run_manager import RunManager
+from src.agent.runtime.executor import AgentExecutor
 from src.agent.tools.registry import build_default_registry
 from src.observability.client import ObservabilityClient
 from src.observability.context import get_current_context
 from src.observability.exporters import OpenTelemetryExporter
+from src.observability.schema import EventRow, IssueRow, ModelCallRow, RunRow, SpanRow, TraceRow
 from src.observability.storage import ObservabilityDatabase
 from src.promptops.models import CandidatePrompt
 from src.promptops.registry import PromptRegistry
@@ -35,6 +36,7 @@ from src.seo_agent.automation.prompt_optimization import (
 from src.seo_agent.automation.prompts import SeoPromptSeeder
 from src.seo_agent.automation.structured import StructuredModelAutomation
 from src.seo_agent.db.database import SeoAgentDatabase
+from src.seo_agent.db.models import TABLES
 from src.seo_agent.graphs.observability import LangGraphObserver
 from src.seo_agent.services.system import SeoAgentSystemService
 from src.seo_agent.tasks.models import TaskPrdContent
@@ -88,18 +90,18 @@ class FailingStructuredModel:
 
 
 @pytest.mark.asyncio
-async def test_observability_start_failure_ends_agent_run(tmp_path: Path, monkeypatch) -> None:
-    database = ObservabilityDatabase(tmp_path / "observability.db")
+async def test_observability_start_failure_ends_agent_run(pg_url, monkeypatch) -> None:
+    database = ObservabilityDatabase(pg_url)
     client = ObservabilityClient(database, project_key="seo-agent")
     await client.startup()
     run = RunManager().create_run([{"role": "user", "content": "test"}])
 
     async def fail(*_args, **_kwargs):
-        raise sqlite3.OperationalError("synthetic observability storage failure")
+        raise RuntimeError("synthetic observability storage failure")
 
     monkeypatch.setattr(database, "execute", fail)
     try:
-        await AgentLoop(
+        await AgentExecutor(
             FakeModelProvider.text("ok"), build_default_registry(),
             observer=AgentRunObserver(client, operation_name="agent.chat"),
         ).run(run)
@@ -112,22 +114,22 @@ async def test_observability_start_failure_ends_agent_run(tmp_path: Path, monkey
 
 @pytest.mark.asyncio
 async def test_observability_start_failure_does_not_leak_trace_context(
-    tmp_path: Path, monkeypatch
+    pg_url, monkeypatch
 ) -> None:
-    database = ObservabilityDatabase(tmp_path / "observability.db")
+    database = ObservabilityDatabase(pg_url)
     client = ObservabilityClient(database, project_key="seo-agent")
     await client.startup()
-    execute = database.execute
+    record = client.record_event
 
-    async def fail_start_event(sql, params=()):
-        if "INSERT INTO obs_events" in sql and "trace.started" in params:
-            raise sqlite3.OperationalError("synthetic observability storage failure")
-        await execute(sql, params)
+    async def fail_start_event(**fields):
+        if fields.get("event_type") == "trace.started":
+            raise RuntimeError("synthetic observability storage failure")
+        return await record(**fields)
 
-    monkeypatch.setattr(database, "execute", fail_start_event)
+    monkeypatch.setattr(client, "record_event", fail_start_event)
     run = RunManager().create_run([{"role": "user", "content": "test"}])
     try:
-        await AgentLoop(
+        await AgentExecutor(
             FakeModelProvider.text("ok"), build_default_registry(),
             observer=AgentRunObserver(client, operation_name="agent.chat"),
         ).run(run)
@@ -139,8 +141,8 @@ async def test_observability_start_failure_does_not_leak_trace_context(
 
 
 @pytest.mark.asyncio
-async def test_agent_records_partial_usage_and_missing_usage(tmp_path: Path) -> None:
-    database = ObservabilityDatabase(tmp_path / "observability.db")
+async def test_agent_records_partial_usage_and_missing_usage(pg_url) -> None:
+    database = ObservabilityDatabase(pg_url)
     client = ObservabilityClient(database, project_key="seo-agent")
     try:
         for chunks in (
@@ -150,11 +152,13 @@ async def test_agent_records_partial_usage_and_missing_usage(tmp_path: Path) -> 
         ):
             run = RunManager().create_run([{"role": "user", "content": "test"}])
             provider = FakeModelProvider([chunks])
-            await AgentLoop(
+            await AgentExecutor(
                 provider, build_default_registry(),
                 observer=AgentRunObserver(client, operation_name="agent.chat"),
             ).run(run)
-        calls = await database.fetch_all("SELECT * FROM obs_model_calls ORDER BY completed_at")
+        calls = await database.fetch_all(
+            select(ModelCallRow.__table__).order_by(ModelCallRow.completed_at)
+        )
         assert [row["total_tokens"] for row in calls] == [150, None]
         assert all(row["time_to_first_token_ms"] is not None for row in calls)
     finally:
@@ -162,21 +166,21 @@ async def test_agent_records_partial_usage_and_missing_usage(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_agent_records_deepseek_http_status(tmp_path: Path) -> None:
+async def test_agent_records_deepseek_http_status(pg_url) -> None:
     class FailingProvider(FakeModelProvider):
         async def stream(self, messages, tools, *, tool_choice="auto"):
             raise DeepSeekRequestError(429)
             yield  # pragma: no cover
 
-    database = ObservabilityDatabase(tmp_path / "observability.db")
+    database = ObservabilityDatabase(pg_url)
     client = ObservabilityClient(database, project_key="seo-agent")
     run = RunManager().create_run([{"role": "user", "content": "test"}])
     try:
-        await AgentLoop(
+        await AgentExecutor(
             FailingProvider([]), build_default_registry(),
             observer=AgentRunObserver(client, operation_name="agent.chat"),
         ).run(run)
-        call = await database.fetch_one("SELECT * FROM obs_model_calls")
+        call = await database.fetch_one(select(ModelCallRow.__table__))
         assert call is not None
         assert call["status"] == "FAILED" and call["error_code"] == "HTTP_429"
         assert call["total_tokens"] is None
@@ -186,9 +190,9 @@ async def test_agent_records_deepseek_http_status(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_agent_loop_persists_model_tool_events_and_sanitizes_arguments(
-    tmp_path: Path,
+    pg_url,
 ) -> None:
-    database = ObservabilityDatabase(tmp_path / "observability.db")
+    database = ObservabilityDatabase(pg_url)
     await database.startup()
     client = ObservabilityClient(database, project_key="seo-agent")
     manager = RunManager()
@@ -201,7 +205,7 @@ async def test_agent_loop_persists_model_tool_events_and_sanitizes_arguments(
         agent_name="chat-agent",
     )
     try:
-        await AgentLoop(
+        await AgentExecutor(
             provider,
             build_default_registry(),
             observer=observer,
@@ -213,20 +217,24 @@ async def test_agent_loop_persists_model_tool_events_and_sanitizes_arguments(
         assert counts["obs_tool_calls"] == 1
         event_types = {
             row["event_type"]
-            for row in await database.fetch_all("SELECT event_type FROM obs_events")
+            for row in await database.fetch_all(select(EventRow.event_type))
         }
         assert {"run.started", "tool.started", "tool.completed", "run.completed"}.issubset(
             event_types
         )
         assert (
             await database.fetch_value(
-                "SELECT COUNT(*) FROM obs_events WHERE event_type = 'run.started'"
+                select(func.count())
+                .select_from(EventRow.__table__)
+                .where(EventRow.event_type == "run.started")
             )
             == 1
         )
         assert (
             await database.fetch_value(
-                "SELECT COUNT(*) FROM obs_events WHERE event_type = 'run.completed'"
+                select(func.count())
+                .select_from(EventRow.__table__)
+                .where(EventRow.event_type == "run.completed")
             )
             == 1
         )
@@ -239,9 +247,9 @@ async def test_agent_loop_persists_model_tool_events_and_sanitizes_arguments(
 
 
 @pytest.mark.asyncio
-async def test_agent_exports_decisions_reuse_and_stop_reason(tmp_path: Path) -> None:
+async def test_agent_exports_decisions_reuse_and_stop_reason(pg_url) -> None:
     memory = InMemorySpanExporter()
-    database = ObservabilityDatabase(tmp_path / "observability.db")
+    database = ObservabilityDatabase(pg_url)
     exporter = OpenTelemetryExporter(
         service_name="seo-agent", endpoint=None, span_exporter=memory, database=database
     )
@@ -259,7 +267,7 @@ async def test_agent_exports_decisions_reuse_and_stop_reason(tmp_path: Path) -> 
         "role": "user", "content": "private-request API_KEY=sk-example-sensitive-123456789"
     }])
     try:
-        await AgentLoop(
+        await AgentExecutor(
             provider, build_default_registry(), max_iterations=4,
             observer=AgentRunObserver(client, operation_name="agent.chat"),
         ).run(run)
@@ -305,16 +313,16 @@ async def test_agent_exports_decisions_reuse_and_stop_reason(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_agent_trace_explains_budget_forced_summary(tmp_path: Path) -> None:
+async def test_agent_trace_explains_budget_forced_summary(pg_url) -> None:
     memory = InMemorySpanExporter()
-    database = ObservabilityDatabase(tmp_path / "observability.db")
+    database = ObservabilityDatabase(pg_url)
     exporter = OpenTelemetryExporter(
         service_name="seo-agent", endpoint=None, span_exporter=memory, database=database
     )
     client = ObservabilityClient(database, project_key="seo-agent", exporters=[exporter])
     run = RunManager().create_run([{"role": "user", "content": "计算"}])
     try:
-        await AgentLoop(
+        await AgentExecutor(
             FakeModelProvider.calculator_then_text("1 + 1", "完成"), build_default_registry(),
             max_iterations=2, observer=AgentRunObserver(client, operation_name="agent.chat"),
         ).run(run)
@@ -335,9 +343,9 @@ async def test_agent_trace_explains_budget_forced_summary(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_model_prompt_and_tool_io_are_recorded_and_credentials_masked(tmp_path: Path) -> None:
+async def test_model_prompt_and_tool_io_are_recorded_and_credentials_masked(pg_url) -> None:
     memory = InMemorySpanExporter()
-    database = ObservabilityDatabase(tmp_path / "observability.db")
+    database = ObservabilityDatabase(pg_url)
     exporter = OpenTelemetryExporter(
         service_name="seo-agent", endpoint=None, span_exporter=memory, database=database
     )
@@ -345,7 +353,7 @@ async def test_model_prompt_and_tool_io_are_recorded_and_credentials_masked(tmp_
     prompt = "long-prompt:" + "x" * 5_000 + " API_KEY=sk-example-sensitive-123456789"
     run = RunManager().create_run([{"role": "user", "content": prompt}])
     try:
-        await AgentLoop(
+        await AgentExecutor(
             FakeModelProvider.calculator_then_text("1234 * 56", "结果是 69104。"),
             build_default_registry(),
             observer=AgentRunObserver(client, operation_name="agent.chat"),
@@ -373,9 +381,9 @@ async def test_model_prompt_and_tool_io_are_recorded_and_credentials_masked(tmp_
 
 
 @pytest.mark.asyncio
-async def test_agent_unknown_tool_is_marked_but_model_output_is_preserved(tmp_path: Path) -> None:
+async def test_agent_unknown_tool_is_marked_but_model_output_is_preserved(pg_url) -> None:
     memory = InMemorySpanExporter()
-    database = ObservabilityDatabase(tmp_path / "observability.db")
+    database = ObservabilityDatabase(pg_url)
     exporter = OpenTelemetryExporter(
         service_name="seo-agent", endpoint=None, span_exporter=memory, database=database
     )
@@ -388,7 +396,7 @@ async def test_agent_unknown_tool_is_marked_but_model_output_is_preserved(tmp_pa
     ])
     run = RunManager().create_run([{"role": "user", "content": "test"}])
     try:
-        await AgentLoop(
+        await AgentExecutor(
             provider, build_default_registry(),
             observer=AgentRunObserver(client, operation_name="chat"),
         ).run(run)
@@ -400,8 +408,8 @@ async def test_agent_unknown_tool_is_marked_but_model_output_is_preserved(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_paused_agent_trace_is_interrupted_not_completed(tmp_path: Path) -> None:
-    database = ObservabilityDatabase(tmp_path / "observability.db")
+async def test_paused_agent_trace_is_interrupted_not_completed(pg_url) -> None:
+    database = ObservabilityDatabase(pg_url)
     client = ObservabilityClient(database, project_key="seo-agent")
     run = RunManager().create_run([{"role": "user", "content": "test"}])
 
@@ -413,20 +421,20 @@ async def test_paused_agent_trace_is_interrupted_not_completed(tmp_path: Path) -
 
     try:
         with pytest.raises(asyncio.CancelledError):
-            await AgentLoop(
+            await AgentExecutor(
                 PausingProvider([]), build_default_registry(),
                 observer=AgentRunObserver(client, operation_name="agent.chat"),
             ).run(run)
-        trace = await database.fetch_one("SELECT status, metadata_json FROM obs_traces")
+        trace = await database.fetch_one(select(TraceRow.status, TraceRow.metadata_json))
         assert trace is not None and trace["status"] == "INTERRUPTED"
-        run_row = await database.fetch_one("SELECT status FROM obs_runs")
+        run_row = await database.fetch_one(select(RunRow.status))
         assert run_row is not None and run_row["status"] == "INTERRUPTED"
         model = await database.fetch_one(
-            "SELECT status FROM obs_spans WHERE operation_name = 'model.iteration.1'"
+            select(SpanRow.status).where(SpanRow.operation_name == 'model.iteration.1')
         )
         assert model is not None and model["status"] == "CANCELLED"
         event = await database.fetch_one(
-            "SELECT severity FROM obs_events WHERE event_type = 'run.interrupted'"
+            select(EventRow.severity).where(EventRow.event_type == 'run.interrupted')
         )
         assert event is not None and event["severity"] == "INFO"
     finally:
@@ -459,10 +467,10 @@ def test_deepseek_parser_does_not_invent_missing_usage() -> None:
 
 @pytest.mark.asyncio
 async def test_structured_prd_resolves_prompt_version_and_records_model_call(
-    tmp_path: Path, approve_opportunity,
+    pg_url, tmp_path: Path, approve_opportunity,
 ) -> None:
-    business = SeoAgentDatabase(tmp_path / "seo-agent.db")
-    observability = ObservabilityDatabase(tmp_path / "observability.db")
+    business = SeoAgentDatabase(pg_url)
+    observability = ObservabilityDatabase(pg_url)
     await business.startup()
     await observability.startup()
     registry = PromptRegistry(observability)
@@ -484,14 +492,25 @@ async def test_structured_prd_resolves_prompt_version_and_records_model_call(
     )
     owner = await system.create_actor(actor_type="USER", name="Owner", email="owner@test.com")
     await business.execute(
-        "INSERT INTO opportunities(id, site_id, fingerprint, normalized_intent, opportunity_type, "
-        "target_country, target_language, title, current_score, priority_level, status, "
-        "current_summary, policy_version, first_seen_at, last_seen_at, created_at, updated_at) "
-        "VALUES ('opp-1', ?, 'fp', 'maintenance cost', 'CONTENT_GAP', 'US', 'en', "
-        "'Maintenance Cost', 88, 'HIGH', 'WAITING_FOR_DECISION', 'pricing gap', 'v1', "
-        "'2026-07-24T00:00:00+00:00', '2026-07-24T00:00:00+00:00', "
-        "'2026-07-24T00:00:00+00:00', '2026-07-24T00:00:00+00:00')",
-        (site["id"],),
+        insert(TABLES['opportunities']).values(
+            id='opp-1',
+            site_id=site['id'],
+            fingerprint='fp',
+            normalized_intent='maintenance cost',
+            opportunity_type='CONTENT_GAP',
+            target_country='US',
+            target_language='en',
+            title='Maintenance Cost',
+            current_score=88,
+            priority_level='HIGH',
+            status='WAITING_FOR_DECISION',
+            current_summary='pricing gap',
+            policy_version='v1',
+            first_seen_at='2026-07-24T00:00:00+00:00',
+            last_seen_at='2026-07-24T00:00:00+00:00',
+            created_at='2026-07-24T00:00:00+00:00',
+            updated_at='2026-07-24T00:00:00+00:00',
+        ),
     )
     await approve_opportunity(business, site["id"], "opp-1", owner["id"])
     tasks = TaskDeliveryService(business, artifact_root=tmp_path / "artifacts")
@@ -541,7 +560,7 @@ async def test_structured_prd_resolves_prompt_version_and_records_model_call(
             created_by_actor_id=owner["id"],
         )
         assert result["version_no"] == 1
-        model_call = await observability.fetch_one("SELECT * FROM obs_model_calls")
+        model_call = await observability.fetch_one(select(ModelCallRow.__table__))
         assert model_call is not None
         assert model_call["prompt_version_id"] == seeded["seo.prd.generate"]["id"]
         assert model_call["prompt_key"] == "seo.prd.generate"
@@ -559,8 +578,8 @@ async def test_structured_prd_resolves_prompt_version_and_records_model_call(
 
 
 @pytest.mark.asyncio
-async def test_langgraph_observer_records_node_interrupt_and_resume(tmp_path: Path) -> None:
-    database = ObservabilityDatabase(tmp_path / "observability.db")
+async def test_langgraph_observer_records_node_interrupt_and_resume(pg_url) -> None:
+    database = ObservabilityDatabase(pg_url)
     await database.startup()
     client = ObservabilityClient(database, project_key="seo-agent")
     saver = InMemorySaver()
@@ -586,12 +605,14 @@ async def test_langgraph_observer_records_node_interrupt_and_resume(tmp_path: Pa
                 assert resolved["current_stage"] == "approval_resolved"
         event_types = {
             row["event_type"]
-            for row in await database.fetch_all("SELECT event_type FROM obs_events")
+            for row in await database.fetch_all(select(EventRow.event_type))
         }
         assert "langgraph.node.started" in event_types
         assert "langgraph.interrupt.requested" in event_types
         assert "langgraph.resumed" in event_types
-        spans = await database.fetch_all("SELECT * FROM obs_spans WHERE kind = 'LANGGRAPH_NODE'")
+        spans = await database.fetch_all(
+            select(SpanRow.__table__).where(SpanRow.kind == "LANGGRAPH_NODE")
+        )
         assert spans and spans[0]["operation_name"] == "wait_for_approval"
     finally:
         await database.shutdown()
@@ -599,9 +620,9 @@ async def test_langgraph_observer_records_node_interrupt_and_resume(tmp_path: Pa
 
 @pytest.mark.asyncio
 async def test_production_prompt_optimizer_generator_and_executor_are_observed(
-    tmp_path: Path,
+    pg_url,
 ) -> None:
-    database = ObservabilityDatabase(tmp_path / "prompt-optimization.db")
+    database = ObservabilityDatabase(pg_url)
     await database.startup()
     registry = PromptRegistry(database)
     await registry.startup()
@@ -653,7 +674,9 @@ async def test_production_prompt_optimizer_generator_and_executor_are_observed(
         assert candidate.change_summary == "补充证据约束"
         assert execution.error_message is None
         assert execution.output["evidence"] == ["source-1"]
-        calls = await database.fetch_all("SELECT * FROM obs_model_calls ORDER BY started_at")
+        calls = await database.fetch_all(
+            select(ModelCallRow.__table__).order_by(ModelCallRow.started_at)
+        )
         assert len(calls) == 2
         assert calls[0]["prompt_key"] == "agent.prompt.optimize"
         assert calls[1]["prompt_version_id"] == current["id"]
@@ -718,8 +741,8 @@ async def test_structured_raw_message_does_not_invent_missing_usage() -> None:
 
 
 @pytest.mark.asyncio
-async def test_prompt_evaluation_failure_records_model_call_and_issue(tmp_path: Path) -> None:
-    database = ObservabilityDatabase(tmp_path / "prompt-evaluation-failure.db")
+async def test_prompt_evaluation_failure_records_model_call_and_issue(pg_url) -> None:
+    database = ObservabilityDatabase(pg_url)
     await database.startup()
     registry = PromptRegistry(database)
     await registry.startup()
@@ -748,8 +771,8 @@ async def test_prompt_evaluation_failure_records_model_call_and_issue(tmp_path: 
     try:
         result = await executor.execute(version, case)
         assert result.error_message == "model timeout"
-        call = await database.fetch_one("SELECT * FROM obs_model_calls")
-        issue = await database.fetch_one("SELECT * FROM obs_issues")
+        call = await database.fetch_one(select(ModelCallRow.__table__))
+        issue = await database.fetch_one(select(IssueRow.__table__))
         assert call is not None and call["status"] == "FAILED"
         assert call["prompt_version_id"] == version["id"]
         assert call["evaluation_case_id"] == case["id"]

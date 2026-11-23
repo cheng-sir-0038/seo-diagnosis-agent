@@ -12,8 +12,8 @@ from src.seo_agent.tasks.service import TaskDeliveryService
 
 
 @pytest.mark.asyncio
-async def test_product_query_services_return_real_lists_and_details(tmp_path: Path) -> None:
-    db = SeoAgentDatabase(tmp_path / "product.db")
+async def test_product_query_services_return_real_lists_and_details(pg_url, tmp_path: Path) -> None:
+    db = SeoAgentDatabase(pg_url)
     await db.startup()
     try:
         system = SeoAgentSystemService(db)

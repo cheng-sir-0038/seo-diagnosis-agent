@@ -1,12 +1,13 @@
 import pytest
+from sqlalchemy import select
 
 from src.core.cache import CacheManager
+from src.core.evidence_models import ApiUsage
 
 
 @pytest.mark.asyncio
-async def test_cache_set_get_and_ttl(tmp_path):
-    cache = CacheManager(db_path=tmp_path / "evidence.sqlite3")
-    await cache.startup()
+async def test_cache_set_get_and_ttl():
+    cache = CacheManager()
 
     await cache.set("key", {"value": 1}, ttl=60)
 
@@ -15,12 +16,13 @@ async def test_cache_set_get_and_ttl(tmp_path):
     await cache.invalidate("key")
 
     assert await cache.get("key") is None
+    await cache.set("expired", "value", ttl=0)
+    assert await cache.get("expired") is None
     await cache.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_snapshot_survives_cache_manager_restart(tmp_path):
-    db_path = tmp_path / "evidence.sqlite3"
+async def test_snapshot_survives_cache_manager_restart(pg_url):
     response = {
         "meta": {
             "capability": "search_metrics",
@@ -34,7 +36,7 @@ async def test_snapshot_survives_cache_manager_restart(tmp_path):
         "data": {"organic_traffic_estimate": 12},
     }
 
-    first = CacheManager(db_path=db_path)
+    first = CacheManager(pg_url)
     await first.startup()
     snapshot_id = await first.save_snapshot(
         task_id="task-1",
@@ -45,8 +47,14 @@ async def test_snapshot_survives_cache_manager_restart(tmp_path):
     await first.log_api_usage("dataforseo", "competitors_domain", 2, True)
     await first.shutdown()
 
-    second = CacheManager(db_path=db_path)
+    second = CacheManager(pg_url)
     await second.startup()
 
     assert await second.get_snapshot(snapshot_id) == response
+    assert await second.get_snapshot("missing") is None
+    async with second.database.orm_session() as session:
+        log = (await session.scalars(select(ApiUsage))).one()
+        assert (log.provider, log.endpoint, log.units_consumed, log.success) == (
+            "dataforseo", "competitors_domain", 2, True,
+        )
     await second.shutdown()
