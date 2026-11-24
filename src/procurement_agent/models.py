@@ -8,7 +8,7 @@ from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 DOMAIN = "shopping_procurement"
-INTAKE_PROMPT_KEY = "workspace.procurement.intake"
+INTAKE_PROMPT_KEY = "workspace.procurement.intake.v2"
 MAX_LINES = 5
 MAX_QUOTES = 15
 MAX_RECORDS = 24
@@ -23,6 +23,7 @@ TopId = Annotated[str, Field(pattern=r"^[A-Za-z0-9_-]{1,80}$")]
 
 
 class Procedure(StrEnum):
+    SEARCH = "search"
     COMPARE = "compare"
     LIST = "list"
     RECONCILE = "reconcile"
@@ -125,8 +126,10 @@ class ProcurementIntake(_Input):
 
 INTAKE_PROMPT = (
     "购物与采购助理提取最后一条用户消息里的条件和资料。"
-    "procedure 为 compare（商品或报价比较）、list（多物品采购清单）"
+    "procedure 为 search（按关键词查商品或参考价）、compare（比较采购报价）、list（多物品采购清单）"
     "或 reconcile（核对订单、到货、支出及退款）。"
+    "只查商品和参考价时用 search，在 needs 中保留商品名称与明确规格，数量缺失时直接搜索。"
+    "用户明确要求只查天猫时，把 tmall_only 写为 true。"
     "沿用已确认任务时只输出本次补充或修订的字段。商品是买什么，不包括差旅行程或网站优化。"
     "needs 的 item 用用户所需的品类或名称，specification 用明确型号、尺寸、材质等。"
     "直接给的数量写 quantity。活动清单可以提出每人所需件数 per_person 作为待确认的估算，"

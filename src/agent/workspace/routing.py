@@ -51,7 +51,7 @@ class Route(StrEnum):
     CLARIFY = "clarify"
 
 
-ROUTE_PROMPT_KEY = "workspace.route.v6"
+ROUTE_PROMPT_KEY = "workspace.route.v7"
 SKILL_LOADED_EVENT = "skill.loaded"
 SUPERVISOR_NODE = "supervisor"
 ASK_PAGE = "请发要检查的公开网页链接或域名。"

@@ -18,7 +18,7 @@ const labels: Record<string, string> = {
   travel_compare_plans: '比对交通与住宿',
   travel_weather: '查目的地天气和出行建议',
   travel_save_plan: '保存所选出差方案',
-  shopping_catalog: '查淘宝联盟商品资料',
+  shopping_catalog: '查商品资料',
   shopping_compare_quotes: '核算同规格报价',
   shopping_build_list: '整理采购清单',
   shopping_reconcile: '核对订单和到货凭证',

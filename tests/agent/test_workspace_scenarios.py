@@ -193,8 +193,40 @@ def travel_result(events, name):
 
 
 @pytest.mark.asyncio
+async def test_procurement_search_renders_local_results_and_reuses_cache(workspace, monkeypatch):
+    monkeypatch.setattr(chat.settings, "taobao_tbk_local_catalog", True)
+    planned = {
+        "route": "shopping_procurement",
+        "procurement": {
+            "procedure": "search", "needs": [{"item": "纸杯", "specification": "200ml"}],
+        },
+    }
+    workspace.models.decisions.extend([planned, planned])
+    async with workspace.serve() as api:
+        _, events = await ask(api, "帮我搜200ml的纸杯，给我几个参考价。", conversation_id="catalog")
+        assert events[-1]["type"] == "run.completed"
+        skill = payloads(events, "skill.loaded")[0]
+        assert skill["skill"] == "shopping-and-procurement"
+        completed = payloads(events, "tool.completed")
+        assert [tool["name"] for tool in completed] == [PROCUREMENT_CATALOG]
+        assert completed[0]["render_hint"] == "cards"
+        result = travel_result(events, PROCUREMENT_CATALOG)
+        assert result["title"] == "商品搜索"
+        assert result["provenance"]["source_label"] == "本地商品库"
+        assert len(result["items"]) == 5
+        assert all("200ml" in item["title"] for item in result["items"])
+        source = result["sources"][0]
+        assert source["total_results"] == 10 and not source["cache_hit"]
+
+        _, repeated = await ask(api, "找200ml纸杯。", conversation_id="another-catalog")
+        next_source = travel_result(repeated, PROCUREMENT_CATALOG)["sources"][0]
+        assert next_source["cache_hit"] and next_source["fetched_at"] == source["fetched_at"]
+
+
+@pytest.mark.asyncio
 async def test_procurement_reuses_a_run_and_reprices_without_a_provider_key(workspace, monkeypatch):
     monkeypatch.setattr(chat.settings, "taobao_tbk_app_key", SecretStr(""))
+    monkeypatch.setattr(chat.settings, "taobao_tbk_local_catalog", False)
     need = {"item": "纸杯", "specification": "200ml", "unit": "个", "quantity": 60}
     quote = (
         "甲商家：纸杯200ml，1个装，1个起订，1至99个单价14元，满100个单价12元。"

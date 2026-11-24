@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import hmac
 import json
 import re
@@ -8,17 +10,21 @@ from decimal import Decimal
 from enum import StrEnum
 from html import unescape
 from urllib.parse import urlsplit
+from weakref import WeakValueDictionary
 
 import httpx
 from pydantic import SecretStr
 
+from src.core.cache import CacheManager
 from src.procurement_agent.evidence import safe_link
+from src.procurement_agent.local_catalog import LOCAL_CATALOG_SOURCE, material_search_response
 
 GATEWAY = "https://eco.taobao.com/router/rest"
 _TOP_TIMEZONE = timezone(timedelta(hours=8))
 _MAX_BYTES = 1_000_000
-_PAGE_SIZE = 10
-_MAX_ITEMS = 5
+CATALOG_RESULT_LIMIT = 5
+_SEARCH_CACHE_TTL = 2 * 60 * 60
+_SEARCH_LOCKS: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
 _TIMEOUT = 8.0
 _ITEM_ID = re.compile(r"[A-Za-z0-9_-]{1,80}")
 _PRICE = re.compile(r"[0-9]{1,12}(?:\.[0-9]{1,2})?")
@@ -126,9 +132,10 @@ def _result(
     *,
     fetched_at: str | None = None,
     items: list[dict] | None = None,
+    source: str = "taobao_affiliate",
 ) -> dict:
     return {
-        "source": "taobao_affiliate",
+        "source": source,
         "method": method.value,
         "status": status.value,
         "fetched_at": fetched_at,
@@ -137,11 +144,37 @@ def _result(
     }
 
 
+def _decode_response(
+    method: _Method, payload: dict, fetched_at: str, *, source: str = "taobao_affiliate"
+) -> tuple[dict, dict]:
+    if (error := payload.get("error_response")) is not None:
+        return _result(method, _status(_record(error)), fetched_at=fetched_at, source=source), {}
+    envelope = payload.get(method.removeprefix("taobao.").replace(".", "_") + "_response")
+    if not isinstance(envelope, dict):
+        return _result(method, Status.INVALID_RESPONSE, fetched_at=fetched_at, source=source), {}
+    return _result(method, Status.OK, fetched_at=fetched_at, source=source), envelope
+
+
 class TaobaoAffiliate:
-    def __init__(self, app_key: SecretStr, app_secret: SecretStr, adzone_id: str) -> None:
+    def __init__(
+        self, app_key: SecretStr, app_secret: SecretStr, adzone_id: str, *,
+        local_catalog: bool = False, cache: CacheManager | None = None,
+    ) -> None:
         self._app_key, self._app_secret, self._adzone_id = app_key, app_secret, adzone_id.strip()
+        self._local_catalog = local_catalog
+        self._cache = cache
 
     async def _call(self, method: _Method, args: dict[str, str]) -> tuple[dict, dict]:
+        if self._local_catalog and method == _Method.SEARCH:
+            payload = material_search_response(
+                args["q"],
+                page=int(args["page_no"]),
+                page_size=int(args["page_size"]),
+                tmall_only=args.get("is_tmall") == "true",
+            )
+            return _decode_response(
+                method, payload, datetime.now(UTC).isoformat(), source=LOCAL_CATALOG_SOURCE
+            )
         key = self._app_key.get_secret_value().strip()
         secret = self._app_secret.get_secret_value()
         if (
@@ -192,12 +225,7 @@ class TaobaoAffiliate:
             return _result(method, Status.ERROR, fetched_at=fetched_at), {}
         except (ValueError, RecursionError):
             return _result(method, Status.INVALID_RESPONSE, fetched_at=fetched_at), {}
-        if (error := payload.get("error_response")) is not None:
-            return _result(method, _status(_record(error)), fetched_at=fetched_at), {}
-        envelope = payload.get(method.removeprefix("taobao.").replace(".", "_") + "_response")
-        if not isinstance(envelope, dict):
-            return _result(method, Status.INVALID_RESPONSE, fetched_at=fetched_at), {}
-        return _result(method, Status.OK, fetched_at=fetched_at), envelope
+        return _decode_response(method, payload, fetched_at)
 
     @staticmethod
     def _items(receipt: dict, envelope: dict, group: str, key: str) -> dict:
@@ -221,23 +249,50 @@ class TaobaoAffiliate:
                 "message": _MESSAGES[Status.INVALID_RESPONSE],
             }
         if not items:
-            return {**receipt, "status": Status.EMPTY.value, "message": _MESSAGES[Status.EMPTY]}
-        return {
-            **receipt,
-            "items": list({item["item_id"]: item for item in items}.values())[:_MAX_ITEMS],
-        }
+            message = (
+                "本地商品库没有匹配的商品，可以换个品名或规格。"
+                if receipt["source"] == LOCAL_CATALOG_SOURCE else _MESSAGES[Status.EMPTY]
+            )
+            return {**receipt, "status": Status.EMPTY.value, "message": message}
+        unique = {item["item_id"]: item for item in items}
+        return {**receipt, "items": list(unique.values())[:CATALOG_RESULT_LIMIT]}
 
     async def search(self, keyword: str, *, tmall_only: bool) -> dict:
+        keyword = " ".join(keyword.split())
+        if self._cache is None:
+            return await self._search(keyword, tmall_only=tmall_only)
+        scope = (LOCAL_CATALOG_SOURCE,) if self._local_catalog else (
+            self._app_key.get_secret_value(),
+            self._app_secret.get_secret_value(),
+            self._adzone_id,
+        )
+        params = json.dumps((scope, keyword, tmall_only), ensure_ascii=False)
+        cache_key = f"taobao:catalog:v1:{hashlib.sha256(params.encode()).hexdigest()}"
+        async with _SEARCH_LOCKS.setdefault(cache_key, asyncio.Lock()):
+            cached = await self._cache.get(cache_key)
+            if cached is not None:
+                return {**cached, "cache_hit": True}
+            result = await self._search(keyword, tmall_only=tmall_only)
+            if result["status"] in {Status.OK, Status.EMPTY}:
+                await self._cache.set(cache_key, result, ttl=_SEARCH_CACHE_TTL)
+            return result
+
+    async def _search(self, keyword: str, *, tmall_only: bool) -> dict:
         args = {
             "q": keyword,
             "adzone_id": self._adzone_id,
             "page_no": "1",
-            "page_size": str(_PAGE_SIZE),
+            "page_size": str(CATALOG_RESULT_LIMIT),
         }
         if tmall_only:
             args["is_tmall"] = "true"
         receipt, envelope = await self._call(_Method.SEARCH, args)
-        return self._items(receipt, envelope, "result_list", "map_data")
+        result = self._items(receipt, envelope, "result_list", "map_data")
+        result["cache_hit"] = False
+        total = envelope.get("total_results")
+        if type(total) is int and total >= 0:
+            result["total_results"] = total
+        return result
 
     async def details(self, item_id: str) -> dict:
         receipt, envelope = await self._call(_Method.DETAILS, {"item_id": item_id})

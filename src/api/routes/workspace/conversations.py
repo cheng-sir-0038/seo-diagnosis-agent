@@ -140,6 +140,8 @@ def _procurement_registry() -> ToolRegistry:
         app_key=settings.taobao_tbk_app_key,
         app_secret=settings.taobao_tbk_app_secret,
         adzone_id=settings.taobao_tbk_adzone_id,
+        local_catalog=settings.taobao_tbk_local_catalog,
+        cache=cache_manager,
     )
 
 

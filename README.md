@@ -128,6 +128,7 @@ flowchart TB
 
 ### 购物与采购
 
+- 找商品可以说「帮我查 200ml 纸杯的参考价」。商品搜索工作流按名称和规格查最多 5 件，卡片显示来源、店铺、包装和参考价。同一来源、关键词和天猫筛选条件的查询缓存 2 小时。
 - 比报价可以直接说「我要买 60 个 200ml 纸杯」并贴商家原文或带表头的报价表。给出包装、起订量、阶梯单价和已知费用后，卡片会分别显示需求量、实买量、多买多少和支出。规格不同的报价单独标出。缺运费、税费或适用优惠时显示已知小计和待核对项。
 - 活动清单可从首页点「列活动采购清单」。一轮最多 5 种物品。按人数推算的用量会标为估算，有对应报价时可核对采购组合、预算和交期。询价草稿可以复制给商家。
 - 到货核对可以贴脱敏的订单、收货、付款、发票和退款记录，提供共同的订单号和各自的凭证编号。结果按订单归集并显示应到、实到与差异。净支出按确认的付款与到账退款计算。
@@ -422,6 +423,7 @@ SEO Chat 可调用 `seo_page_change_review`；需要 live 页面 HTML 能力和�
 | 百度地图（商旅） | 将地点解析成坐标，查询驾车距离和耗时 | `BAIDU_MAPS_AK` | 需 Web 服务 AK，并开通地理编码、地点检索和轻量级驾车路线等所需权限。[百度地图 Web API](https://lbsyun.baidu.com/docs/webapi) |
 | Open-Meteo（商旅） | 查城市与逐日天气预报 | 无 Key | 当前用非商业免费端点，预报最多覆盖未来 16 天。[额度及许可](https://open-meteo.com/en/pricing) |
 | 淘宝联盟（购物与采购） | 商品搜索、简版详情、指定推广券资料 | `TAOBAO_TBK_APP_KEY`、`TAOBAO_TBK_APP_SECRET`、搜索另需 `TAOBAO_TBK_ADZONE_ID` | 需应用已获得对应接口权限和额度。留空时可用自己提供的报价做比价、清单和到货核对。[搜索](https://developer.alibaba.com/docs/api.htm?apiId=64759&source=search) · [详情](https://developer.alibaba.com/docs/api.htm?apiId=64763) · [推广券](https://developer.alibaba.com/docs/api.htm?apiId=31106) |
+| 本地商品库（购物与采购） | 按关键词、规格和天猫筛选查商品 | `TAOBAO_TBK_LOCAL_CATALOG=true` | 在本地环境开启。25 个品类共 1,000 条商品由项目生成，使用淘宝联盟商品搜索的 JSON 回包结构。[商品库代码](src/procurement_agent/local_catalog.py) · [接口文档](https://developer.alibaba.com/docs/api.htm?apiId=64759) |
 
 飞猪适配已验证官方 CLI `1.0.16`。本机可运行 `npm install -g @fly-ai/flyai-cli@1.0.16`，或者将 `FLYAI_EXECUTABLE` 指向已安装的 `flyai` 完整路径。商旅仍使用已有 DeepSeek 配置。缺飞猪或百度凭据时，来源卡会展示配置状态，天气仍可单独查询。[FlyAI 源码和许可证](https://github.com/alibaba-flyai/flyai-skill)
 
@@ -538,10 +540,10 @@ export TEST_DATABASE_URL='postgresql://seo_agent:your-local-password@127.0.0.1:5
 .venv/bin/python -m pytest -q tests/agent/test_travel_{flyai,context,plan}.py tests/agent/test_workspace_scenarios.py
 ```
 
-采购回归可用以下命令运行。接口测试覆盖签名、响应结构、权限、限流和无凭据分支。对话测试覆盖改量重算、清单估算以及到货与付款去重。
+采购回归覆盖签名、权限和限流，以及本地商品库 1,000 条记录的回包格式、筛选分页和两小时缓存。对话测试覆盖查商品、改量重算、清单估算以及到货与付款去重。
 
 ```bash
-.venv/bin/python -m pytest -q tests/agent/test_procurement.py tests/agent/test_workspace_scenarios.py -k procurement
+.venv/bin/python -m pytest -q tests/agent/test_local_catalog.py tests/agent/test_procurement.py tests/agent/test_workspace_scenarios.py -k 'procurement or local_catalog'
 ```
 
 运行考研检索评测并导出逐题回执：

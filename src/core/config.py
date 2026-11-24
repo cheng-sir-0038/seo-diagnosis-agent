@@ -132,6 +132,7 @@ class Settings(BaseSettings):
     taobao_tbk_app_key: SecretStr = SecretStr("")
     taobao_tbk_app_secret: SecretStr = SecretStr("")
     taobao_tbk_adzone_id: str = ""
+    taobao_tbk_local_catalog: bool = False
 
     # ---- Agent 模型 ----
     deepseek_api_key: str = ""

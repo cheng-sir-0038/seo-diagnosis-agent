@@ -9,9 +9,11 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from src.agent.config import Skill
 from src.agent.tools.base import AgentTool, RenderHint, ToolResult, ToolRuntimeContext
 from src.agent.tools.registry import ToolRegistry
+from src.core.cache import CacheManager
 from src.procurement_agent.calculations import compare, reconcile
+from src.procurement_agent.local_catalog import LOCAL_CATALOG_LABEL, LOCAL_CATALOG_SOURCE
 from src.procurement_agent.models import DOMAIN, MAX_LINES, Lookup, Procedure, ProcurementIntake
-from src.procurement_agent.taobao import TaobaoAffiliate
+from src.procurement_agent.taobao import CATALOG_RESULT_LIMIT, TaobaoAffiliate
 
 CATALOG = "shopping_catalog"
 COMPARE = "shopping_compare_quotes"
@@ -21,10 +23,10 @@ RECONCILE = "shopping_reconcile"
 PROCUREMENT_SKILL = Skill(
     name="shopping-and-procurement",
     domain=DOMAIN,
-    description="选品、比价、清单与到货核对",
+    description="商品搜索、报价比对、清单与到货核对",
     tools=[CATALOG, COMPARE, BUILD_LIST, RECONCILE],
     prompt_fragment=(
-        "shopping_procurement 负责商品选购、纸质或粘贴的报价比较、活动采购清单、"
+        "shopping_procurement 负责按关键词找商品和查参考价、报价比较、活动采购清单、"
         "实到数量与采购支出核对。即使缺少规格、数量或链接也先分派。"
         "采购商品链接只作商品资料。如果用户明确在做商品页面SEO，仍分给seo。"
     ),
@@ -37,6 +39,7 @@ class _CatalogQuery(BaseModel):
     keywords: list[str] = Field(default_factory=list, max_length=MAX_LINES)
     tmall_only: bool = False
     lookup: Lookup | None = None
+    show_results: bool = False
 
 
 class _ReportQuery(BaseModel):
@@ -60,6 +63,12 @@ class _Tool(AgentTool):
         self.name, self.description, self.query = name, description, query
         self.parameters_schema = query.model_json_schema()
         self.handler, self.render_hint = handler, render_hint
+
+    def resolve_render_hint(self, result_payload: dict) -> RenderHint | None:
+        data = result_payload.get("data")
+        if isinstance(data, dict) and data.get("view_type") == "cards":
+            return "cards"
+        return self.render_hint
 
     async def execute(
         self,
@@ -185,7 +194,14 @@ def _plan_card(plan: dict, index: int) -> dict:
     )
 
 
-def _catalog_cards(sources: list[dict]) -> list[dict]:
+def _catalog_label(source: dict) -> str:
+    return {
+        "taobao_affiliate": "淘宝联盟",
+        LOCAL_CATALOG_SOURCE: LOCAL_CATALOG_LABEL,
+    }.get(source.get("source"), "商品资料")
+
+
+def _catalog_cards(sources: list[dict], *, limit: int | None = None) -> list[dict]:
     cards = []
     shown_errors = set()
     for index, source in enumerate(sources):
@@ -193,17 +209,25 @@ def _catalog_cards(sources: list[dict]) -> list[dict]:
             problem = source.get("message")
             if problem and problem not in shown_errors:
                 shown_errors.add(problem)
-                cards.append(_card(f"source-{index}", "淘宝联盟", {}, problem))
+                cards.append(_card(f"source-{index}", _catalog_label(source), {}, problem))
             continue
+        rows = source.get("items", [])[:CATALOG_RESULT_LIMIT if limit is None else limit]
         cards.extend(
             _provider_card(row, source, f"source-{index}-{position}")
-            for position, row in enumerate(source.get("items", [])[:3])
+            for position, row in enumerate(rows)
         )
+        if limit is not None:
+            limit -= len(rows)
     return cards
 
 
 def _provider_card(row: dict, source: dict, key: str) -> dict:
-    common = {"来源": "淘宝联盟", "查询时间": source.get("fetched_at"), "商品 ID": row["item_id"]}
+    common = {
+        "来源": _catalog_label(source),
+        "查询时间": source.get("fetched_at"),
+        "结果": "缓存命中" if source.get("cache_hit") else None,
+        "商品 ID": row["item_id"],
+    }
     if "activity_id" in row:
         return _card(
             key,
@@ -219,6 +243,7 @@ def _provider_card(row: dict, source: dict, key: str) -> dict:
             },
             "个人资格与本批适用条件待核对。",
         )
+    price_label = "目录参考价" if source.get("source") == LOCAL_CATALOG_SOURCE else "平台预估价"
     return _card(
         key,
         row["title"],
@@ -226,7 +251,7 @@ def _provider_card(row: dict, source: dict, key: str) -> dict:
             **common,
             "店铺": row["shop"],
             "商品标价": _yuan(row["reference_price_cny"]),
-            "平台预估价": _yuan(row["estimated_price_cny"]),
+            price_label: _yuan(row["estimated_price_cny"]),
             "链接": "推广链接" if row["promotion_link"] else None,
         },
         "待核对所选规格、包装和实买价格。",
@@ -306,8 +331,12 @@ def procurement_tools(
     app_key: SecretStr = SecretStr(""),
     app_secret: SecretStr = SecretStr(""),
     adzone_id: str = "",
+    local_catalog: bool = False,
+    cache: CacheManager | None = None,
 ) -> ToolRegistry:
-    client = TaobaoAffiliate(app_key, app_secret, adzone_id)
+    client = TaobaoAffiliate(
+        app_key, app_secret, adzone_id, local_catalog=local_catalog, cache=cache
+    )
 
     async def catalog(query: _CatalogQuery) -> dict:
         lookup = query.lookup
@@ -319,11 +348,23 @@ def procurement_tools(
             receipts = [
                 client.search(keyword, tmall_only=query.tmall_only) for keyword in query.keywords
             ]
-        return {"sources": await asyncio.gather(*receipts)}
+        sources = await asyncio.gather(*receipts)
+        result = {"sources": sources}
+        if query.show_results and sources:
+            result.update(_presentation("商品搜索"))
+            result["provenance"] = {
+                "source": sources[0]["source"],
+                "source_label": _catalog_label(sources[0]),
+                "is_estimated": False,
+            }
+            result["items"] = _catalog_cards(sources, limit=CATALOG_RESULT_LIMIT)
+        return result
 
     return ToolRegistry(
         [
-            _Tool(CATALOG, "读取已授权的淘宝联盟商品、详情或推广券资料。", _CatalogQuery, catalog),
+            _Tool(
+                CATALOG, "按关键词查商品，或读取已授权的商品详情和券资料。", _CatalogQuery, catalog
+            ),
             _Tool(
                 COMPARE,
                 "对齐规格、包装、阶梯价和已知费用。",

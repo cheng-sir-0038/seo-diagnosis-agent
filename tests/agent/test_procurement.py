@@ -245,6 +245,7 @@ async def test_taobao_signing_and_documented_catalog_envelopes(monkeypatch):
         "纸杯 200ml",
         "true",
     )
+    assert seen[0]["page_size"] == "5"
     assert set(seen[1]) - set(seen[0]) == {"item_id"}
     assert seen[2]["item_id"] == "34112" and seen[2]["activity_id"] == "coupon-1"
     assert details["items"][0] == result["items"][0]

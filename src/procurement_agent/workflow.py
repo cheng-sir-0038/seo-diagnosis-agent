@@ -27,6 +27,7 @@ from src.procurement_agent.models import (
     ProcurementIntake,
     RecordKind,
 )
+from src.procurement_agent.taobao import CATALOG_RESULT_LIMIT
 from src.procurement_agent.tools import BUILD_LIST, CATALOG, COMPARE, RECONCILE
 from src.seo_agent.workflows.structured_model import StructuredModelRunner
 
@@ -169,9 +170,10 @@ async def _finish(executor: AgentExecutor, run: AgentRun, text: str) -> None:
 
 
 def _catalog_arguments(intake: ProcurementIntake) -> dict | None:
-    if intake.lookup:
+    search_only = intake.procedure == Procedure.SEARCH
+    if intake.lookup and (not search_only or not intake.needs):
         return {"lookup": intake.lookup.model_dump(mode="json", exclude_none=True)}
-    with_quotes = {item_key(quote.item) for quote in intake.quotes}
+    with_quotes = set() if search_only else {item_key(quote.item) for quote in intake.quotes}
     keywords = [
         " ".join(filter(None, (need.item, need.specification)))[:120]
         for need in intake.needs
@@ -180,18 +182,22 @@ def _catalog_arguments(intake: ProcurementIntake) -> dict | None:
     return {"keywords": keywords, "tmall_only": bool(intake.tmall_only)} if keywords else None
 
 
-async def _catalog(executor: AgentExecutor, run: AgentRun, intake: ProcurementIntake) -> list[dict]:
+async def _catalog(
+    executor: AgentExecutor, run: AgentRun, intake: ProcurementIntake, *, show_results: bool = False
+) -> list[dict]:
     arguments = _catalog_arguments(intake)
     if arguments is None:
         return []
+    if show_results:
+        arguments["show_results"] = True
     result = await _tool(executor, run, CATALOG, arguments)
     if result.success:
         return result.data["sources"]
     return [
         {
-            "source": "taobao_affiliate",
+            "source": "procurement",
             "status": "error",
-            "message": "淘宝联盟查询暂未完成，可以先用你提供的报价。",
+            "message": "商品查询暂未完成，可以先用你提供的报价。",
         }
     ]
 
@@ -274,6 +280,20 @@ async def run_procurement(
 
     await executor.checkpoint(run, stage="procurement_conditions")
     try:
+        if procedure == Procedure.SEARCH:
+            sources = await _catalog(executor, run, intake, show_results=True)
+            count = min(
+                CATALOG_RESULT_LIMIT, sum(len(source.get("items", [])) for source in sources)
+            )
+            summary = (
+                f"找到 {count} 条商品资料，卡片里可核对规格、包装和参考价。"
+                if count else next(
+                    (source["message"] for source in sources if source.get("message")),
+                    "请告诉我想查的商品名称或规格。",
+                )
+            )
+            await _finish(executor, run, summary)
+            return
         sources = [] if procedure == Procedure.RECONCILE else await _catalog(executor, run, intake)
         report = await _tool(
             executor,
