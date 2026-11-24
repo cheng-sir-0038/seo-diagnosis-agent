@@ -2,6 +2,7 @@ import { lazy, Suspense } from 'react'
 
 import type { RenderHint } from '../types/agent'
 import { CardResult } from './renderers/CardResult'
+import { ProcurementResult } from './renderers/ProcurementResult'
 import { RawJsonResult } from './renderers/RawJsonResult'
 import { TableResult } from './renderers/TableResult'
 import { TreeResult } from './renderers/TreeResult'
@@ -34,6 +35,9 @@ export function ToolResultView({ hint, data, mode = 'inspector' }: ToolResultVie
     return <TreeResult data={rendererData} rawData={data} />
   }
   if (hint === 'cards' && isCardResultData(rendererData)) {
+    if (mode === 'chat' && rendererData.capability === 'shopping_procurement') {
+      return <ProcurementResult data={rendererData} />
+    }
     return <CardResult data={rendererData} />
   }
   if (mode === 'chat') {
