@@ -131,6 +131,63 @@ async def test_suggestions_adapt_to_content_without_writing_pages_or_business_da
 
 
 @pytest.mark.asyncio
+async def test_resolves_heading_and_identity_citations_to_observed_page_fields():
+    source = PageSource()
+    source.html = (
+        '<html lang="en"><head><title>Field notes</title>'
+        '<link rel="canonical" href="https://example.com"></head>'
+        "<body><h1>Field notes</h1><h2>Field checklist</h2></body></html>"
+    )
+
+    async def analyze(_page):
+        return {"headings": {"h2": ["Field checklist"]}}
+
+    source.provider.analyzer = SimpleNamespace(enabled=True, analyze=analyze)
+    output = draft()
+    output["citations"].append({"source_path": "/h2/0", "quote": "Field checklist"})
+    output["json_ld_citations"] = [{
+        "json_pointer": "/url", "source_path": "/page_identity_url", "quote": "https://example.com/",
+    }]
+    model = Model(output)
+    result = await workflow(source, model).execute({})
+
+    assert model.contexts[0]["page_identity_url"] == "https://example.com"
+    assert result.data["suggestion_status"] == "draft"
+    proposal = result.data["proposal"]
+    assert proposal["citations"][-1]["source_path"] == "/headings/h2/0"
+    assert proposal["json_ld_citations"][0]["source_path"] == "/final_url"
+    assert proposal["json_ld"]["url"] == "https://example.com/"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["citation_limit", "unsupported_author"])
+async def test_retries_an_invalid_draft_once_using_the_same_page(failure):
+    invalid = draft()
+    if failure == "citation_limit":
+        invalid["citations"] *= 9
+    else:
+        invalid["json_ld"]["author"] = {"@type": "Person", "name": "Invented author"}
+        invalid["json_ld_citations"] = [{
+            "json_pointer": "/author/name", "source_path": "/content_excerpt", "quote": "By Lin.",
+        }]
+
+    class RepairModel(Model):
+        def with_structured_output(self, schema, **kwargs):
+            if self.contexts:
+                self.output = draft()
+            return super().with_structured_output(schema, **kwargs)
+
+    source, model = PageSource(), RepairModel(invalid)
+    result = await workflow(source, model).execute({})
+
+    assert result.data["suggestion_status"] == "draft"
+    assert "author" not in result.data["proposal"]["json_ld"]
+    assert len(source.calls) == 1 and len(model.contexts) == 2
+    assert model.contexts[0]["page"] == model.contexts[1]["page"]
+    assert "1 至 6 条" in model.contexts[1]["correction"]
+
+
+@pytest.mark.asyncio
 async def test_missing_information_asks_a_question_then_uses_real_user_reply_as_separate_source():
     source = PageSource()
     first = draft()
@@ -164,6 +221,7 @@ async def test_missing_information_asks_a_question_then_uses_real_user_reply_as_
     [
         "invented_quote",
         "foreign_path",
+        "unverified_heading_alias",
         "invented_price",
         "hidden_json_fact",
         "wrong_url",
@@ -181,6 +239,8 @@ async def test_rejects_untrusted_suggestions_and_keeps_page_evidence(problem):
         output["citations"][0]["quote"] = "not on the page"
     elif problem == "foreign_path":
         output["citations"][0]["source_path"] = "/unknown"
+    elif problem == "unverified_heading_alias":
+        output["citations"][0]["source_path"] = "/h2/0"
     elif problem in {"invented_price", "hidden_json_fact"}:
         document["offers"] = {"@type": "Offer", "price": 99}
         if problem == "hidden_json_fact":
@@ -250,10 +310,12 @@ async def test_timeout_and_model_failure_do_not_expose_upstream_messages_or_disc
     tool = workflow(source, model)
     failed = await tool.execute({})
     assert failed.data["suggestion_status"] == "needs_review"
+    assert failed.data["items"][0]["title"] == "暂未取得可用建议"
     assert "private upstream failure" not in str(failed)
     model.fail, model.delay, tool.timeout = False, 0.2, 0.03
     timed_out = await tool.execute({})
     assert timed_out.data["coverage"]["draft"]["status"] == "failed"
+    assert timed_out.data["items"][0]["title"] == "建议生成超时"
     assert timed_out.data["proposal"] is None
 
 

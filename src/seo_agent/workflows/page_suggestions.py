@@ -8,11 +8,17 @@ from html import escape
 from typing import Any
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict
+from langchain_core.exceptions import OutputParserException
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from src.agent.models import HumanInputRequest
 from src.agent.tools.base import AgentTool, ToolProtocol, ToolResult, ToolRuntimeContext
-from src.models.page_suggestions import PageFactCitation, PageSeoDraft, PageSuggestionInput
+from src.models.page_suggestions import (
+    PageFactCitation,
+    PageSeoDraft,
+    PageSuggestionInput,
+    StructuredFactCitation,
+)
 from src.observability.client import ObservabilityClient
 from src.observability.instrumentation import observed_operation
 from src.observability.models import SpanKind
@@ -27,6 +33,7 @@ FACT_FIELDS = {
     "final_url",
     "canonical_url",
     "h1s",
+    "headings",
     "content_excerpt",
     "html_lang",
     "og_title",
@@ -87,6 +94,34 @@ def _http_url(value: Any) -> bool:
         and bool(parsed.hostname)
         and not (parsed.username or parsed.password)
     )
+
+
+def _normalize_draft_citations(
+    page: dict[str, Any], draft: PageSeoDraft, identity: str
+) -> PageSeoDraft:
+    def normalize(citation: PageFactCitation) -> PageFactCitation:
+        path = citation.source_path
+        if re.fullmatch(r"/h[2-6]/(?:0|[1-9]\d*)", path):
+            path = f"/headings{path}"
+        elif (
+            path == "/page_identity_url"
+            and isinstance(citation, StructuredFactCitation)
+            and citation.json_pointer == "/url"
+            and draft.json_ld is not None
+            and citation.quote == draft.json_ld.url
+        ):
+            if citation.quote == page.get("final_url"):
+                path = "/final_url"
+            elif citation.quote == identity == page.get("canonical_url"):
+                path = "/canonical_url"
+        if path != citation.source_path:
+            return citation.model_copy(update={"source_path": path})
+        return citation
+
+    return draft.model_copy(update={
+        "citations": [normalize(citation) for citation in draft.citations],
+        "json_ld_citations": [normalize(citation) for citation in draft.json_ld_citations],
+    })
 
 
 def validate_page_draft(
@@ -288,51 +323,76 @@ class PageSuggestionsWorkflow(AgentTool):
         identity = (
             page.get("canonical_url") if _http_url(page.get("canonical_url")) else page["final_url"]
         )
-        steps.coverage["draft"] = {"status": "failed"}
-        try:
-            async with asyncio.timeout(max(0, steps.deadline - time.monotonic())):
-                result = await self.runner.invoke(
-                    prompt_key="seo.page.suggestions",
-                    method="json_mode",
-                    schema=PageSeoDraft,
-                    context=PageSuggestionInput(
-                        page=page,
-                        page_identity_url=identity,
-                    ).model_dump(mode="json"),
-                    operation="page_seo_suggestions",
-                    business_object={
-                        "url": page["final_url"],
-                        "site_id": runtime.site_id if runtime else None,
-                    },
+        for attempt in range(2):
+            steps.coverage["draft"] = {"status": "failed"}
+            steps.coverage.pop("validation", None)
+            try:
+                context = PageSuggestionInput(
+                    page=page,
+                    page_identity_url=identity,
+                ).model_dump(mode="json")
+                if attempt:
+                    context["correction"] = (
+                        "前次草稿未通过校验。重新从已给的 page 取证，citations 只选 1 至 6 条"
+                        "能逐字匹配的引用。JSON-LD 只使用可自动核对的根 URL、名称、描述和语言；"
+                        "省略作者、日期、评级等可选属性。不确定页面类型时省略结构化数据。"
+                    )
+                async with asyncio.timeout(max(0, steps.deadline - time.monotonic())):
+                    result = await self.runner.invoke(
+                        prompt_key="seo.page.suggestions",
+                        method="json_mode",
+                        schema=PageSeoDraft,
+                        context=context,
+                        operation="page_seo_suggestions",
+                        business_object={
+                            "url": page["final_url"],
+                            "site_id": runtime.site_id if runtime else None,
+                        },
+                    )
+                draft = result.output
+                steps.coverage["draft"]["status"] = "complete"
+                steps.coverage["validation"] = {"status": "failed"}
+                async with observed_operation(
+                    self.observability,
+                    "validate_page_suggestions",
+                    kind=SpanKind.INTERNAL,
+                    input_data={"draft": draft, "page": page},
+                ) as span:
+                    draft = _normalize_draft_citations(page, draft, identity)
+                    document = validate_page_draft(page, draft, identity)
+                    if span:
+                        span.output_data = {"valid": True, "schema_type": draft.schema_type}
+                steps.coverage["validation"]["status"] = "complete"
+            except Exception as exc:
+                draft_returned = steps.coverage["draft"]["status"] == "complete"
+                retryable = isinstance(exc, (OutputParserException, ValidationError)) or (
+                    draft_returned and isinstance(exc, ValueError)
                 )
-            draft = result.output
-            steps.coverage["draft"]["status"] = "complete"
-            steps.coverage["validation"] = {"status": "failed"}
-            async with observed_operation(
-                self.observability,
-                "validate_page_suggestions",
-                kind=SpanKind.INTERNAL,
-                input_data={"draft": draft, "page": page},
-            ) as span:
-                document = validate_page_draft(page, draft, identity)
-                if span:
-                    span.output_data = {"valid": True, "schema_type": draft.schema_type}
-            steps.coverage["validation"]["status"] = "complete"
-        except Exception:
-            return steps.finish(
-                "page_suggestions",
-                "页面 SEO 信息建议",
-                [
-                    {
+                if attempt == 0 and retryable and time.monotonic() < steps.deadline:
+                    continue
+                if isinstance(exc, TimeoutError):
+                    title = "建议生成超时"
+                    reason = "已读到页面信息，生成建议超过本次等待时间。"
+                elif draft_returned:
+                    title = "建议未通过证据校验"
+                    reason = "草稿中的引用或结构化数据与本次页面证据不一致。"
+                else:
+                    title = "暂未取得可用建议"
+                    reason = "本次模型调用没有返回可用的建议。"
+                return steps.finish(
+                    "page_suggestions",
+                    "页面 SEO 信息建议",
+                    [{
                         "key": "unavailable",
-                        "title": "建议暂未生成",
-                        "summary": "模型调用未完成或建议未通过事实校验，已保留页面证据。",
-                    }
-                ],
-                limitations,
-                suggestion_status="needs_review",
-                proposal=None,
-            )
+                        "title": title,
+                        "summary": f"{reason}页面证据已保留，可在当前对话重新生成建议。",
+                    }],
+                    limitations,
+                    suggestion_status="needs_review",
+                    proposal=None,
+                )
+            else:
+                break
         missing = list(draft.missing_information)
         questions = list(draft.questions)
         use_available = bool(resume and resume.get("action") == "use_available")

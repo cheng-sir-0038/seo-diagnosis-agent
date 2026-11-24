@@ -33,13 +33,23 @@ class PageFactCitation(BaseModel):
     source_path: str = Field(
         min_length=1,
         max_length=200,
-        description="相对于 page 的 JSON Pointer，例如 /title、/content_excerpt、/user_supplied/0",
+        description=(
+            "相对于 page 的实际 JSON Pointer，例如 /title、/content_excerpt、"
+            "/headings/h2/0、/user_supplied/0。二级标题在 headings.h2 下。"
+        ),
     )
     quote: str = Field(min_length=1, max_length=400)
 
 
 class StructuredFactCitation(PageFactCitation):
-    json_pointer: str = Field(min_length=1, max_length=200)
+    json_pointer: str = Field(
+        min_length=1,
+        max_length=200,
+        description=(
+            "相对于 JSON-LD 对象的路径。根 /url 已自动校验，可省略引用；"
+            "若提供引用，source_path 用 /canonical_url 或 /final_url。"
+        ),
+    )
 
 
 class PageSeoDraft(BaseModel):
