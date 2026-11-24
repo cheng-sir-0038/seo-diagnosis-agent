@@ -10,7 +10,12 @@ from pydantic import SecretStr
 
 from src.core import cache as cache_module
 from src.core.cache import CacheManager
+from src.procurement_agent import taobao
 from src.procurement_agent.local_catalog import material_search_response
+from src.procurement_agent.search_intent import (
+    is_catalog_refresh_followup,
+    requests_catalog_refresh,
+)
 from src.procurement_agent.taobao import TaobaoAffiliate
 
 _RESPONSE = "tbk_dg_material_optional_upgrade_response"
@@ -88,3 +93,50 @@ async def test_local_search_uses_existing_parser_with_two_hour_cache_and_no_http
     assert missing["status"] == "no_results" and "本地商品库" in missing["message"]
     live = TaobaoAffiliate(SecretStr(""), SecretStr(""), "", cache=cache)
     assert (await live.search("纸杯 200ml", tmall_only=False))["status"] == "unconfigured"
+
+
+@pytest.mark.asyncio
+async def test_refresh_replaces_only_the_exact_catalog_cache_entry(monkeypatch):
+    calls = []
+
+    def search_local(keyword, **filters):
+        calls.append((keyword, filters["tmall_only"]))
+        return material_search_response(keyword, **filters)
+
+    monkeypatch.setattr(taobao, "material_search_response", search_local)
+    client = TaobaoAffiliate(
+        SecretStr(""), SecretStr(""), "", local_catalog=True, cache=CacheManager(),
+    )
+    await client.search("纸杯 200ml", tmall_only=False)
+    await client.search("纸杯 200ml", tmall_only=True)
+    await client.search("鼠标", tmall_only=False)
+
+    refreshed = await client.search("纸杯 200ml", tmall_only=False, force_refresh=True)
+    assert not refreshed["cache_hit"]
+    assert (await client.search("纸杯 200ml", tmall_only=True))["cache_hit"]
+    assert (await client.search("鼠标", tmall_only=False))["cache_hit"]
+    cached = await client.search("纸杯 200ml", tmall_only=False)
+    assert cached["cache_hit"] and cached["fetched_at"] == refreshed["fetched_at"]
+    assert calls == [
+        ("纸杯 200ml", False), ("纸杯 200ml", True), ("鼠标", False), ("纸杯 200ml", False),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("text", "refresh", "followup"),
+    [
+        ("最新", True, True),
+        ("帮我刷新一下上次的结果。", True, True),
+        ("查一下最新价格", True, True),
+        ("清理一下缓存", True, True),
+        ("刷新天猫200ml纸杯的价格", True, False),
+        ("查200ml纸杯，不用缓存", True, False),
+        ("找最新款无线鼠标", False, False),
+        ("查高刷新率显示器", False, False),
+        ("不要刷新，沿用上次纸杯价格", False, False),
+        ("不用查最新的价格", False, False),
+    ],
+)
+def test_only_intentional_catalog_refresh_requests_skip_cache(text, refresh, followup):
+    assert requests_catalog_refresh(text) is refresh
+    assert is_catalog_refresh_followup(text) is followup

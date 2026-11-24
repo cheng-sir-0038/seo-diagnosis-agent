@@ -44,7 +44,8 @@ from src.healthcare_agent.skills import (
 )
 from src.observability.instrumentation import observed_operation
 from src.observability.models import SpanKind
-from src.procurement_agent.models import ProcurementIntake
+from src.procurement_agent.models import Procedure, ProcurementIntake
+from src.procurement_agent.search_intent import is_catalog_refresh_followup
 from src.procurement_agent.tools import PROCUREMENT_SKILL, procurement_tools
 from src.procurement_agent.workflow import run_procurement
 from src.seo_agent.workflows.course_review import course_editor_input
@@ -64,6 +65,16 @@ class GraphState(TypedDict):
 
 def conversation_context(previous: dict[str, Any]) -> dict[str, Any]:
     """仅从同一对话的完成记录继承目标和上一轮业务。"""
+    procurement = previous.get("procurement")
+    catalog_search = None
+    if (
+        previous.get("route") == Route.PROCUREMENT and isinstance(procurement, dict)
+        and procurement.get("procedure") == Procedure.SEARCH and procurement.get("needs")
+    ):
+        catalog_search = {
+            "needs": procurement["needs"],
+            "tmall_only": procurement.get("tmall_only"),
+        }
     return {
         "target_url": previous.get("target_url"),
         "previous_route": previous.get("route"),
@@ -71,6 +82,7 @@ def conversation_context(previous: dict[str, Any]) -> dict[str, Any]:
         "previous_agent": previous.get("active_agent"),
         "previous_healthcare_skill": previous.get("healthcare_skill"),
         "previous_teacher_exam": previous.get("teacher_exam"),
+        "previous_catalog_search": catalog_search,
     }
 
 
@@ -147,6 +159,16 @@ class WorkspaceSupervisor:
             ) as span:
                 if answered and saved.get("awaiting_page") and new_targets and len(targets) == 1:
                     decision = RouteDecision(route=saved["route"], needs_page=True, target_index=1)
+                elif (
+                    not answered and saved.get("previous_route") == Route.PROCUREMENT
+                    and is_catalog_refresh_followup(latest)
+                ):
+                    checkout = ProcurementIntake(
+                        procedure=Procedure.SEARCH, **(saved.get("previous_catalog_search") or {})
+                    )
+                    decision = RouteDecision(
+                        route=Route.PROCUREMENT, needs_page=False, procurement=checkout
+                    )
                 else:
                     previous = await self._previous_dialog(run, saved.get("previous_agent"))
                     result = await self.planner.invoke(
@@ -159,6 +181,7 @@ class WorkspaceSupervisor:
                             "previous_route": saved.get("route") or saved.get("previous_route"),
                             "previous_healthcare_skill": saved.get("previous_healthcare_skill"),
                             "previous_teacher_exam": saved.get("previous_teacher_exam"),
+                            "previous_catalog_search": saved.get("previous_catalog_search"),
                             "pending_teacher_exam": saved.get("teacher_exam") if answered else None,
                             "previous_intent": next(
                                 (m["content"] for m in reversed(previous) if m["role"] == "user"),

@@ -224,6 +224,80 @@ async def test_procurement_search_renders_local_results_and_reuses_cache(workspa
 
 
 @pytest.mark.asyncio
+async def test_procurement_refresh_reuses_the_last_search_filters(workspace, monkeypatch):
+    monkeypatch.setattr(chat.settings, "taobao_tbk_local_catalog", True)
+    planned = {
+        "route": "shopping_procurement",
+        "procurement": {
+            "procedure": "search",
+            "needs": [{"item": "纸杯", "specification": "200ml"}],
+            "tmall_only": True,
+        },
+    }
+    workspace.models.decisions.extend([planned, planned])
+    async with workspace.serve() as api:
+        await ask(api, "只查天猫的200ml纸杯。", conversation_id="catalog-refresh")
+        _, latest = await ask(
+            api, "查最新的200ml天猫纸杯价格。", conversation_id="catalog-refresh",
+        )
+        args = payloads(latest, "tool.started")[0]["arguments"]
+        assert args["force_refresh"] and args["tmall_only"]
+        assert args["keywords"] == ["纸杯 200ml"]
+        assert not travel_result(latest, PROCUREMENT_CATALOG)["sources"][0]["cache_hit"]
+
+        for request in ("刷新一下", "最新"):
+            _, repeated = await ask(api, request, conversation_id="catalog-refresh")
+            assert repeated[-1]["type"] == "run.completed"
+            assert payloads(repeated, "tool.started")[0]["arguments"] == args
+            source = travel_result(repeated, PROCUREMENT_CATALOG)["sources"][0]
+            assert not source["cache_hit"] and source["total_results"] == 4
+            assert "已刷新" in payloads(repeated, "message.completed")[-1]["content"]
+        assert len(workspace.models.planner_inputs) == 2
+
+
+@pytest.mark.asyncio
+async def test_procurement_refresh_remembers_intent_after_asking_for_the_product(
+    workspace, monkeypatch,
+):
+    monkeypatch.setattr(chat.settings, "taobao_tbk_local_catalog", True)
+    workspace.models.decisions.extend([
+        {"route": "shopping_procurement", "procurement": {"procedure": "search"}},
+        {"needs": [{"item": "纸杯", "specification": "200ml"}]},
+    ])
+    async with workspace.serve() as api:
+        receipt, events = await ask(api, "我想刷新商品价格")
+        assert events[-1]["type"] == "run.waiting_for_input"
+        assert not payloads(events, "tool.started")
+        completed, _, _ = await answer_waiting(api, receipt, events, "200ml纸杯")
+        assert completed[-1]["type"] == "run.completed"
+        [call] = payloads(completed, "tool.started")
+        assert call["arguments"]["force_refresh"]
+
+
+@pytest.mark.asyncio
+async def test_procurement_repeated_refresh_continues_existing_comparison(workspace, monkeypatch):
+    monkeypatch.setattr(chat.settings, "taobao_tbk_local_catalog", True)
+    workspace.models.decisions.extend([
+        {
+            "route": "shopping_procurement",
+            "procurement": {"needs": [{"item": "纸杯", "specification": "200ml", "quantity": 60}]},
+        },
+        {},
+        {},
+    ])
+    async with workspace.serve() as api:
+        receipt, events = await ask(api, "买60只200ml纸杯，帮我比价。")
+        first, _, _ = await answer_waiting(api, receipt, events, "刷新")
+        second, _, _ = await answer_waiting(api, receipt, first, "刷新")
+        assert second[-1]["type"] == "run.waiting_for_input"
+        refreshed = [
+            call for call in payloads(second, "tool.started")
+            if call["name"] == PROCUREMENT_CATALOG and call["arguments"].get("force_refresh")
+        ]
+        assert len(refreshed) == 2 and refreshed[0]["tool_call_id"] != refreshed[1]["tool_call_id"]
+
+
+@pytest.mark.asyncio
 async def test_procurement_reuses_a_run_and_reprices_without_a_provider_key(workspace, monkeypatch):
     monkeypatch.setattr(chat.settings, "taobao_tbk_app_key", SecretStr(""))
     monkeypatch.setattr(chat.settings, "taobao_tbk_local_catalog", False)

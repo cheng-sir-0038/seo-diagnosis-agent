@@ -28,6 +28,7 @@ PROCUREMENT_SKILL = Skill(
     prompt_fragment=(
         "shopping_procurement 负责按关键词找商品和查参考价、报价比较、活动采购清单、"
         "实到数量与采购支出核对。即使缺少规格、数量或链接也先分派。"
+        "要求刷新商品查询时，沿用用户已确认的商品、规格和筛选条件，采用用户明确更改的条件。"
         "采购商品链接只作商品资料。如果用户明确在做商品页面SEO，仍分给seo。"
     ),
 )
@@ -40,6 +41,7 @@ class _CatalogQuery(BaseModel):
     tmall_only: bool = False
     lookup: Lookup | None = None
     show_results: bool = False
+    force_refresh: bool = False
 
 
 class _ReportQuery(BaseModel):
@@ -346,7 +348,10 @@ def procurement_tools(
                 receipts.append(client.coupon(lookup.item_id, lookup.activity_id))
         else:
             receipts = [
-                client.search(keyword, tmall_only=query.tmall_only) for keyword in query.keywords
+                client.search(
+                    keyword, tmall_only=query.tmall_only, force_refresh=query.force_refresh
+                )
+                for keyword in query.keywords
             ]
         sources = await asyncio.gather(*receipts)
         result = {"sources": sources}

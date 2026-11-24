@@ -257,7 +257,9 @@ class TaobaoAffiliate:
         unique = {item["item_id"]: item for item in items}
         return {**receipt, "items": list(unique.values())[:CATALOG_RESULT_LIMIT]}
 
-    async def search(self, keyword: str, *, tmall_only: bool) -> dict:
+    async def search(
+        self, keyword: str, *, tmall_only: bool, force_refresh: bool = False
+    ) -> dict:
         keyword = " ".join(keyword.split())
         if self._cache is None:
             return await self._search(keyword, tmall_only=tmall_only)
@@ -269,8 +271,9 @@ class TaobaoAffiliate:
         params = json.dumps((scope, keyword, tmall_only), ensure_ascii=False)
         cache_key = f"taobao:catalog:v1:{hashlib.sha256(params.encode()).hexdigest()}"
         async with _SEARCH_LOCKS.setdefault(cache_key, asyncio.Lock()):
-            cached = await self._cache.get(cache_key)
-            if cached is not None:
+            if force_refresh:
+                await self._cache.invalidate(cache_key)
+            elif (cached := await self._cache.get(cache_key)) is not None:
                 return {**cached, "cache_hit": True}
             result = await self._search(keyword, tmall_only=tmall_only)
             if result["status"] in {Status.OK, Status.EMPTY}:

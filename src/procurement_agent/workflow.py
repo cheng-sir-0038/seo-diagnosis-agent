@@ -27,6 +27,7 @@ from src.procurement_agent.models import (
     ProcurementIntake,
     RecordKind,
 )
+from src.procurement_agent.search_intent import requests_catalog_refresh
 from src.procurement_agent.taobao import CATALOG_RESULT_LIMIT
 from src.procurement_agent.tools import BUILD_LIST, CATALOG, COMPARE, RECONCILE
 from src.seo_agent.workflows.structured_model import StructuredModelRunner
@@ -141,6 +142,8 @@ def _merge(saved: ProcurementIntake, updates: ProcurementIntake, text: str) -> P
 
 async def _tool(executor: AgentExecutor, run: AgentRun, name: str, args: dict) -> ToolResult:
     encoded = json.dumps(args, sort_keys=True, ensure_ascii=False).encode()
+    if args.get("force_refresh") and run.human_input and run.human_input.answer:
+        encoded += run.human_input.request_id.encode()
     call = ToolCall(f"{name}:{hashlib.sha256(encoded).hexdigest()[:20]}", name, args)
     if run.tool_count >= executor.max_tool_calls and not any(
         event.type == "tool.completed" and event.payload.get("tool_call_id") == call.id
@@ -151,12 +154,13 @@ async def _tool(executor: AgentExecutor, run: AgentRun, name: str, args: dict) -
 
 
 async def _wait(
-    executor: AgentExecutor, run: AgentRun, question: str, text: str | None = None
+    executor: AgentExecutor, run: AgentRun, question: str, text: str | None = None, *,
+    force_refresh: bool = False,
 ) -> None:
     run.human_input = HumanInputState(
         request_id=f"input_{uuid4().hex}",
         tool_name=_INPUT_TOOL,
-        tool_arguments={},
+        tool_arguments={"force_refresh": True} if force_refresh else {},
         tool_result={},
         questions=[question],
         message=text,
@@ -183,13 +187,16 @@ def _catalog_arguments(intake: ProcurementIntake) -> dict | None:
 
 
 async def _catalog(
-    executor: AgentExecutor, run: AgentRun, intake: ProcurementIntake, *, show_results: bool = False
+    executor: AgentExecutor, run: AgentRun, intake: ProcurementIntake, *,
+    show_results: bool = False, force_refresh: bool = False,
 ) -> list[dict]:
     arguments = _catalog_arguments(intake)
     if arguments is None:
         return []
     if show_results:
         arguments["show_results"] = True
+    if force_refresh and arguments.get("keywords"):
+        arguments["force_refresh"] = True
     result = await _tool(executor, run, CATALOG, arguments)
     if result.success:
         return result.data["sources"]
@@ -213,15 +220,19 @@ async def run_procurement(
         return
     saved = run.dispatch_state
     today = datetime.now(_LOCAL_ZONE).date().isoformat()
+    text = next(
+        (
+            str(message["content"])
+            for message in reversed(run.messages)
+            if message["role"] == "user" and message.get("content")
+        ),
+        "",
+    )
+    message = pending.answer if pending and pending.answer else text
+    force_refresh = requests_catalog_refresh(message) or bool(
+        pending and pending.tool_arguments.get("force_refresh")
+    )
     if "procurement" not in saved:
-        text = next(
-            (
-                str(message["content"])
-                for message in reversed(run.messages)
-                if message["role"] == "user" and message.get("content")
-            ),
-            "",
-        )
         extracted = ProcurementIntake.model_validate(saved.get("procurement_intake") or {})
         intake = _merge(ProcurementIntake(), extracted, text)
         saved["procurement"] = intake.model_dump(mode="json")
@@ -275,18 +286,25 @@ async def run_procurement(
         await _wait(executor, run, "请贴订单号、应到和实到数量，以及已有的付款或退款资料。")
         return
     if procedure != Procedure.RECONCILE and not (intake.needs or intake.lookup):
-        await _wait(executor, run, "想买什么、要多少？有型号或报价也可以一起发来。")
+        question = (
+            "想刷新哪个商品？请发商品名称或规格。"
+            if force_refresh else "想买什么、要多少？有型号或报价也可以一起发来。"
+        )
+        await _wait(executor, run, question, force_refresh=force_refresh)
         return
 
     await executor.checkpoint(run, stage="procurement_conditions")
     try:
         if procedure == Procedure.SEARCH:
-            sources = await _catalog(executor, run, intake, show_results=True)
+            sources = await _catalog(
+                executor, run, intake, show_results=True, force_refresh=force_refresh,
+            )
             count = min(
                 CATALOG_RESULT_LIMIT, sum(len(source.get("items", [])) for source in sources)
             )
+            lead = "已刷新查询，" if force_refresh else ""
             summary = (
-                f"找到 {count} 条商品资料，卡片里可核对规格、包装和参考价。"
+                f"{lead}找到 {count} 条商品资料，卡片里可核对规格、包装和参考价。"
                 if count else next(
                     (source["message"] for source in sources if source.get("message")),
                     "请告诉我想查的商品名称或规格。",
@@ -294,7 +312,9 @@ async def run_procurement(
             )
             await _finish(executor, run, summary)
             return
-        sources = [] if procedure == Procedure.RECONCILE else await _catalog(executor, run, intake)
+        sources = [] if procedure == Procedure.RECONCILE else await _catalog(
+            executor, run, intake, force_refresh=force_refresh,
+        )
         report = await _tool(
             executor,
             run,
