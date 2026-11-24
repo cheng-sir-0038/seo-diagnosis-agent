@@ -229,6 +229,7 @@ class AgentExecutor:
     async def run_turns(
         self, run: AgentRun, *,
         evidence_answer: Callable[[AgentRun], str | None] | None = None,
+        extra_user_context: str | None = None,
     ) -> None:
         messages = [dict(message) for message in run.messages]
         iteration = int(run.iteration)
@@ -322,11 +323,24 @@ class AgentExecutor:
             )
             if force_summary:
                 model_messages = _inject_budget_summary_prompt(model_messages)
-            tool_choice = "none" if force_summary else "required" if evidence_answer else "auto"
+            tool_choice = (
+                "none" if force_summary or extra_user_context
+                else "required" if evidence_answer else "auto"
+            )
             tool_schemas = self.tools.schemas()
+            capture_content = self.observer is None or self.observer.record_content
             model_input = {
                 "messages": model_messages, "tools": tool_schemas, "tool_choice": tool_choice
-            }
+            } if capture_content else {"message_count": len(model_messages)}
+            if extra_user_context:
+                user_index = next(
+                    index for index in range(len(model_messages) - 1, -1, -1)
+                    if model_messages[index]["role"] == "user"
+                )
+                question = model_messages[user_index]["content"]
+                model_messages[user_index] = {
+                    **model_messages[user_index], "content": f"{question}\n\n{extra_user_context}",
+                }
             model_span = (
                 self.observer.span(
                     f"model.iteration.{iteration + 1}",
@@ -370,8 +384,10 @@ class AgentExecutor:
                     try:
                         await consume_model()
                     except Exception as exc:
+                        error = exc if capture_content else RuntimeError("资料问答模型请求失败")
                         await record_model_failure(
-                            span, exc, component=f"model.{self.provider.provider_name}",
+                            span, error,
+                            component=f"model.{self.provider.provider_name}",
                             provider=self.provider.provider_name,
                             model=self.provider.model_name or "unknown",
                             operation="stream",
@@ -379,8 +395,12 @@ class AgentExecutor:
                             time_to_first_token_ms=first_token_ms,
                             finish_reason=finish_reason,
                             input_summary=model_input,
-                            output_summary={"content": "".join(assistant_text)},
+                            output_summary=(
+                                {"content": "".join(assistant_text)} if capture_content else {}
+                            ),
                         )
+                        if not capture_content:
+                            raise error from None
                         raise
                     await span.model_call(
                         provider=self.provider.provider_name,
@@ -392,15 +412,17 @@ class AgentExecutor:
                         finish_reason=finish_reason,
                         input_summary=model_input,
                         output_summary={
-                            "content": "".join(assistant_text),
-                            "tool_calls": [
-                                {
-                                    "id": call.id,
-                                    "name": call.name,
-                                    "arguments": call.arguments,
-                                }
-                                for call in pending_calls
-                            ],
+                            **({
+                                "content": "".join(assistant_text),
+                                "tool_calls": [
+                                    {
+                                        "id": call.id,
+                                        "name": call.name,
+                                        "arguments": call.arguments,
+                                    }
+                                    for call in pending_calls
+                                ],
+                            } if capture_content else {}),
                             "text_length": sum(len(part) for part in assistant_text),
                             "tool_call_count": len(pending_calls),
                             "iteration": iteration + 1,

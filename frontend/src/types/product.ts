@@ -178,6 +178,9 @@ export interface ObservabilityTrace {
   started_at: string
   completed_at?: string | null
   duration_ms?: number | null
+  metadata_json?: string
+  input_json?: string
+  output_json?: string
   runs?: ObservabilityRun[]
   events?: ObservabilityEvent[]
   model_calls?: ModelCallRecord[]
@@ -211,6 +214,7 @@ export interface ObservabilitySpan {
 
 export interface ObservabilityEvent {
   id: string
+  span_id?: string | null
   sequence: number
   event_type: string
   severity: string
@@ -233,11 +237,14 @@ export interface ModelCallRecord {
   structured_output_valid?: number | null
   status: string
   error_code?: string | null
+  input_summary_json?: string
+  output_summary_json?: string
   started_at: string
 }
 
 export interface ToolCallRecord {
   id: string
+  span_id?: string | null
   tool_call_id: string
   tool_name: string
   adapter_key?: string | null
@@ -247,7 +254,10 @@ export interface ToolCallRecord {
   retry_count: number
   error_code?: string | null
   error_message?: string | null
+  arguments_json?: string
+  result_summary_json?: string
   started_at: string
+  timeout_seconds?: number | null
 }
 
 export interface AgentIssue {

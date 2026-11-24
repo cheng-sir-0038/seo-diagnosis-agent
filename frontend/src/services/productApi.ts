@@ -68,24 +68,27 @@ export const productApi = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
-  listObservabilityTraces: (status?: string) =>
+  listObservabilityTraces: (status?: string, signal?: AbortSignal) =>
     request<ObservabilityTrace[]>(
       `/api/v1/observability/traces${status ? `?status=${encodeURIComponent(status)}` : ''}`,
+      { signal },
     ),
-  getObservabilityTrace: (traceId: string) =>
-    request<ObservabilityTrace>(`/api/v1/observability/traces/${traceId}`),
-  listAgentIssues: (status?: string) =>
+  getObservabilityTrace: (traceId: string, signal?: AbortSignal) =>
+    request<ObservabilityTrace>(`/api/v1/observability/traces/${encodeURIComponent(traceId)}`, { signal }),
+  listAgentIssues: (status?: string, signal?: AbortSignal) =>
     request<AgentIssue[]>(
       `/api/v1/observability/issues${status ? `?status=${encodeURIComponent(status)}` : ''}`,
+      { signal },
     ),
   setAgentIssueStatus: (issueId: string, status: string) =>
     request<AgentIssue>(`/api/v1/observability/issues/${issueId}/status`, {
       method: 'PATCH',
       body: JSON.stringify({ status }),
     }),
-  listMetricSummary: (metricName?: string) =>
+  listMetricSummary: (metricName?: string, signal?: AbortSignal) =>
     request<MetricSummary[]>(
       `/api/v1/observability/metrics${metricName ? `?metric_name=${encodeURIComponent(metricName)}` : ''}`,
+      { signal },
     ),
   listPrompts: () => request<PromptDefinition[]>('/api/v1/promptops/prompts'),
   createPrompt: (payload: { prompt_key: string; name: string; purpose: string }) =>

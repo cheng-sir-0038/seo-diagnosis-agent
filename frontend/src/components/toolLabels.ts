@@ -1,3 +1,8 @@
+import {
+  BankOutlined, BarChartOutlined, BookOutlined, CalculatorOutlined, CloudOutlined, EnvironmentOutlined,
+  FileDoneOutlined, FormOutlined, MedicineBoxOutlined, SearchOutlined, SendOutlined, ShoppingCartOutlined, ToolOutlined,
+} from '@ant-design/icons'
+
 import type { ToolRun } from '../types/agent'
 import { isPresentationBase, resolveLocalizedText, unwrapToolResult } from './renderers/contracts'
 
@@ -15,6 +20,9 @@ const labels: Record<string, string> = {
   followup_read_materials: '读取资料回执',
   followup_prepare_materials: '核对报告并整理资料包',
   followup_save_confirmed: '保存已确认资料和待办',
+  travel_transport: '查询高铁与航班',
+  travel_hotels: '查询酒店和参考价',
+  travel_commute: '查询到会场的接驳路线',
   travel_compare_plans: '比对交通与住宿',
   travel_weather: '查目的地天气和出行建议',
   travel_save_plan: '保存所选出差方案',
@@ -48,7 +56,31 @@ const labels: Record<string, string> = {
   seo_share_image: '生成分享图',
 }
 
-export const toolLabel = (id: string) => labels[id] ?? id
+export const toolLabel = (id: string) => Object.hasOwn(labels, id) ? labels[id] : id
+
+const icons: Record<string, typeof ToolOutlined> = {
+  travel_transport: SendOutlined,
+  travel_hotels: BankOutlined,
+  travel_weather: CloudOutlined,
+  travel_commute: EnvironmentOutlined,
+  travel_compare_plans: CalculatorOutlined,
+  travel_save_plan: FileDoneOutlined,
+  medical_exam_registration: FormOutlined,
+  medical_exam_syllabus: BookOutlined,
+  postgraduate_admissions_search: BookOutlined,
+  medicare_drug_catalogue: MedicineBoxOutlined,
+  pubmed_literature_search: SearchOutlined,
+  ntce_written_exam_lookup: FormOutlined,
+  tal_math_practice: CalculatorOutlined,
+  math_resource_lookup: BookOutlined,
+  shopping_catalog: ShoppingCartOutlined,
+  shopping_compare_quotes: CalculatorOutlined,
+  shopping_build_list: FileDoneOutlined,
+  shopping_reconcile: FileDoneOutlined,
+}
+
+export const toolIcon = (id: string) => Object.hasOwn(icons, id) ? icons[id]
+  : id.startsWith('seo_') ? BarChartOutlined : id.startsWith('followup_') ? FileDoneOutlined : ToolOutlined
 
 const healthcareDescriptions: Record<string, string> = {
   medicare_drug_catalogue: '按通用名查询国家医保局目录中的甲乙分类、剂型与原文页码。',

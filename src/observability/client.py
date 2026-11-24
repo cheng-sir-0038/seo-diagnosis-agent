@@ -11,7 +11,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, insert, select, update
+from sqlalchemy import cast, func, insert, select, update
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.observability.context import reset_current_context, set_current_context
@@ -522,6 +523,24 @@ class ObservabilityClient:
         return await self.database.fetch_all(query.order_by(TraceRow.started_at.desc()).limit(
             max(1, min(limit, 500))
         ))
+
+    async def application_run_stats(self, run_id: str) -> dict[str, Any]:
+        filters = (
+            TraceRow.project_id == await self._ensure_project(),
+            cast(TraceRow.metadata_json, JSONB)["application_run_id"].astext == run_id,
+        )
+        elapsed = select(func.sum(TraceRow.duration_ms)).where(*filters).scalar_subquery()
+        tokens = (
+            select(func.sum(ModelCallRow.total_tokens))
+            .join(TraceRow, TraceRow.id == ModelCallRow.trace_id)
+            .where(*filters)
+            .scalar_subquery()
+        )
+        rows = await self.database.fetch_all(select(
+            elapsed.label("elapsed_ms"),
+            tokens.label("total_tokens"),
+        ))
+        return rows[0]
 
     async def list_issues(
         self, *, status: str | None = None, limit: int = 100

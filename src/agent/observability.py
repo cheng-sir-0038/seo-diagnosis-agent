@@ -25,12 +25,14 @@ class AgentRunObserver:
         session_id: str | None = None,
         agent_name: str | None = None,
         workflow_name: str = EXECUTOR_WORKFLOW,
+        record_content: bool = True,
     ) -> None:
         self.client = client
         self.operation_name = operation_name
         self.session_id = session_id
         self.agent_name = agent_name
         self.workflow_name = workflow_name
+        self.record_content = record_content
         self.trace_scope: TraceScope | None = None
         self.run_scope: RunScope | None = None
         self._initial_sequence = 0
@@ -51,7 +53,7 @@ class AgentRunObserver:
             session_id=self.session_id,
             input_data={
                 "application_run_id": run.id,
-                "messages": run.messages,
+                **({"messages": run.messages} if self.record_content else {}),
             },
             metadata={
                 "application_run_id": run.id,
@@ -78,7 +80,7 @@ class AgentRunObserver:
         final = next(
             (event for event in reversed(events) if event.type == "message.completed"), None
         )
-        if final is not None:
+        if final is not None and self.record_content:
             self.trace_scope.output_data = {"content": final.payload.get("content")}
         self.trace_scope.metadata.update({
             "application_status": run.status.value,
@@ -102,7 +104,9 @@ class AgentRunObserver:
         })
         exc: BaseException | None = None
         if run.status == RunStatus.FAILED:
-            exc = RuntimeError(run.error or "Agent run failed")
+            exc = RuntimeError(
+                (run.error or "Agent run failed") if self.record_content else "资料问答执行失败"
+            )
         elif run.status == RunStatus.CANCELLED:
             exc = asyncio.CancelledError()
         elif run.status in {RunStatus.RECOVERING, RunStatus.WAITING_FOR_INPUT}:
@@ -140,7 +144,7 @@ class AgentRunObserver:
             trace_id=self.trace_scope.trace_id,
             run_id=self.run_scope.run_id,
             event_type=event_type,
-            payload=payload or {},
+            payload=(payload or {}) if self.record_content else {},
             severity=severity,
             stage=stage,
         )
