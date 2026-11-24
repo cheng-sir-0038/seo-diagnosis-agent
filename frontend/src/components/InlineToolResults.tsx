@@ -3,6 +3,7 @@ import { lazy, Suspense } from 'react'
 
 import type { ToolRun } from '../types/agent'
 import { ResultTag } from './ResultTag'
+import { toolIcon } from './toolLabels'
 import {
   isPageMetadataData,
   isPresentationBase,
@@ -15,6 +16,8 @@ const ToolResultView = lazy(async () => {
   const module = await import('./ToolResultView')
   return { default: module.ToolResultView }
 })
+
+const examTools = new Set(['medical_exam_registration', 'medical_exam_syllabus', 'postgraduate_admissions_search'])
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -73,12 +76,14 @@ export function InlineToolResults({ tools }: { tools?: ToolRun[] }) {
           : undefined
         const hasDraft = presentation?.capability === 'page_suggestions'
           && isRecord(result) && isRecord(result.proposal)
+        const Icon = toolIcon(tool.name)
+        const exam = examTools.has(tool.name)
         return (
           <article className={`inline-tool-result-card${selfContained ? ' self-contained' : ''}`} key={tool.id}>
             {!selfContained && presentation ? (
               <header>
                 <div>
-                  <h3>{resolveLocalizedText(presentation.title, '查询结果')}</h3>
+                  <h3><Icon aria-hidden="true" />{resolveLocalizedText(presentation.title, '查询结果')}</h3>
                   {description ? <p>{description}</p> : null}
                 </div>
                 {source || hasDraft ? (
@@ -92,6 +97,8 @@ export function InlineToolResults({ tools }: { tools?: ToolRun[] }) {
                     {hasDraft ? <ResultTag icon="✦" tone="accent">建议草稿</ResultTag> : null}
                   </div>
                 ) : null}
+                {exam && <img className="inline-exam-art" src={`${import.meta.env.BASE_URL}workbench-exam.webp`}
+                  alt="" width={108} height={72} loading="lazy" />}
               </header>
             ) : null}
             <Suspense fallback={<div className="tool-result-loading" role="status">正在加载结果…</div>}>

@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { ChatPage } from '../pages/ChatPage'
@@ -13,11 +13,13 @@ const resumeAgentRun = vi.fn()
 const submitAgentInput = vi.fn()
 
 vi.mock('../services/agentApi', () => ({
+  agentApiUrl: (path: string) => path,
   createAgentRun: (...args: unknown[]) => createAgentRun(...args),
   streamAgentEvents: (...args: unknown[]) => streamAgentEvents(...args),
   cancelAgentRun: (...args: unknown[]) => cancelAgentRun(...args),
   listAgentTasks: (...args: unknown[]) => listAgentTasks(...args),
   getAgentRun: (...args: unknown[]) => getAgentRun(...args),
+  getWorkspaceRunStats: () => Promise.resolve({ elapsed_ms: null, total_tokens: null }),
   resumeAgentRun: (...args: unknown[]) => resumeAgentRun(...args),
   submitAgentInput: (...args: unknown[]) => submitAgentInput(...args),
 }))
@@ -30,6 +32,16 @@ const event = (sequence: number, type: AgentEvent['type'], payload: Record<strin
   created_at: '2026-07-24T00:00:00Z',
   payload,
 })
+
+async function openExecutionDrawer() {
+  fireEvent.click(screen.getByRole('button', { name: '打开执行详情' }))
+  return within(await screen.findByRole('dialog', { name: '执行详情' }))
+}
+
+function changeDisclosure(details: HTMLDetailsElement, open: boolean) {
+  details.open = open
+  fireEvent(details, new Event('toggle'))
+}
 
 describe('ChatPage SEO Agent integration', () => {
   beforeEach(() => {
@@ -121,6 +133,64 @@ describe('ChatPage SEO Agent integration', () => {
   afterEach(() => {
     cleanup()
     vi.clearAllMocks()
+    vi.unstubAllGlobals()
+  })
+
+  it('follows new output at the bottom, respects reading history, and keeps the reply at completion', async () => {
+    const NativeResizeObserver = ResizeObserver
+    let notifyResize = () => {}
+    vi.stubGlobal('ResizeObserver', class extends NativeResizeObserver {
+      constructor(private readonly callback: ResizeObserverCallback) { super(callback) }
+      observe(target: Element) {
+        super.observe(target)
+        if (target.classList.contains('chat-message-list')) notifyResize = () => this.callback([], this)
+      }
+    })
+    let publish!: (item: AgentEvent) => void
+    let finish!: () => void
+    streamAgentEvents.mockImplementationOnce((_url, onEvent: (item: AgentEvent) => void) =>
+      new Promise(resolve => {
+        publish = onEvent
+        finish = () => resolve({ lastEventId: 3, terminal: true })
+      }),
+    )
+
+    const { container } = render(<ChatPage />)
+    fireEvent.change(screen.getByRole('textbox', { name: '给业务助理发送消息' }), { target: { value: '核对页面' } })
+    fireEvent.click(screen.getByRole('button', { name: '发送消息' }))
+    await waitFor(() => expect(publish).toBeDefined())
+
+    const messages = container.querySelector<HTMLDivElement>('.chat-messages')!
+    let scrollTop = 200
+    let scrollHeight = 600
+    Object.defineProperties(messages, {
+      clientHeight: { value: 400 },
+      scrollHeight: { get: () => scrollHeight },
+      scrollTop: { get: () => scrollTop, set: (top: number) => { scrollTop = Math.min(top, scrollHeight - 400) } },
+    })
+    act(() => {
+      publish(event(1, 'run.started', {}))
+      publish(event(2, 'message.delta', { delta: '已核对页面。' }))
+    })
+    expect(await screen.findByText('已核对页面。')).toBeVisible()
+    scrollHeight += 120
+    notifyResize()
+    expect(messages.scrollTop).toBe(320)
+
+    messages.scrollTop = 50
+    fireEvent.scroll(messages)
+    scrollHeight += 100
+    notifyResize()
+    expect(messages.scrollTop).toBe(50)
+    expect(screen.getByRole('button', { name: '返回最新消息' })).toBeVisible()
+
+    act(() => publish(event(3, 'run.completed', { status: 'completed' })))
+    expect(screen.getByText('已核对页面。')).toBeVisible()
+    await act(async () => finish())
+    expect(screen.getAllByText('已核对页面。')).toHaveLength(1)
+    expect(messages.scrollTop).toBe(50)
+    fireEvent.click(screen.getByRole('button', { name: '返回最新消息' }))
+    expect(messages.scrollTop).toBe(scrollHeight - 400)
   })
 
   it('reopens the original run and restores the reply after a reload during generation', async () => {
@@ -133,7 +203,7 @@ describe('ChatPage SEO Agent integration', () => {
       target: { value: '核对首页索引设置' },
     })
     fireEvent.click(screen.getByRole('button', { name: '发送消息' }))
-    await screen.findByText('生成中')
+    await screen.findByText('进行中')
     const originalSignal = streamAgentEvents.mock.calls[0][2].signal
     first.unmount()
 
@@ -251,7 +321,7 @@ describe('ChatPage SEO Agent integration', () => {
     expect(submitAgentInput).toHaveBeenCalledWith('run_1', 'choice_1', 'B', 'answer')
   })
 
-  it('shows the procurement source and price gap in the result card', async () => {
+  it('shows procurement requirements, amounts and sources in separate tables', async () => {
     const agent = { agent: 'shopping_procurement', agent_run_id: 'procurement' }
     streamAgentEvents.mockImplementationOnce(async (_url, onEvent: (item: AgentEvent) => void) => {
       onEvent(event(1, 'run.started', {}))
@@ -259,9 +329,19 @@ describe('ChatPage SEO Agent integration', () => {
       onEvent(event(3, 'tool.completed', {
         ...agent, tool_call_id: 'compare', name: 'shopping_compare_quotes', render_hint: 'cards',
         result: { success: true, data: {
-          view_type: 'cards', items: [{
-            key: 'quote-0', title: '纸杯 · 甲商家', summary: '确认运费',
-            metadata: [{ label: '已知小计', value: '840.00 元' }],
+          view_type: 'cards', capability: 'shopping_procurement', items: [{
+            key: 'line-0', title: '纸杯', metadata: [
+              { label: '需求规格', value: '200ml' }, { label: '需求数量', value: '待明确' },
+            ],
+          }, {
+            key: 'quote-0', title: '纸杯 · 甲商家', summary: '确认运费；确认税费',
+            metadata: [{ label: '已知小计', value: '840.00 元' }, { label: '原文', value: '甲商家报价原文' }],
+          }, {
+            key: 'source-1-0', title: '一次性纸杯 200ml', summary: '待核对实买价格',
+            metadata: [
+              { label: '来源', value: '本地商品库' }, { label: '目录参考价', value: '4.40 元' },
+              { label: '查询时间', value: '2026-11-24T07:27:33Z' },
+            ],
           }, {
             key: 'source-0', title: '淘宝联盟', summary: '可以先使用你提供的资料。',
           }],
@@ -278,9 +358,24 @@ describe('ChatPage SEO Agent integration', () => {
     const composer = screen.getByRole('textbox', { name: '给业务助理发送消息' })
     expect((composer as HTMLTextAreaElement).value).toContain('20 人')
     fireEvent.click(screen.getByRole('button', { name: '发送消息' }))
-    const report = within(await screen.findByTestId('card-result'))
-    expect(report.getByText('确认运费')).toBeVisible()
-    expect(report.getByText('840.00 元')).toBeVisible()
+    const report = within(await screen.findByRole('region', { name: '采购结果' }))
+    const needs = within(report.getByRole('table', { name: '采购需求' }))
+    const quotes = within(report.getByRole('table', { name: '商家报价' }))
+    const candidates = within(report.getByRole('table', { name: '商品候选' }))
+    expect(needs.getByRole('rowheader', { name: '纸杯' })).toBeVisible()
+    expect(needs.getByText('待明确')).toBeVisible()
+    expect(quotes.getByText('确认运费')).toBeVisible()
+    expect(quotes.getByText('840.00 元')).toBeVisible()
+    expect(candidates.getByText('4.40 元')).toBeVisible()
+    expect(candidates.getByText('本地商品库')).toBeVisible()
+    expect(candidates.getByText(/15:27/)).toBeVisible()
+    expect(report.queryByText('查看明细')).not.toBeInTheDocument()
+    const quoteDetail = quotes.getByText('报价原文与条款').closest('details')
+    expect(quoteDetail).toBeInstanceOf(HTMLDetailsElement)
+    expect(quotes.getByText('甲商家报价原文')).not.toBeVisible()
+    changeDisclosure(quoteDetail as HTMLDetailsElement, true)
+    expect(quotes.getByText('甲商家报价原文')).toBeVisible()
+    expect(quotes.getByRole('list', { name: '待核对项' })).toHaveTextContent('确认税费')
     expect(report.getByText('淘宝联盟')).toBeVisible()
     expect(screen.getByRole('list', { name: '专员进度' })).toHaveTextContent('购物与采购待补充')
   })
@@ -298,7 +393,7 @@ describe('ChatPage SEO Agent integration', () => {
           advice: ['2026-11-23 降水概率最高 70%，建议带伞。'],
         } },
       }))
-      onEvent(event(4, 'message.completed', { content: '你准备哪天出发和返程？' }))
+      onEvent(event(4, 'message.completed', { content: '还需要你补充以下信息：\n\n1. 你准备哪天出发和返程？' }))
       onEvent(event(5, 'run.waiting_for_input', {
         ...specialist, request_id: 'trip_dates', questions: ['你准备哪天出发和返程？'],
       }))
@@ -312,14 +407,16 @@ describe('ChatPage SEO Agent integration', () => {
     const forecast = within(await screen.findByRole('region', { name: '近期天气参考' }))
     expect(forecast.getByRole('heading', { name: '近期天气参考 · 杭州' })).toBeVisible()
     expect(forecast.getByText('70% 降水概率')).toBeVisible()
-    expect(forecast.getByRole('list', { name: '出行建议' })).toHaveTextContent('建议带伞')
+    expect(forecast.getByRole('list', { name: '天气提醒' })).toHaveTextContent('建议带伞')
     expect(forecast.getByRole('link', { name: 'Open-Meteo' })).toBeInTheDocument()
+    expect(screen.getAllByText('你准备哪天出发和返程？')).toHaveLength(1)
     expect(screen.queryByRole('region', { name: '出差方案比较' })).toBeNull()
   })
 
   it('uses the latest travel comparison and waits for the user to send the selection', async () => {
     const specialist = { agent: 'travel', agent_run_id: 'trip' }
     const bookingUrl = 'https://example.com/offer?ref=original&ticket=1'
+    const routeUrl = 'https://api.map.baidu.com/direction?origin=latlng:30.77,114.22&destination=latlng:30.5,114.41&coord_type=bd09ll'
     const queriedAt = '2026-11-23T08:00:00+08:00'
     const data = {
       request: {
@@ -328,10 +425,17 @@ describe('ChatPage SEO Agent integration', () => {
       },
       revision: 2,
       plans: [{
-        id: 'plan_hash', label: '高铁与会场附近住宿', transport: 'train-1', return_transport: null, hotel: 'hotel-1',
+        id: 'plan_hash', label: '高铁与会场附近住宿', transport: 'train-1', return_transport: 'flight-1', hotel: 'hotel-1',
         known_cost: '1200.00', currency: 'CNY', complete_price: false, hotel_commute_minutes: 22,
+        cost_items: {
+          outbound: { status: 'partial', amount: '1200.00', currency: 'CNY' },
+          return: { status: 'price_unconfirmed' },
+          hotel: { status: 'price_unconfirmed' },
+          ground: { status: 'price_unconfirmed' },
+        },
         arrival_commute_minutes: 35, arrival_status: 'met',
-        missing: ['返程价格未返回'], warnings: ['房价按每晚显示，尚未取得含税总价'],
+        missing: ['返程价格未返回', '到站后前往会场的接驳时间', '住宿房型'],
+        warnings: ['房价按每晚显示，尚未取得含税总价'],
       }],
       offers: [
         {
@@ -339,10 +443,28 @@ describe('ChatPage SEO Agent integration', () => {
           to_stop: '武汉站', departs_at: '2026-12-01T08:15:00+08:00', arrives_at: '2026-12-01T12:20:00+08:00',
           amount: '600.00', currency: 'CNY', price_basis: 'person', booking_url: bookingUrl, queried_at: queriedAt,
         },
-        { id: 'hotel-1', kind: 'hotel', name: '会场附近酒店', source: 'flyai', booking_url: 'javascript:alert(1)' },
+        {
+          id: 'flight-1', kind: 'transport', mode: 'flight', name: '返程航班', source: 'flyai',
+          departs_local: '2026-12-03 08:15:00', arrives_local: '2026-12-03 09:40:00', amount: '260',
+        },
+        {
+          id: 'hotel-1', kind: 'hotel', name: '会场附近酒店', source: 'flyai', booking_url: 'javascript:alert(1)',
+          amount: '94', currency: 'CNY',
+        },
+        {
+          id: 'flight-2', kind: 'transport', direction: 'outbound', mode: 'flight', name: '备选航班', source: 'flyai',
+          from_stop: '浦东国际机场', to_stop: '天河国际机场', departs_local: '2026-12-01 22:15:00',
+          arrives_local: '2026-12-02 00:10:00', amount: '250', booking_url: bookingUrl,
+        },
       ],
       issues: ['跨平台报价尚未核对'],
       providers: [{ source: 'ctrip', status: 'unconfigured', message: '未配置授权' }],
+      routes: {
+        'train-1': { source: 'baidu', status: 'ok', origin: '武汉站', destination: '武汉国际博览中心',
+          source_url: routeUrl, items: [{ duration_minutes: 35, distance_meters: 26800 }] },
+        'hotel-1': { source: 'baidu', status: 'needs_selection', origin: '会场附近酒店',
+          message: '请确认出发地点的完整地址。' },
+      },
       weather: { source: 'open_meteo', status: 'ok', location: '武汉', timezone: 'Asia/Shanghai', queried_at: queriedAt,
         items: [{ date: '2026-12-01', temperature_min_c: 5, temperature_max_c: 12, precipitation_probability_max_pct: 65 }],
         advice: ['低温出行，建议带外套。'],
@@ -388,12 +510,55 @@ describe('ChatPage SEO Agent integration', () => {
     expect(result.getByText('返程价格未返回')).toBeInTheDocument()
     expect(result.getByText('跨平台报价尚未核对')).toBeInTheDocument()
     expect(result.getByText('房价按每晚显示，尚未取得含税总价')).toBeInTheDocument()
-    expect(result.getByText('65% 降水概率', { exact: false })).toBeInTheDocument()
-    expect(result.getByRole('list', { name: '出行建议' })).toHaveTextContent('带外套')
-    expect(result.getByText('已知费用')).toBeInTheDocument()
+    const preview = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(null, { status: 502 }))
+    try {
+      fireEvent.click(result.getByRole('tab', { name: '地图与路线' }))
+      fireEvent.change(screen.getByRole('textbox', { name: '给业务助理发送消息' }), { target: { value: '我先看一下地图' } })
+      expect(result.getByRole('tab', { name: '地图与路线' })).toHaveAttribute('aria-selected', 'true')
+      const routes = within(result.getByRole('tabpanel', { name: '地图与路线' }))
+      expect(routes.getByText('35 分钟')).toBeVisible()
+      expect(routes.getByRole('link', { name: '在百度地图查看路线' })).toHaveAttribute('href', routeUrl)
+      expect(await routes.findByText('地图暂时无法加载，可打开百度地图查看。')).toBeVisible()
+      expect(preview).toHaveBeenCalledWith('/api/v1/workspace/travel/map-preview', expect.objectContaining({
+        method: 'POST', body: JSON.stringify({ origin: [114.22, 30.77], destination: [114.41, 30.5], path: [] }),
+      }))
+      fireEvent.mouseDown(routes.getByRole('combobox', { name: '接驳路线' }))
+      fireEvent.click(await screen.findByRole('option', { name: /会场附近酒店.*地址待确认/ }))
+      expect(routes.getByText('请确认出发地点的完整地址。')).toBeVisible()
+    } finally {
+      preview.mockRestore()
+    }
+    fireEvent.click(result.getByRole('tab', { name: '天气参考' }))
+    const forecast = within(await result.findByRole('tabpanel', { name: '天气参考' }))
+    expect(forecast.getByText('65% 降水概率', { exact: false })).toBeVisible()
+    expect(forecast.getByRole('list', { name: '天气提醒' })).toHaveTextContent('带外套')
+    const comparison = result.getByText('候选与来源').closest('[role="tabpanel"]')!
+    expect(comparison).not.toBeNull()
+    expect(comparison).not.toBeVisible()
+    expect(forecast.queryByText('候选与来源')).toBeNull()
+    fireEvent.click(result.getByRole('tab', { name: '费用明细' }))
+    const fees = within(result.getByRole('tabpanel', { name: '费用明细' }))
+    expect(fees.getByText('可核算小计')).toBeVisible()
+    expect(fees.getAllByText('1,200 元', { exact: true })).toHaveLength(2)
+    expect(fees.getByText('参考价 260')).toBeVisible()
+    expect(fees.getByText('参考价 94 元')).toBeVisible()
+    expect(fees.getByText('会场接驳')).toBeVisible()
+    expect(fees.getByText('待报价')).toBeVisible()
+    expect(fees.queryByText(/接驳时间|住宿房型/)).toBeNull()
+    fireEvent.click(result.getByRole('tab', { name: '方案对比' }))
+    expect(result.getByText('已知费用小计')).toBeVisible()
+    fireEvent.click(result.getByText('交通与住宿'))
     expect(result.getByText('酒店到会场约 22 分钟')).toBeInTheDocument()
     expect(result.getByText('抵达后到会场约 35 分钟')).toBeInTheDocument()
+    expect(result.getByText('出发 2026-12-03 08:15 +08:00')).toBeVisible()
+    expect(result.getByText('到达 2026-12-03 09:40 +08:00')).toBeVisible()
     fireEvent.click(result.getByText('候选与来源'))
+    const candidates = within(result.getByRole('region', { name: '去程交通' }))
+    expect(candidates.getByText('出发 · 12/1')).toBeVisible()
+    expect(candidates.getByText('到达 · 12/2')).toBeVisible()
+    expect(candidates.getByText('00:10')).toBeVisible()
+    expect(candidates.getByRole('presentation')).toHaveAttribute('src', expect.stringContaining('workbench-travel-flight.webp'))
+    expect(candidates.getByRole('link', { name: /备选航班/ })).toHaveAttribute('href', bookingUrl)
     expect(result.getByRole('link', { name: /G123 次列车/ })).toHaveAttribute('href', bookingUrl)
     expect(result.queryByRole('link', { name: /会场附近酒店/ })).toBeNull()
     expect(screen.queryByText('旧报价结果')).toBeNull()
@@ -459,12 +624,12 @@ describe('ChatPage SEO Agent integration', () => {
       onEvent(event(7, 'run.completed', {}))
       return {lastEventId:7,terminal:true}
     })
-    getAgentRun.mockResolvedValue({id:'run_1',status:'FAILED'})
+    getAgentRun.mockResolvedValue({id:'run_1',status:'FAILED',checkpoint:{id:'checkpoint-1'}})
     const {container} = render(<ChatPage />)
     fireEvent.change(screen.getByRole('textbox', {name:'给业务助理发送消息'}), {target:{value:'给页面提建议'}})
     fireEvent.click(screen.getByRole('button', {name:'发送消息'}))
     expect(await screen.findByText('已保留本次取得的数据，见下方。')).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', {name:'基于已有证据完成'}))
+    fireEvent.click(await screen.findByRole('button', {name:'恢复任务'}))
     expect(await screen.findByText('恢复后的完整结论。')).toBeInTheDocument()
     await waitFor(() => expect(container.querySelectorAll('.chat-message.assistant')).toHaveLength(1))
     expect(screen.queryByText('已保留本次取得的数据，见下方。')).not.toBeInTheDocument()
@@ -485,7 +650,26 @@ describe('ChatPage SEO Agent integration', () => {
     fireEvent.click(screen.getByRole('button', { name: '发送消息' }))
     const participants = await screen.findByRole('list', { name: '专员进度' })
     expect(participants).toHaveTextContent('医药业务失败')
-    expect(within(participants.closest('article')!).getByText('本轮执行中断。')).toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent('资料暂时不可用')
+    expect(screen.queryByRole('button', { name: '恢复任务' })).toBeNull()
+  })
+
+  it('keeps an early failure across reloads and only offers recovery with a checkpoint', async () => {
+    getAgentRun.mockResolvedValue({ id: 'run_1', status: 'FAILED', checkpoint: null, error_message: '无法读取资料' })
+    streamAgentEvents.mockImplementationOnce(async (_url, publish: (item: AgentEvent) => void) => {
+      publish(event(1, 'run.started', {}))
+      publish(event(2, 'run.failed', { message: '无法读取资料' }))
+      return { lastEventId: 2, terminal: true }
+    })
+    const first = render(<ChatPage />)
+    fireEvent.change(screen.getByLabelText('给业务助理发送消息'), { target: { value: '核对资料' } })
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    expect(await screen.findByRole('alert')).toHaveTextContent('无法读取资料')
+    first.unmount()
+    render(<ChatPage />)
+    expect(await screen.findByRole('alert')).toHaveTextContent('无法读取资料')
+    expect(screen.queryByRole('button', { name: '恢复任务' })).toBeNull()
+    expect(createAgentRun).toHaveBeenCalledTimes(1)
   })
 
   it('keeps the actual tool with the specialist who used it when the conversation is reopened', async () => {
@@ -513,11 +697,12 @@ describe('ChatPage SEO Agent integration', () => {
     render(<ChatPage />)
     const list = within(screen.getByRole('list', { name: '专员进度' })).getAllByRole('listitem')
     expect(list).toHaveLength(2)
-    expect(list[0]).toHaveTextContent('医药业务已完成Skill · 医考考纲核对查证考纲条款')
-    expect(list[1]).toHaveTextContent('SEO / GEO已完成读取网页内容')
-    fireEvent.click(screen.getByText('执行详情'))
-    const medicalDetails = await screen.findByRole('region', { name: '医药业务' })
-    const seoDetails = screen.getByRole('region', { name: 'SEO / GEO' })
+    expect(list[0]).toHaveTextContent(/^医药业务已完成$/)
+    expect(list[1]).toHaveTextContent(/^SEO \/ GEO已完成$/)
+    const drawer = await openExecutionDrawer()
+    changeDisclosure(drawer.getByText('工具调用详情').closest('details')!, true)
+    const medicalDetails = await drawer.findByRole('region', { name: '医药业务' })
+    const seoDetails = drawer.getByRole('region', { name: 'SEO / GEO' })
     expect(within(medicalDetails).getByText('查证考纲条款')).toBeInTheDocument()
     expect(within(seoDetails).getByText('读取网页内容')).toBeInTheDocument()
   })
@@ -540,7 +725,7 @@ describe('ChatPage SEO Agent integration', () => {
     })
     fireEvent.click(screen.getByLabelText('发送消息'))
     expect(await screen.findByRole('status', { name: '分析进度' })).toHaveTextContent('正在准备任务')
-    expect(screen.getByLabelText('停止生成')).toBeEnabled()
+    expect(screen.getByLabelText('停止生成')).toBeDisabled()
     expect(screen.queryByRole('region', { name: '本次结果' })).not.toBeInTheDocument()
   })
 
@@ -565,7 +750,7 @@ describe('ChatPage SEO Agent integration', () => {
     expect(stored[0].messages[1].toolResults[0].result.data.raw).toBeUndefined()
     expect(screen.queryByText('Task 12345678 · Thread 12345678')).not.toBeInTheDocument()
     expect(screen.queryByText('数据证据', { exact: true })).not.toBeInTheDocument()
-    expect(within(reply).getByText('执行详情').closest('details')).not.toHaveAttribute('open')
+    expect(within(reply).queryByText('工具调用详情')).not.toBeInTheDocument()
     expect(screen.getAllByRole('table')).toHaveLength(1)
   })
 
@@ -781,7 +966,7 @@ Top 4-10（第4-10名） ██ 21 个 → 增长
   })
 
 
-  it('keeps execution details collapsed inside the reply and opens raw data on demand', async () => {
+  it('shows tool calls in the execution drawer and opens returned data on demand', async () => {
     render(<ChatPage />)
     fireEvent.change(screen.getByLabelText('给业务助理发送消息'), {
       target: { value: '分析自然流量下降' },
@@ -790,28 +975,27 @@ Top 4-10（第4-10名） ██ 21 个 → 增长
 
     await screen.findByText('分析完成')
     expect(screen.queryByLabelText('Agent 执行详情')).not.toBeInTheDocument()
-    const details = screen.getByText('执行详情').closest('details')!
-    expect(details).not.toHaveAttribute('open')
+    const drawer = await openExecutionDrawer()
+    const details = drawer.getByText('工具调用详情').closest('details')!
+    expect(details).toHaveAttribute('open')
     expect(screen.queryByTestId('raw-tool-result')).not.toBeInTheDocument()
 
-    details.open = true
-    fireEvent(details, new Event('toggle'))
-    expect(await within(details).findByText('关键词明细')).toBeInTheDocument()
-    expect(within(details).getByText('domain')).toBeInTheDocument()
-    expect(within(details).getByText('example.com')).toBeInTheDocument()
+    const call = (await within(details).findByText('关键词明细')).closest<HTMLDetailsElement>('details.chat-run-tool')!
+    expect(call).not.toHaveAttribute('open')
+    changeDisclosure(call, true)
+    const parameters = within(await within(call).findByRole('region', { name: '调用参数' }))
+    expect(parameters.getByTestId('raw-tool-result')).toHaveTextContent('"domain": "example.com"')
     expect(within(details).getByText('2.5 秒')).toBeInTheDocument()
     expect(within(details).queryByText('run.started')).not.toBeInTheDocument()
     expect(within(details).queryByText('tool.completed')).not.toBeInTheDocument()
 
     const result = within(details).getByText('返回数据').closest('details')!
     expect(result).not.toHaveAttribute('open')
-    result.open = true
-    fireEvent(result, new Event('toggle'))
+    changeDisclosure(result, true)
     expect(await within(result).findByTestId('raw-tool-result')).toHaveTextContent('seo agent')
     expect(screen.getAllByRole('table')).toHaveLength(1)
 
-    details.open = false
-    fireEvent(details, new Event('toggle'))
+    changeDisclosure(details, false)
     await waitFor(() => expect(screen.queryByTestId('raw-tool-result')).not.toBeInTheDocument())
   })
 

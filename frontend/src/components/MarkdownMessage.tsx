@@ -1,6 +1,6 @@
 import type { Root } from 'hast'
-import type { ComponentProps, ReactNode } from 'react'
-import ReactMarkdown from 'react-markdown'
+import { createContext, type ComponentProps, type ReactNode, useContext } from 'react'
+import ReactMarkdown, { type ExtraProps } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 
 import { MarkdownDataSummary } from './MarkdownDataSummary'
@@ -8,6 +8,13 @@ import { sanitizeAssistantContent } from './assistantContentSanitizer'
 import { splitMarkdownContent } from './markdownDataSummaryParser'
 
 const resultSlotClass = 'assistant-result-slot'
+const ResultSlot = createContext<ReactNode>(null)
+
+function MarkdownDiv({ node, children, ...props }: ComponentProps<'div'> & ExtraProps) {
+  const results = useContext(ResultSlot)
+  return node?.properties.className?.toString() === resultSlotClass
+    ? <>{results}</> : <div {...props}>{children}</div>
+}
 
 function insertResultSlot() {
   return (tree: Root) => {
@@ -32,7 +39,7 @@ export function MarkdownMessage({
   const segments = splitMarkdownContent(sanitized.content)
   const lead = results ? segments.findIndex((segment) => segment.type === 'markdown') : -1
   return (
-    <div className="markdown-body">
+    <div className="markdown-body"><ResultSlot.Provider value={results}>
       {segments.map((segment, index) => (
         segment.type === 'data-summary'
           ? <MarkdownDataSummary data={segment.data} key={`summary-${index}`} />
@@ -54,10 +61,7 @@ export function MarkdownMessage({
                     }
                     return <a {...props} href={href}>{children}</a>
                   },
-                  div: ({ node, children, ...props }) =>
-                    index === lead && node?.properties.className?.toString() === resultSlotClass
-                      ? results
-                      : <div {...props}>{children}</div>,
+                  div: MarkdownDiv,
                 }}
                 key={`markdown-${index}`}
               >
@@ -66,6 +70,6 @@ export function MarkdownMessage({
             )
       ))}
       {lead < 0 ? results : null}
-    </div>
+    </ResultSlot.Provider></div>
   )
 }

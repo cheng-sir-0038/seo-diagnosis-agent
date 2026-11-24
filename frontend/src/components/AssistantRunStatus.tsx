@@ -1,36 +1,27 @@
+import { LoadingOutlined, RightOutlined } from '@ant-design/icons'
+
 import { specialists, specialistStatusLabels } from '../specialists'
-import type { AppliedSkill, SpecialistRun, ToolRun } from '../types/agent'
-import { toolLabel } from './toolLabels'
+import type { SpecialistRun } from '../types/agent'
 
-interface Props {
+export function AssistantRunStatus({ agentRuns, stage, running, onInspect }: {
   agentRuns?: SpecialistRun[]
-  skills?: AppliedSkill[]
-  tools?: ToolRun[]
-}
-
-export function AssistantRunStatus({ agentRuns, skills, tools }: Props) {
+  stage?: string
+  running?: boolean
+  onInspect?: () => void
+}) {
   return (
-    <>
-      <div className="assistant-name">业务助理</div>
-      {!!agentRuns?.length && (
-        <ol className="assistant-agents" aria-label="专员进度">
-          {agentRuns.map(run => {
-            const { name, icon: Icon, tone } = specialists[run.agent]
-            const actions = [...new Set(tools?.filter(tool => tool.agentRunId === run.id).map(tool => toolLabel(tool.name)))]
-            const skill = skills?.find(item => item.agentRunId === run.id)
-            return (
-              <li key={run.id} className={`specialist-${tone}`}>
-                <div className="participant-heading">
-                  <span className="participant-label"><Icon aria-hidden="true" />{name}</span>
-                  <span className="participant-status" data-status={run.status}>{specialistStatusLabels[run.status]}</span>
-                </div>
-                {skill && <span className="participant-skill">Skill · {skill.label}</span>}
-                {actions.length > 0 && <small>{actions.slice(0, 2).join(' · ')}{actions.length > 2 ? ` 等 ${actions.length} 项` : ''}</small>}
-              </li>
-            )
-          })}
-        </ol>
-      )}
-    </>
+    <div className="assistant-collaboration">
+      <span className="assistant-name">主 Agent</span>
+      {!!agentRuns?.length && <ol aria-label="专员进度">
+        {agentRuns.map(run => {
+          const { name, icon: Icon } = specialists[run.agent]
+          return <li key={run.id}><RightOutlined aria-hidden="true" /><Icon aria-hidden="true" />{name}
+            <small data-status={run.status}>{specialistStatusLabels[run.status]}</small>
+          </li>
+        })}
+      </ol>}
+      {running && <span role="status" aria-label="分析进度"><LoadingOutlined spin /> {stage}</span>}
+      {onInspect && <button type="button" onClick={onInspect}>本轮执行详情<RightOutlined aria-hidden="true" /></button>}
+    </div>
   )
 }

@@ -1,5 +1,6 @@
 import { isSpecialist, specialistStatusLabels, type SpecialistStatus } from '../specialists'
 import type { AgentEvent, AppliedSkill, RenderHint, RunState, SpecialistRun, ToolRun } from '../types/agent'
+import type { AgentRunDetail } from '../services/agentApi'
 
 export const initialRunState: RunState = {
   status: 'idle',
@@ -54,6 +55,23 @@ const stopOpenSpecialists = (runs: SpecialistRun[]): SpecialistRun[] =>
 
 const stopOpenTools = (tools: ToolRun[]): ToolRun[] =>
   tools.map(tool => tool.status === 'running' ? { ...tool, status: 'cancelled' } : tool)
+
+export function readRunSnapshot(detail: AgentRunDetail, afterSequence = 0, prior?: RunState, throughSequence = Infinity): RunState {
+  let state = prior ?? initialRunState
+  for (const item of detail.events ?? []) {
+    const type = item.event_type ?? item.type
+    if (!type || item.sequence <= afterSequence || item.sequence > throughSequence) continue
+    state = reduceAgentEvent(state, {
+      event_id: item.event_id ?? item.id ?? String(item.sequence), run_id: detail.id, type,
+      sequence: item.sequence, created_at: item.created_at, payload: item.payload,
+    })
+  }
+  const status = detail.status.toLowerCase()
+  if (['pending', 'running', 'recovering', 'recovery_blocked', 'waiting_for_input', 'completed', 'failed', 'cancelled'].includes(status)) {
+    return { ...state, runId: detail.id, status: status as RunState['status'], error: detail.error_message ?? state.error }
+  }
+  return state
+}
 
 export function reduceAgentEvent(state: RunState, event: AgentEvent): RunState {
   if (event.type === 'run.reset') {

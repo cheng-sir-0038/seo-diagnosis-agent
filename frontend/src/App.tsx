@@ -3,6 +3,7 @@ import zhCN from 'antd/locale/zh_CN'
 
 import { ProductShell } from './components/ProductShell'
 import './styles.css'
+import './pages/workspace.css'
 
 const themeVariables = {
   colorPrimary: '--color-primary',
