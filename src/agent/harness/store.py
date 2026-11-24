@@ -358,14 +358,49 @@ class AgentChatHarnessStore:
             return _decode_task(*row)
 
     async def list_tasks(
-        self, *, site_id: str | None = None, status_group: str | None = None, limit: int = 100
+        self, *, site_id: str | None = None, status_group: str | None = None, limit: int = 100,
+        workspace_conversation_ids: list[str] | None = None,
+        exclude_prompt_version: str | None = None,
     ) -> list[dict[str, Any]]:
-        query = _TASKS_WITH_THREAD.order_by(AgentRuntimeTaskRow.updated_at.desc())
+        query = _TASKS_WITH_THREAD.order_by(
+            AgentRuntimeTaskRow.updated_at.desc(), AgentRuntimeTaskRow.id.desc(),
+        )
         if site_id:
             query = query.where(AgentRuntimeTaskRow.site_id == site_id)
+        if workspace_conversation_ids is not None:
+            query = query.where(
+                AgentRuntimeTaskRow.site_id.is_(None),
+                AgentRuntimeTaskRow.conversation_id.in_(workspace_conversation_ids),
+            )
         if status_group:
             query = query.where(AgentRuntimeTaskRow.status_group == status_group)
+        if exclude_prompt_version:
+            query = query.where(
+                AgentRuntimeTaskRow.prompt_version.is_distinct_from(exclude_prompt_version),
+            )
         async with self.database.orm_session() as session:
+            if workspace_conversation_ids is not None:
+                run_id = AgentRuntimeTaskRow.current_run_id
+                checkpoint_exists = select(AgentRunCheckpointRow.id).where(
+                    AgentRunCheckpointRow.agent_run_id == run_id,
+                ).exists()
+                completion = select(AgentRunEventRow.payload_json).where(
+                    AgentRunEventRow.agent_run_id == run_id,
+                    AgentRunEventRow.event_type == "run.completed",
+                ).order_by(AgentRunEventRow.sequence.desc()).limit(1).scalar_subquery()
+                rows = await session.execute(
+                    query.add_columns(checkpoint_exists, completion).limit(max(1, min(limit, 500)))
+                )
+                return [
+                    {
+                        **_decode_task(task, thread_key),
+                        "can_resume": has_checkpoint
+                        and task.status in {"FAILED", "RECOVERY_BLOCKED"},
+                        "partial": task.status == "COMPLETED"
+                        and _json(completed_payload, {}).get("partial") is True,
+                    }
+                    for task, thread_key, has_checkpoint, completed_payload in rows
+                ]
             rows = await session.execute(query.limit(max(1, min(limit, 500))))
             return [_decode_task(*row) for row in rows]
 

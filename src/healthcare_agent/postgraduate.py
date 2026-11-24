@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import unicodedata
 from enum import StrEnum
 from typing import Annotated
 
@@ -13,6 +12,8 @@ from sqlalchemy.dialects.postgresql import TSVECTOR, insert
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.agent.tools.base import ToolResult, ToolRuntimeContext
+from src.core.text_search import normalize_search_text as _normalize
+from src.core.text_search import search_tokens as _tokens
 from src.healthcare_agent.postgraduate_sources import EXCERPTS, PROGRAM
 from src.healthcare_agent.results import HealthcareTool, ask, resumed_arguments
 from src.seo_agent.db.database import SeoAgentDatabase
@@ -89,26 +90,9 @@ _QUALIFIERS = (
     "录取人数",
     "招生人数",
 )
-_WORDS = re.compile(r"[a-z0-9]+|[\u3400-\u9fff]+")
 _CATALOGUE_CODE = re.compile(r"(?<!\d)\d{6}(?!\d)")
 _INTERNAL_MEDICINE = ("内科学专硕", "内科学专业学位", "内科学专业硕士")
 _INTERNAL_MEDICINE_CODE = "105101"
-
-
-def _normalize(value: str) -> str:
-    separated = re.sub(r"[①②③④⑤⑥⑦⑧⑨⑩]", " ", value)
-    return unicodedata.normalize("NFKC", separated).casefold()
-
-
-def _tokens(value: str) -> set[str]:
-    terms: set[str] = set()
-    for word in _WORDS.findall(_normalize(value)):
-        if word.isascii() or len(word) <= 2:
-            terms.add(word)
-        else:
-            for size in (2, 3):
-                terms.update(word[i : i + size] for i in range(len(word) - size + 1))
-    return {term for term in terms if len(term) > 1 or term.isdigit()}
 
 
 async def seed_postgraduate_corpus(database: SeoAgentDatabase) -> None:

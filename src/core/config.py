@@ -9,7 +9,7 @@
     from src.core.config import settings
     print(settings.ahrefs_api_base_url)
 
-配置优先级: 系统环境变量 > 项目根目录 .env.local > .env > 默认值
+配置优先级: 系统环境变量 > 工作台数据源配置 > .env.local > .env > 默认值
 """
 
 from __future__ import annotations
@@ -19,6 +19,8 @@ from typing import Literal
 
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from src.core.source_settings import read_source_settings
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -55,6 +57,15 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    @classmethod
+    def settings_customise_sources(
+        cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings,
+    ):
+        return (
+            init_settings, env_settings, read_source_settings, dotenv_settings,
+            file_secret_settings,
+        )
 
     # ---- 项目基本信息 ----
     project_name: str = "SEO Diagnosis Agent"

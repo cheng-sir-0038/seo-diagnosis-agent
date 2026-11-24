@@ -33,7 +33,7 @@ export interface AgentEvent {
   payload: Record<string, unknown>
 }
 
-export type RunStatus = 'idle' | 'pending' | 'running' | 'recovering' | 'waiting_for_input' | 'completed' | 'failed' | 'cancelled'
+export type RunStatus = 'idle' | 'pending' | 'running' | 'recovering' | 'recovery_blocked' | 'waiting_for_input' | 'completed' | 'failed' | 'cancelled'
 
 export interface HumanInputRequest {
   requestId: string
@@ -101,15 +101,22 @@ export interface ChatMessage {
   role: 'user' | 'assistant'
   content: string
   createdAt: string
+  documents?: DocumentSummary[]
   toolResults?: ToolRun[]
   agentRuns?: SpecialistRun[]
   skills?: AppliedSkill[]
   runId?: string
+  runStatus?: RunStatus
+  error?: string
+  afterSequence?: number
+  throughSequence?: number
+  partial?: boolean
   inputRequest?: HumanInputRequest
   followupKey?: string
 }
 
 export interface SavedAgentRun {
+  replyId?: string
   priorAgentRuns?: SpecialistRun[]
   priorSkills?: AppliedSkill[]
   runId: string
@@ -125,8 +132,20 @@ export interface Conversation {
   messages: ChatMessage[]
   updatedAt: string
   activeRun?: SavedAgentRun
+  draftDocuments?: DocumentSummary[]
 }
 
+export interface WorkspaceTaskRow {
+  id: string
+  conversation_id: string
+  current_run_id: string | null
+  title: string
+  status: string
+  can_resume: boolean
+  partial: boolean
+  created_at: string
+  updated_at: string
+}
 
 export type AgentTaskStatusGroup = 'pending' | 'running' | 'ended'
 
@@ -147,3 +166,4 @@ export interface AgentTaskSummary {
   updated_at: string
   completed_at?: string | null
 }
+import type { DocumentSummary } from './workspace'

@@ -73,6 +73,8 @@ from src.api.routes.workspace.conversations import (
 from src.api.routes.workspace.conversations import (
     router as conversation_router,
 )
+from src.api.routes.workspace.documents import router as workspace_document_router
+from src.api.routes.workspace.sources import router as workspace_source_router
 from src.core.cache import cache_manager
 from src.core.config import settings
 from src.core.exceptions import ErrorResponse, InternalAdapterError, to_error_response
@@ -304,6 +306,8 @@ def _get_http_status(error_code: str) -> int:
 app.include_router(query_router, prefix="/api/v1")
 app.include_router(agent_router, prefix="/api/v1")
 app.include_router(conversation_router, prefix="/api/v1")
+app.include_router(workspace_document_router, prefix="/api/v1")
+app.include_router(workspace_source_router, prefix="/api/v1")
 app.include_router(observability_router, prefix="/api/v1")
 app.include_router(promptops_router, prefix="/api/v1")
 app.include_router(seo_agent_system_router, prefix="/api/v1")

@@ -1,4 +1,7 @@
-import type { AgentEvent, AgentTaskStatusGroup, AgentTaskSummary, ChatMessage, SpecialistDirectoryData } from '../types/agent'
+import { workspaceHeaders } from '../state/workspaceAccess'
+import type {
+  AgentEvent, AgentTaskStatusGroup, AgentTaskSummary, ChatMessage, SpecialistDirectoryData, WorkspaceTaskRow,
+} from '../types/agent'
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? ''
 const CHAT_RUNS = '/api/v1/chat/runs'
@@ -12,6 +15,14 @@ export async function listWorkspaceTools(conversationId: string, signal?: AbortS
   const query = new URLSearchParams({ conversation_id: conversationId })
   const response = await fetch(agentApiUrl(`/api/v1/chat/tools?${query}`), { signal })
   if (!response.ok) throw new Error(`读取工具目录失败（${response.status}）`)
+  return response.json()
+}
+
+export async function listWorkspaceTasks(conversationIds: string[], signal?: AbortSignal): Promise<WorkspaceTaskRow[]> {
+  const query = new URLSearchParams()
+  for (const id of conversationIds) query.append('conversation_id', id)
+  const response = await fetch(agentApiUrl(`/api/v1/chat/tasks?${query}`), { signal })
+  if (!response.ok) throw new Error(`读取任务失败（${response.status}）`)
   return response.json()
 }
 
@@ -51,6 +62,25 @@ export interface AgentRunDetail {
   current_stage?: string | null
   task_status?: string | null
   error_message?: string | null
+  checkpoint?: { id: string } | null
+  events?: Array<{
+    id?: string; event_id?: string; event_type?: AgentEvent['type']; type?: AgentEvent['type']
+    sequence: number; created_at: string; payload: AgentEvent['payload']
+  }>
+}
+
+export interface WorkspaceRunStats {
+  elapsed_ms: number | null
+  total_tokens: number | null
+}
+
+export async function getWorkspaceRunStats(runId: string, signal?: AbortSignal): Promise<WorkspaceRunStats> {
+  const response = await fetch(agentApiUrl(`${CHAT_RUNS}/${encodeURIComponent(runId)}/stats`), {
+    headers: workspaceHeaders(),
+    signal,
+  })
+  if (!response.ok) throw new Error('无法读取运行统计')
+  return response.json()
 }
 
 export interface AgentStreamOptions {
@@ -83,12 +113,22 @@ export class AgentStreamConnectionError extends Error {
 }
 
 export async function createAgentRun(messages: ChatMessage[], conversationId?: string): Promise<CreateRunResponse> {
+  const documentIds = messages.at(-1)?.documents?.map(({ id }) => id)
+  let includeTurn = true
+  const context = messages.flatMap(({ role, content, documents }, index) => {
+    if (role === 'user') includeTurn = !documents?.length || index === messages.length - 1
+    return includeTurn ? [{ role, content }] : []
+  })
   const response = await fetch(agentApiUrl(CHAT_RUNS), {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(documentIds?.length ? workspaceHeaders() : {}),
+    },
     body: JSON.stringify({
       conversation_id: conversationId,
-      messages: messages.map(({ role, content }) => ({ role, content })),
+      messages: context,
+      ...(documentIds?.length ? { document_ids: documentIds } : {}),
     }),
   })
   if (!response.ok) {
@@ -144,7 +184,7 @@ async function openEventStream(
   options: AgentStreamOptions,
 ): Promise<AgentStreamResult> {
   const url = withCursor(eventsUrl, options.afterEventId ?? 0)
-  const headers: Record<string, string> = { Accept: 'text/event-stream' }
+  const headers: Record<string, string> = { Accept: 'text/event-stream', ...workspaceHeaders() }
   if ((options.afterEventId ?? 0) > 0) headers['Last-Event-ID'] = String(options.afterEventId)
   const response = await fetch(`${API_BASE}${url}`, { signal: options.signal, headers })
   if (!response.ok || !response.body) {
@@ -225,21 +265,32 @@ function waitForRetry(delayMs: number, signal?: AbortSignal): Promise<void> {
   })
 }
 
-export async function getAgentRun(runId: string): Promise<AgentRunDetail> {
-  const response = await fetch(agentApiUrl(`${CHAT_RUNS}/${runId}`))
+export async function getAgentRun(runId: string, signal?: AbortSignal): Promise<AgentRunDetail> {
+  const headers = workspaceHeaders()
+  const url = agentApiUrl(`${CHAT_RUNS}/${runId}`)
+  const response = signal || headers['X-Workspace-Key'] ? await fetch(url, { headers, signal }) : await fetch(url)
   if (!response.ok) throw new Error(`读取 Agent 运行失败（${response.status}）`)
   return response.json() as Promise<AgentRunDetail>
 }
 
 export async function resumeAgentRun(runId: string): Promise<{ run_id: string; status: string }> {
-  const response = await fetch(agentApiUrl(`${CHAT_RUNS}/${runId}/resume`), { method: 'POST' })
-  if (!response.ok) throw new Error(`恢复 Agent 运行失败（${response.status}）`)
+  const response = await fetch(agentApiUrl(`${CHAT_RUNS}/${runId}/resume`), { method: 'POST', ...workspaceRequestHeaders() })
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}))
+    throw new Error(typeof error.detail === 'string' ? error.detail : `恢复任务失败（${response.status}）`)
+  }
   return response.json() as Promise<{ run_id: string; status: string }>
 }
 
-export async function cancelAgentRun(cancelUrl: string): Promise<void> {
-  const response = await fetch(`${API_BASE}${cancelUrl}`, { method: 'POST' })
+export async function cancelAgentRun(cancelUrl: string): Promise<{ run_id: string; status: string }> {
+  const response = await fetch(`${API_BASE}${cancelUrl}`, { method: 'POST', ...workspaceRequestHeaders() })
   if (!response.ok) throw new Error(`停止运行失败（${response.status}）`)
+  return response.json()
+}
+
+function workspaceRequestHeaders(): Pick<RequestInit, 'headers'> {
+  const headers = workspaceHeaders()
+  return headers['X-Workspace-Key'] ? { headers } : {}
 }
 
 export async function listAgentTasks(

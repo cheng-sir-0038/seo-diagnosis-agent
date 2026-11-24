@@ -105,7 +105,8 @@ async def _event_stream(run_id: str) -> AsyncIterator[str]:
 
 @router.get("/runs/{run_id}/events")
 async def stream_events(run_id: str) -> StreamingResponse:
-    if run_manager.get(run_id) is None:
+    run = run_manager.get(run_id)
+    if run is None or "document_owner" in run.dispatch_state:
         raise HTTPException(status_code=404, detail="run 不存在")
     return StreamingResponse(
         _event_stream(run_id),
@@ -116,6 +117,9 @@ async def stream_events(run_id: str) -> StreamingResponse:
 
 @router.post("/runs/{run_id}/cancel")
 async def cancel_run(run_id: str) -> dict[str, str]:
+    existing = run_manager.get(run_id)
+    if existing is not None and "document_owner" in existing.dispatch_state:
+        raise HTTPException(404, "run 不存在")
     run = run_manager.cancel(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="run 不存在")

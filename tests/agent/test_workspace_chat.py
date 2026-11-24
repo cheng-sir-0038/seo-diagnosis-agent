@@ -6,10 +6,14 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
+from src.agent.harness.store import AgentChatHarnessStore
+from src.agent.models import RunStatus
 from src.agent.providers.fake import FakeModelProvider
 from src.agent.run_manager import RunManager
 from src.api.routes.workspace import conversations as chat
 from src.models.common import Capability
+from src.seo_agent.db.database import SeoAgentDatabase
+from src.seo_agent.db.models import SiteRow
 
 
 class RouteModel:
@@ -50,8 +54,69 @@ def test_app_exposes_a_standalone_chat_contract():
     spec = app.openapi()
     create = spec["paths"]["/api/v1/chat/runs"]["post"]
     ref = create["requestBody"]["content"]["application/json"]["schema"]["$ref"].split("/")[-1]
-    assert set(spec["components"]["schemas"][ref]["properties"]) == {"conversation_id", "messages"}
+    assert set(spec["components"]["schemas"][ref]["properties"]) == {
+        "conversation_id", "messages", "document_ids",
+    }
     assert "/api/v1/seo-agent/chat/runs/{run_id}/events" in spec["paths"]
+
+
+@pytest.mark.asyncio
+async def test_workspace_tasks_only_list_requested_site_free_conversations(pg_url, monkeypatch):
+    database = SeoAgentDatabase(pg_url)
+    await database.startup()
+    store = AgentChatHarnessStore(database)
+    monkeypatch.setattr(chat, "seo_chat_harness_store", store)
+    app = FastAPI()
+    app.include_router(chat.router, prefix="/api/v1")
+    try:
+        async with database.orm_session(write=True) as db:
+            db.add(SiteRow(
+                id="site-a", name="Site A", domain="example.com", default_country="US",
+                default_language="en", timezone="UTC",
+                created_at="2026-11-24T00:00:00Z", updated_at="2026-11-24T00:00:00Z",
+            ))
+        created = []
+        for conversation_id, site_id in (("known", None), ("other", None), ("known", "site-a")):
+            created.append(await store.create_task_run(
+                site_id=site_id, conversation_id=conversation_id, title="Test task",
+                user_intent="Test task", messages=[{"role": "user", "content": "Test task"}],
+                model_provider=None, model_name=None,
+            ))
+        run = await store.restore_run(created[0].run_id, mark_recovering=False)
+        run.status = RunStatus.WAITING_FOR_INPUT
+        await store.finalize_run(run)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as api:
+            response = await api.get("/api/v1/chat/tasks", params={"conversation_id": "known"})
+            assert response.status_code == 200
+            [row] = response.json()
+            assert row["id"] == created[0].task_id
+            assert row["current_run_id"] == created[0].run_id
+            assert row["status"] == "WAITING_FOR_INPUT"
+            assert set(row) == {
+                "id", "conversation_id", "current_run_id", "title", "status",
+                "created_at", "updated_at", "can_resume", "partial",
+            }
+            assert not row["can_resume"] and not row["partial"]
+            run.status = RunStatus.FAILED
+            await store.finalize_run(run)
+            [failed] = (await api.get("/api/v1/chat/tasks?conversation_id=known")).json()
+            assert failed["status"] == "FAILED" and failed["can_resume"]
+            await store.mark_recovery_blocked(run.id, "恢复条件不足")
+            [blocked] = (await api.get("/api/v1/chat/tasks?conversation_id=known")).json()
+            assert blocked["status"] == "RECOVERY_BLOCKED" and blocked["can_resume"]
+            run.status = RunStatus.COMPLETED
+            await store.finalize_run(run)
+            await store.persist_event(run, run.emit("run.completed", {"partial": True}))
+            [partial] = (await api.get("/api/v1/chat/tasks?conversation_id=known")).json()
+            assert partial["partial"] and not partial["can_resume"]
+            assert (await api.get("/api/v1/chat/tasks")).status_code == 422
+            assert (await api.get("/api/v1/chat/tasks?conversation_id=")).status_code == 422
+            assert (await api.get("/api/v1/chat/tasks?conversation_id=unknown")).json() == []
+            await database.shutdown()
+            assert (await api.get("/api/v1/chat/tasks?conversation_id=known")).status_code == 503
+    finally:
+        if database.started:
+            await database.shutdown()
 
 
 @pytest.mark.asyncio

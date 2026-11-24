@@ -5,13 +5,14 @@ import hashlib
 import json
 import secrets
 from collections.abc import AsyncIterator
-from typing import Any, Literal
+from hmac import compare_digest
+from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 from uuid import UUID
 
 from fastapi import APIRouter, Header, HTTPException, Query, status
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 from sqlalchemy.exc import SQLAlchemyError
 
 from src.agent.harness.persistence import StoreRunPersistence
@@ -22,8 +23,17 @@ from src.agent.providers.deepseek import DeepSeekProvider
 from src.agent.run_manager import run_manager
 from src.agent.runtime.executor import AgentExecutor
 from src.agent.tools.registry import ToolRegistry
+from src.agent.workspace.documents import (
+    DOCUMENT_PROMPT_VERSION,
+    DOCUMENT_SYSTEM_PROMPT,
+    MAX_ATTACHMENT_COUNT,
+    WorkspaceDocumentStore,
+    conversation_scope,
+    workspace_owner,
+)
 from src.agent.workspace.routing import ROUTING_PROMPT, Route, Specialist
 from src.agent.workspace.supervisor import WorkspaceSupervisor, conversation_context
+from src.api.routes.workspace.documents import DocumentId, OptionalWorkspaceKey, document_store
 from src.api.routes.workspace.followup import router as followup_router
 from src.core.cache import cache_manager
 from src.core.config import settings
@@ -68,11 +78,16 @@ class CreateConversationRunRequest(BaseModel):
 
     conversation_id: str | None = Field(default=None, min_length=1, max_length=256)
     messages: list[ConversationMessage] = Field(min_length=1)
+    document_ids: list[DocumentId] = Field(default_factory=list, max_length=MAX_ATTACHMENT_COUNT)
 
     @model_validator(mode="after")
     def last_message_is_user(self) -> CreateConversationRunRequest:
         if self.messages[-1].role != "user" or not self.messages[-1].content.strip():
             raise ValueError("请以用户的业务问题开始本轮对话")
+        if self.document_ids and (
+            not self.conversation_id or len(set(self.document_ids)) != len(self.document_ids)
+        ):
+            raise ValueError("附件需要关联当前会话，且每份只可选一次。")
         return self
 
 
@@ -90,6 +105,23 @@ class ConversationRunResponse(BaseModel):
     events_url: str
     cancel_url: str
     followup_key: str | None = None
+
+
+class WorkspaceTaskRow(BaseModel):
+    id: str
+    conversation_id: str
+    current_run_id: str | None
+    title: str
+    status: str
+    can_resume: bool
+    partial: bool
+    created_at: str
+    updated_at: str
+
+
+class WorkspaceRunStats(BaseModel):
+    elapsed_ms: float | None = None
+    total_tokens: int | None = None
 
 
 class DirectoryTool(BaseModel):
@@ -150,17 +182,24 @@ async def _execute(
     provider: ModelProvider,
     registry: ToolRegistry | None,
     conversation_id: str | None,
+    document_context: str | None = None,
 ) -> None:
     run = run_manager.get(run_id)
     if run is None:
         return
+    reading_documents = "document_owner" in run.dispatch_state
     observer = (
         AgentRunObserver(
             observability_client,
-            operation_name="seo_agent.chat" if registry is not None else "workspace.chat",
-            session_id=conversation_id,
+            operation_name=(
+                "workspace.documents" if reading_documents
+                else "seo_agent.chat" if registry is not None else "workspace.chat"
+            ),
+            session_id=None if reading_documents else conversation_id,
             agent_name="seo-specialist-agent" if registry is not None else "workspace-supervisor",
-            workflow_name=EXECUTOR_WORKFLOW if registry is not None else "workspace-graph",
+            workflow_name=EXECUTOR_WORKFLOW if registry is not None or reading_documents
+            else "workspace-graph",
+            record_content=not reading_documents,
         )
         if observability_database.started
         else None
@@ -177,7 +216,28 @@ async def _execute(
         context_message_limit=settings.agent_context_message_limit,
         context_character_limit=settings.agent_context_character_limit,
     )
-    if registry is not None:
+    if reading_documents:
+        async def answer_documents(current: AgentRun) -> None:
+            context = document_context
+            if context is None:
+                state = current.dispatch_state
+                question = next(
+                    message["content"] for message in reversed(current.messages)
+                    if message["role"] == "user"
+                )
+                try:
+                    context = await WorkspaceDocumentStore(
+                        seo_chat_harness_store.database,
+                    ).model_context(
+                        state["document_owner"], conversation_scope(current.conversation_id or ""),
+                        state["document_ids"], question,
+                    )
+                except KeyError:
+                    raise ValueError("本次选中的资料已删除或无法访问。") from None
+            await executor.run_turns(current, extra_user_context=context)
+
+        await executor.run(run, workflow=answer_documents)
+    elif registry is not None:
         await executor.run(run)
     else:
         supervisor = WorkspaceSupervisor(
@@ -335,14 +395,35 @@ async def create_site_run(body: CreateSiteRunRequest) -> ConversationRunResponse
 
 
 @router.post("/runs", response_model=ConversationRunResponse, status_code=201)
-async def create_run(body: CreateConversationRunRequest) -> ConversationRunResponse:
+async def create_run(
+    body: CreateConversationRunRequest, workspace_key: OptionalWorkspaceKey = None,
+) -> ConversationRunResponse:
+    latest = body.messages[-1].content
+    if body.document_ids:
+        if explicit_followup(latest):
+            raise HTTPException(422, "请从复诊资料区上传报告，通用附件用于普通文档问答。")
+        if not workspace_key:
+            raise HTTPException(404, "选中资料不存在或无法访问。")
+        owner = workspace_owner(workspace_key)
+        try:
+            context = await document_store().model_context(
+                owner, conversation_scope(body.conversation_id or ""), body.document_ids, latest,
+            )
+        except KeyError:
+            raise HTTPException(404, "选中资料不存在或无法访问。") from None
+        except SQLAlchemyError:
+            raise HTTPException(503, "暂时无法读取选中的资料。") from None
+        return await _start_run(
+            body, site_id=None, registry=None, system_prompt=DOCUMENT_SYSTEM_PROMPT,
+            dispatch_state={"document_owner": owner, "document_ids": body.document_ids},
+            document_context=context,
+        )
     previous = {}
     if _durable_enabled() and body.conversation_id:
         previous = await seo_chat_harness_store.latest_dispatch_state(
             body.conversation_id, include_dialog=False,
         )
     state = conversation_context(previous)
-    latest = body.messages[-1].content
     if explicit_followup(latest):
         state = {
             "route": Route.FOLLOWUP, "intent": SAFE_INTENT,
@@ -364,6 +445,7 @@ async def create_run(body: CreateConversationRunRequest) -> ConversationRunRespo
 async def _start_run(
     body: CreateConversationRunRequest | CreateSiteRunRequest, *, site_id: str | None,
     registry: ToolRegistry | None, system_prompt: str, dispatch_state: dict | None = None,
+    document_context: str | None = None,
 ) -> ConversationRunResponse:
     try:
         provider = build_conversation_model()
@@ -376,7 +458,7 @@ async def _start_run(
     ]
     created = None
     if _durable_enabled():
-        intent = next(
+        intent = "资料问答" if document_context else next(
             (m.content for m in reversed(body.messages) if m.role == "user"),
             body.messages[-1].content,
         )
@@ -384,7 +466,10 @@ async def _start_run(
             site_id=site_id, conversation_id=body.conversation_id, title=intent[:120],
             user_intent=intent, messages=messages, model_provider=provider.provider_name,
             model_name=provider.model_name, dispatch_state=dispatch_state,
-            prompt_version="seo-chat-v1" if site_id else "workspace-v1",
+            prompt_version=(
+                DOCUMENT_PROMPT_VERSION if document_context
+                else "seo-chat-v1" if site_id else "workspace-v1"
+            ),
             prompt_hash=hashlib.sha256(system_prompt.encode()).hexdigest(),
             available_tools=registry.names() if registry is not None else [],
         )
@@ -396,7 +481,8 @@ async def _start_run(
     )
     run.dispatch_state = dispatch_state or {}
     run.task = asyncio.create_task(
-        _execute(run.id, provider, registry, body.conversation_id), name=f"chat:{run.id}",
+        _execute(run.id, provider, registry, body.conversation_id, document_context),
+        name=f"chat:{run.id}",
     )
     return ConversationRunResponse(
         run_id=run.id, task_id=run.task_id, thread_id=run.thread_id, status=run.status.value,
@@ -443,6 +529,12 @@ async def _load_runtime_run(run_id: str) -> AgentRun | None:
     return run_manager.register(run)
 
 
+def _require_document_access(state: dict, key: str | None) -> None:
+    owner = state.get("document_owner")
+    if owner and (not key or not compare_digest(owner, workspace_owner(key))):
+        raise HTTPException(404, "run 不存在")
+
+
 async def _event_stream(
     run_id: str,
     *,
@@ -463,6 +555,21 @@ async def _event_stream(
             yield _encode(event)
 
 
+@router.get("/tasks", response_model=list[WorkspaceTaskRow])
+async def list_workspace_tasks(
+    conversation_id: Annotated[
+        list[Annotated[str, StringConstraints(min_length=1, max_length=256)]],
+        Query(min_length=1, max_length=50),
+    ],
+    limit: int = Query(default=50, ge=1, le=100),
+) -> list[dict[str, Any]]:
+    if not _durable_enabled():
+        raise HTTPException(status_code=503, detail="Agent 运行记录暂不可用")
+    return await seo_chat_harness_store.list_tasks(
+        workspace_conversation_ids=conversation_id, limit=limit,
+    )
+
+
 @site_chat_router.get("/tasks")
 async def list_tasks(
     site_id: str | None = None,
@@ -475,6 +582,7 @@ async def list_tasks(
         site_id=site_id,
         status_group=status_group,
         limit=limit,
+        exclude_prompt_version=DOCUMENT_PROMPT_VERSION,
     )
 
 
@@ -483,22 +591,30 @@ async def get_task(task_id: str) -> dict[str, Any]:
     if not _durable_enabled():
         raise HTTPException(status_code=503, detail="Agent 运行 Harness 未启动")
     try:
-        return await seo_chat_harness_store.get_task(task_id)
+        task = await seo_chat_harness_store.get_task(task_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if task.get("prompt_version") == DOCUMENT_PROMPT_VERSION:
+        raise HTTPException(404, "任务不存在")
+    return task
 
 
 @router.get("/runs/{run_id}")
 @site_chat_router.get("/runs/{run_id}")
-async def get_run(run_id: str) -> dict[str, Any]:
+async def get_run(run_id: str, workspace_key: OptionalWorkspaceKey = None) -> dict[str, Any]:
     if _durable_enabled():
         try:
-            return await seo_chat_harness_store.get_run(run_id)
+            detail = await seo_chat_harness_store.get_run(run_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        _require_document_access(
+            (detail.get("checkpoint") or {}).get("dispatch_state", {}), workspace_key,
+        )
+        return detail
     run = run_manager.get(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="run 不存在")
+    _require_document_access(run.dispatch_state, workspace_key)
     return {
         "id": run.id,
         "status": run.status.value,
@@ -507,15 +623,40 @@ async def get_run(run_id: str) -> dict[str, Any]:
     }
 
 
+@router.get("/runs/{run_id}/stats", response_model=WorkspaceRunStats)
+async def get_run_stats(
+    run_id: str, workspace_key: OptionalWorkspaceKey = None,
+) -> WorkspaceRunStats:
+    run = await _load_runtime_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="run 不存在")
+    _require_document_access(run.dispatch_state, workspace_key)
+    observed = (
+        await observability_client.application_run_stats(run_id)
+        if observability_database.started else {}
+    )
+    elapsed = observed.get("elapsed_ms")
+    if elapsed is None and run.finished_at is not None:
+        elapsed = (run.finished_at - run.created_at).total_seconds() * 1000
+    tokens = observed.get("total_tokens")
+    return WorkspaceRunStats(
+        elapsed_ms=elapsed,
+        total_tokens=tokens if tokens is not None else run.token_usage.get("total_tokens") or None,
+    )
+
+
 @router.get("/runs/{run_id}/events")
 @site_chat_router.get("/runs/{run_id}/events")
 async def stream_events(
     run_id: str,
     after_sequence: int = Query(default=0, ge=0),
     last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+    workspace_key: OptionalWorkspaceKey = None,
 ) -> StreamingResponse:
-    if await _load_runtime_run(run_id) is None:
+    run = await _load_runtime_run(run_id)
+    if run is None:
         raise HTTPException(status_code=404, detail="run 不存在")
+    _require_document_access(run.dispatch_state, workspace_key)
     header_cursor = int(last_event_id) if last_event_id and last_event_id.isdigit() else 0
     cursor = max(after_sequence, header_cursor)
     return StreamingResponse(
@@ -531,10 +672,12 @@ async def stream_events(
 
 @router.post("/runs/{run_id}/resume")
 @site_chat_router.post("/runs/{run_id}/resume")
-async def resume_run(run_id: str) -> dict[str, str]:
+async def resume_run(run_id: str, workspace_key: OptionalWorkspaceKey = None) -> dict[str, str]:
     if not _durable_enabled():
         raise HTTPException(status_code=503, detail="Agent 运行 Harness 未启动")
-    existing = run_manager.get(run_id)
+    existing = await _load_runtime_run(run_id)
+    if existing:
+        _require_document_access(existing.dispatch_state, workspace_key)
     if existing is not None and existing.task is not None and not existing.task.done():
         raise HTTPException(status_code=409, detail="run 正在执行")
     try:
@@ -557,9 +700,13 @@ async def resume_run(run_id: str) -> dict[str, str]:
 async def submit_run_input(
     run_id: str, body: HumanInputAnswer,
     followup_key: str | None = Header(default=None, alias="X-Followup-Key", max_length=128),
+    workspace_key: OptionalWorkspaceKey = None,
 ) -> dict[str, Any]:
     if not _durable_enabled():
         raise HTTPException(status_code=503, detail="Agent 运行 Harness 未启动")
+    existing = await _load_runtime_run(run_id)
+    if existing:
+        _require_document_access(existing.dispatch_state, workspace_key)
     try:
         followup = await FollowupCaseStore(seo_chat_harness_store.database).check_input_access(
             run_id, followup_key,
@@ -571,7 +718,6 @@ async def submit_run_input(
     commands = {item.value for item in FollowupCommand}
     if followup and (body.action != "answer" or body.answer not in commands):
         raise HTTPException(422, "请通过本次复诊资料区提交操作。")
-    existing = run_manager.get(run_id)
     if (
         existing is not None and existing.task is not None and not existing.task.done()
         and existing.status == RunStatus.WAITING_FOR_INPUT
@@ -602,8 +748,10 @@ async def submit_run_input(
 
 @router.post("/runs/{run_id}/cancel")
 @site_chat_router.post("/runs/{run_id}/cancel")
-async def cancel_run(run_id: str) -> dict[str, str]:
-    await _load_runtime_run(run_id)
+async def cancel_run(run_id: str, workspace_key: OptionalWorkspaceKey = None) -> dict[str, str]:
+    existing = await _load_runtime_run(run_id)
+    if existing:
+        _require_document_access(existing.dispatch_state, workspace_key)
     run = run_manager.cancel(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="run 不存在")

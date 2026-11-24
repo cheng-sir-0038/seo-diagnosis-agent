@@ -144,6 +144,9 @@ class DataFacade:
             await provider.shutdown()
             logger.info(f"Provider [{name}] 已关闭")
 
+    def provider_modes(self) -> dict[str, str]:
+        return {name: provider.runtime_mode for name, provider in self._providers.items()}
+
     # ============================================================
     # 主入口：统一查询
     # ============================================================
