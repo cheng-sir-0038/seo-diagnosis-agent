@@ -40,6 +40,7 @@ from src.followup_agent.workflow import (
 from src.healthcare_agent import build_healthcare_registry
 from src.healthcare_agent.skills import available_healthcare_skills
 from src.observability.runtime import observability_client, observability_database
+from src.procurement_agent.tools import PROCUREMENT_SKILL, procurement_tools
 from src.seo_agent.chat.runtime import build_seo_system_prompt
 from src.seo_agent.chat.tools import build_seo_agent_registry
 from src.seo_agent.geo_a2a import configured_citation_client
@@ -134,6 +135,14 @@ def _travel_registry() -> ToolRegistry:
     )
 
 
+def _procurement_registry() -> ToolRegistry:
+    return procurement_tools(
+        app_key=settings.taobao_tbk_app_key,
+        app_secret=settings.taobao_tbk_app_secret,
+        adzone_id=settings.taobao_tbk_adzone_id,
+    )
+
+
 async def _execute(
     run_id: str,
     provider: ModelProvider,
@@ -176,6 +185,7 @@ async def _execute(
             seo_chat_harness_store.completed_tool_data if _durable_enabled() else None,
             FollowupCaseStore(seo_chat_harness_store.database) if _durable_enabled() else None,
             travel_registry=_travel_registry,
+            procurement_registry=_procurement_registry,
         )
         await executor.run(run, workflow=supervisor.execute)
 
@@ -249,6 +259,7 @@ async def list_workspace_tools(
         skills_by_agent.setdefault(Specialist(skill.domain), []).append(skill)
     skills_by_agent[Specialist.FOLLOWUP] = [FOLLOWUP_SKILL]
     skills_by_agent[Specialist.TRAVEL] = [TRAVEL_SKILL]
+    skills_by_agent[Specialist.PROCUREMENT] = [PROCUREMENT_SKILL]
     return ToolDirectory(specialists=[
         SpecialistTools(
             agent=agent, note=description,
@@ -265,6 +276,7 @@ async def list_workspace_tools(
             (Specialist.HEALTHCARE, healthcare, None), (Specialist.SEO, seo, note), *education,
             (Specialist.FOLLOWUP, followup_tools(), "使用本次提供的资料整理随访与复诊准备清单。"),
             (Specialist.TRAVEL, _travel_registry(), "核对国内出差的交通、住宿、路线和天气。"),
+            (Specialist.PROCUREMENT, _procurement_registry(), "比较报价、列采购清单和核对到货。"),
         )
     ])
 

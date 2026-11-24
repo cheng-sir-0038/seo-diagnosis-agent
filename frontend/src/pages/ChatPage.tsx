@@ -14,6 +14,7 @@ import {
   RightOutlined,
   SearchOutlined,
   SendOutlined,
+  ShoppingCartOutlined,
   SolutionOutlined,
   StopOutlined,
 } from '@ant-design/icons'
@@ -148,6 +149,16 @@ const starterGroups = [
       detail: '上海到武汉，查交通、住宿与会场通勤',
       icon: SolutionOutlined,
       prompt: '下周二从上海到武汉出差，周四返回。两人住一间房，预算 3500 元，周二下午 3 点前到武汉国际博览中心，预留 30 分钟。帮我比较高铁、飞机和酒店。',
+    }],
+  },
+  {
+    title: '购物与采购',
+    tone: 'procurement',
+    examples: [{
+      title: '列活动采购清单',
+      detail: '按人数核算纸杯、礼袋和桌牌',
+      icon: ShoppingCartOutlined,
+      prompt: '我给 20 人的活动准备纸杯、礼袋和桌牌，预算 800 元，帮我列采购清单和需要向商家确认的问题。',
     }],
   },
 ]
@@ -736,7 +747,7 @@ export function ChatPage() {
               <div className="welcome-hero">
                 <div className="welcome-intro">
                   <h1>今天想查什么？</h1>
-                  <p>检查网页、查公开资料、练数学、整理复诊记录或安排出差。</p>
+                  <p>检查网页、查资料、练数学，或安排出差和采购。</p>
                 </div>
                 <img
                   className="welcome-illustration"

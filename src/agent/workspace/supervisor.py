@@ -44,6 +44,9 @@ from src.healthcare_agent.skills import (
 )
 from src.observability.instrumentation import observed_operation
 from src.observability.models import SpanKind
+from src.procurement_agent.models import ProcurementIntake
+from src.procurement_agent.tools import PROCUREMENT_SKILL, procurement_tools
+from src.procurement_agent.workflow import run_procurement
 from src.seo_agent.workflows.course_review import course_editor_input
 from src.seo_agent.workflows.structured_model import StructuredModelRunner
 from src.travel_agent.intake import TravelIntake, china_today
@@ -88,12 +91,14 @@ class WorkspaceSupervisor:
         load_tool_data: Callable[[str, tuple[str, ...]], Awaitable[list[dict[str, Any]]]] | None,
         followup_store: FollowupCaseStore | None = None,
         travel_registry: Callable[[], ToolRegistry] = travel_tools,
+        procurement_registry: Callable[[], ToolRegistry] = procurement_tools,
     ) -> None:
         self.executor, self.planner, self.seo = executor, planner, seo
         self.medical_tools, self.load_dialog = medical_tools, load_dialog
         self.load_tool_data = load_tool_data
         self.followup_store = followup_store
         self.travel_registry = travel_registry
+        self.procurement_registry = procurement_registry
         self.client = executor.observer.client if executor.observer else None
         graph = StateGraph(GraphState)
         graph.add_node(SUPERVISOR_NODE, self.plan)
@@ -104,6 +109,7 @@ class WorkspaceSupervisor:
             Specialist.EXAM_PREP: self.education,
             Specialist.FOLLOWUP: self.followup,
             Specialist.TRAVEL: self.travel,
+            Specialist.PROCUREMENT: self.procurement,
         }
         for agent, node in specialists.items():
             graph.add_node(agent, node)
@@ -207,6 +213,10 @@ class WorkspaceSupervisor:
                     saved.pop("target_url", None)
                     intake = decision.travel or TravelIntake()
                     saved["travel_intake"] = intake.model_dump(mode="json")
+                elif decision.route == Route.PROCUREMENT:
+                    saved.pop("target_url", None)
+                    checkout = decision.procurement or ProcurementIntake()
+                    saved["procurement_intake"] = checkout.model_dump(mode="json")
                 saved.update(
                     route=decision.route, question=question, awaiting_page=wait_for_target,
                     pending_targets=targets if wait_for_target else [],
@@ -359,6 +369,23 @@ class WorkspaceSupervisor:
             await self._record_skill(run, agent_run_id, TRAVEL_SKILL, prompt_hash)
             run.dispatch_state["active_agent"] = Specialist.TRAVEL
             await run_travel(self.executor, run, self.planner)
+            if span:
+                span.output_data = {"status": run.status.value}
+        return {}
+
+    async def procurement(self, state: GraphState) -> dict:
+        run = state["run"]
+        skill = PROCUREMENT_SKILL
+        agent = Specialist.PROCUREMENT
+        async with observed_operation(
+            self.client, "workspace.procurement", kind=SpanKind.AGENT,
+            input_data={"skill": skill.name},
+        ) as span, self.executor.specialist(run, agent, sender=SUPERVISOR_NODE) as agent_run_id:
+            self.executor.tools = self.procurement_registry()
+            prompt_hash = hashlib.sha256(skill.prompt_fragment.encode()).hexdigest()
+            await self._record_skill(run, agent_run_id, skill, prompt_hash)
+            run.dispatch_state["active_agent"] = agent
+            await run_procurement(self.executor, run, self.planner)
             if span:
                 span.output_data = {"status": run.status.value}
         return {}

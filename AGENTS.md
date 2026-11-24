@@ -1,6 +1,6 @@
 # Agent 协作指引
 
-本仓库用 LangGraph 主 Agent 调度 SEO/GEO、医药、学习陪练、报考备考、随访与复诊准备和商旅行程，包含对话运行、数据查询、审批和前端工作台。数据库使用 PostgreSQL 和 SQLAlchemy。
+本仓库用 LangGraph 主 Agent 调度 SEO/GEO、医药、学习陪练、报考备考、随访与复诊准备、商旅行程和购物与采购，包含对话运行、数据查询、审批和前端工作台。数据库使用 PostgreSQL 和 SQLAlchemy。
 
 - 修改代码前，先阅读 [README](README.md) 和受影响的现有实现、调用方及测试。
 - 开发和修复时检查相关调用方，并按改动范围运行增量验证。

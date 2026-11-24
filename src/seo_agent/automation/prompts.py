@@ -6,6 +6,9 @@ from src.agent.workspace.routing import ROUTE_PROMPT_KEY, ROUTING_PROMPT, RouteD
 from src.models.geo import GeoContentDraft, GeoQuestionSelection
 from src.models.page_suggestions import PageSeoDraft
 from src.models.share_image import ShareImageBrief
+from src.procurement_agent.models import INTAKE_PROMPT as PROCUREMENT_INTAKE_PROMPT
+from src.procurement_agent.models import INTAKE_PROMPT_KEY as PROCUREMENT_INTAKE_PROMPT_KEY
+from src.procurement_agent.models import ProcurementIntake
 from src.promptops.models import CandidatePrompt, VersionStage
 from src.promptops.registry import PromptRegistry
 from src.seo_agent.automation.models import DeliveryReviewOutput
@@ -27,6 +30,13 @@ SEO_PROMPT_DEFINITIONS: dict[str, dict[str, Any]] = {
         "system_template": TRAVEL_INTAKE_PROMPT,
         "user_template": "{{input}}",
         "output_schema": TravelIntake.model_json_schema(),
+    },
+    PROCUREMENT_INTAKE_PROMPT_KEY: {
+        "name": "购物与采购需求及资料整理",
+        "purpose": "在当前采购会话里补充条件、报价与订单资料",
+        "system_template": PROCUREMENT_INTAKE_PROMPT,
+        "user_template": "{{input}}",
+        "output_schema": ProcurementIntake.model_json_schema(),
     },
     "seo.geo.question_researcher": {
         "name": "GEO 选题研究员",

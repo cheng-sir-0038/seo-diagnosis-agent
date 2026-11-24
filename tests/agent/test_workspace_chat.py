@@ -63,7 +63,8 @@ async def test_tool_directory_lists_the_live_registries_without_running_tools(mo
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as api:
         default = await api.get("/api/v1/chat/tools")
         assert default.status_code == 200
-        medical, search, learning, exam, followup, travel = default.json()["specialists"]
+        specialists = default.json()["specialists"]
+        medical, search, learning, exam, followup, travel, procurement = specialists
         assert medical["agent"] == "healthcare"
         assert {s["name"] for s in medical["skills"]} >= {"medicare-catalogue", "pubmed-literature"}
         medical_names = {t["name"] for t in medical["tools"]}
@@ -85,6 +86,12 @@ async def test_tool_directory_lists_the_live_registries_without_running_tools(mo
         assert {tool["name"] for tool in travel["tools"]} == {
             "travel_transport", "travel_hotels", "travel_commute", "travel_weather",
             "travel_compare_plans", "travel_save_plan",
+        }
+        assert procurement["agent"] == "shopping_procurement"
+        assert procurement["skills"][0]["name"] == "shopping-and-procurement"
+        assert {tool["name"] for tool in procurement["tools"]} == {
+            "shopping_catalog", "shopping_compare_quotes", "shopping_build_list",
+            "shopping_reconcile",
         }
         database = SimpleNamespace(started=True)
 

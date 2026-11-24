@@ -1,6 +1,6 @@
 # SEO Diagnosis Agent
 
-在工作台提问后，LangGraph 主 Agent 分派给 SEO/GEO、医药、学习陪练、报考备考、随访与复诊准备或商旅行程专员。常规请求用 DeepSeek 判断业务，明确的复诊资料请求直接进入资料整理流程。对话显示专员进度和 Skill，展开「执行详情」可核对工具回执。
+在工作台提问后，LangGraph 主 Agent 分派给 SEO/GEO、医药、学习陪练、报考备考、随访与复诊准备、商旅行程或购物与采购专员。常规请求用 DeepSeek 判断业务，明确的复诊资料请求直接进入资料整理流程。对话显示专员进度和 Skill，展开「执行详情」可核对工具回执。
 
 ![多 Agent 工作台首页，含考研、医药和网站业务入口](docs/screenshots/01-chat-overview.png)
 
@@ -25,6 +25,7 @@
 | “2026 年下半年湖北初中数学教资笔试怎么准备？” | 报考备考核对公告和科目，给出报名清单、备考顺序与 304 大纲链接。 |
 | “用合成资料演示一次复诊准备，帮我对照两次报告。” | 随访与复诊准备专员先追问缺的报告，补齐后按记录条件对照，展示来源并等你确认保存资料包和待办。 |
 | “我去杭州出差。” | 先给目的地近期天气和出行建议。补上日期后按实际行程更新天气，其他条件齐全后可继续比较交通、住宿和接驳。 |
+| “要买 60 个 200ml 纸杯，帮我比较这两份报价。” | 对齐规格和计量单位，按起订量、整包和阶梯价算实际采购数量及已知费用。 |
 
 医考工具使用带年份和出处的官方公告摘录，网页核对直接读取指定的公开页面。[专员编排](src/agent/workspace/supervisor.py) · [医药 Skill](src/healthcare_agent/skills.py)
 
@@ -69,6 +70,7 @@ flowchart TB
     MAIN --> EXAM["报考备考 / 教资笔试"]
     MAIN --> VISIT["随访与复诊准备 / 本次提供的资料"]
     MAIN --> TRAVEL["商旅行程 / 查候选、接驳和天气"]
+    MAIN --> PROCUREMENT["购物与采购 / 报价、清单和到货"]
     MED -->|公开考纲依据| SEO
     SEO --> EXEC["Agent 执行器"]
     MED --> EXEC
@@ -76,6 +78,7 @@ flowchart TB
     EXAM --> EXEC
     VISIT --> EXEC
     TRAVEL --> EXEC
+    PROCUREMENT --> EXEC
     EXEC --> HEALTH["医考公告 / 考研检索 / 医保目录 / PubMed"]
     HEALTH --> RUNDB
     EXEC --> FOLLOWUP["资料读取回执 / 对照 / 确认保存"]
@@ -122,6 +125,14 @@ flowchart TB
 候选卡保留来源、查询时间和平台入口。房型、报价单位或币种缺失时，会显示待核对项。已知费用按币种列出，平台参考价和未取得的接驳费不计入可比总价。平台缺少结果时，也可以粘贴自己查到的候选和报价，页面会标为「用户提供」。
 
 在原对话里修改会议截止时间会沿用已有查询，改返程日期会重查返程及受影响的酒店和天气。交通接口暂时异常时，可回复「重查交通」。回复「保存方案 1」一类的确认后，所选版本随运行检查点写入 PostgreSQL。预订入口用于去平台复核，项目只保存行程草稿。
+
+### 购物与采购
+
+- 比报价可以直接说「我要买 60 个 200ml 纸杯」并贴商家原文或带表头的报价表。给出包装、起订量、阶梯单价和已知费用后，卡片会分别显示需求量、实买量、多买多少和支出。规格不同的报价单独标出。缺运费、税费或适用优惠时显示已知小计和待核对项。
+- 活动清单可从首页点「列活动采购清单」。一轮最多 5 种物品。按人数推算的用量会标为估算，有对应报价时可核对采购组合、预算和交期。询价草稿可以复制给商家。
+- 到货核对可以贴脱敏的订单、收货、付款、发票和退款记录，提供共同的订单号和各自的凭证编号。结果按订单归集并显示应到、实到与差异。净支出按确认的付款与到账退款计算。
+
+在同一个 Run 内可继续补报价或改数量。程序会按新数量重算整包和阶梯价，旧报价的运费等批次费用会标为待复核。淘宝联盟提供平台候选和券资料，预估价保留查询时间。1688 等来源可粘贴自行取得的报价，由用户核对后在平台完成购买。[采购工作流](src/procurement_agent/workflow.py) · [金额与到货核算](src/procurement_agent/calculations.py)
 
 ## 业务场景与现有入口
 
@@ -410,6 +421,7 @@ SEO Chat 可调用 `seo_page_change_review`；需要 live 页面 HTML 能力和�
 | 飞猪 FlyAI（商旅） | 查询火车、航班及酒店候选 | `FLYAI_API_KEY`、可选 `FLYAI_EXECUTABLE` | 从飞猪控制台获取可用 Key，并在运行后端的机器或容器中安装官方 CLI。[飞猪快速开始](https://flyai.open.fliggy.com/docs/quickstart) |
 | 百度地图（商旅） | 将地点解析成坐标，查询驾车距离和耗时 | `BAIDU_MAPS_AK` | 需 Web 服务 AK，并开通地理编码、地点检索和轻量级驾车路线等所需权限。[百度地图 Web API](https://lbsyun.baidu.com/docs/webapi) |
 | Open-Meteo（商旅） | 查城市与逐日天气预报 | 无 Key | 当前用非商业免费端点，预报最多覆盖未来 16 天。[额度及许可](https://open-meteo.com/en/pricing) |
+| 淘宝联盟（购物与采购） | 商品搜索、简版详情、指定推广券资料 | `TAOBAO_TBK_APP_KEY`、`TAOBAO_TBK_APP_SECRET`、搜索另需 `TAOBAO_TBK_ADZONE_ID` | 需应用已获得对应接口权限和额度。留空时可用自己提供的报价做比价、清单和到货核对。[搜索](https://developer.alibaba.com/docs/api.htm?apiId=64759&source=search) · [详情](https://developer.alibaba.com/docs/api.htm?apiId=64763) · [推广券](https://developer.alibaba.com/docs/api.htm?apiId=31106) |
 
 飞猪适配已验证官方 CLI `1.0.16`。本机可运行 `npm install -g @fly-ai/flyai-cli@1.0.16`，或者将 `FLYAI_EXECUTABLE` 指向已安装的 `flyai` 完整路径。商旅仍使用已有 DeepSeek 配置。缺飞猪或百度凭据时，来源卡会展示配置状态，天气仍可单独查询。[FlyAI 源码和许可证](https://github.com/alibaba-flyai/flyai-skill)
 
@@ -524,6 +536,12 @@ export TEST_DATABASE_URL='postgresql://seo_agent:your-local-password@127.0.0.1:5
 
 ```bash
 .venv/bin/python -m pytest -q tests/agent/test_travel_{flyai,context,plan}.py tests/agent/test_workspace_scenarios.py
+```
+
+采购回归可用以下命令运行。接口测试覆盖签名、响应结构、权限、限流和无凭据分支。对话测试覆盖改量重算、清单估算以及到货与付款去重。
+
+```bash
+.venv/bin/python -m pytest -q tests/agent/test_procurement.py tests/agent/test_workspace_scenarios.py -k procurement
 ```
 
 运行考研检索评测并导出逐题回执：

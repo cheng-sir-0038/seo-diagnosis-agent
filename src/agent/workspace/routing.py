@@ -20,6 +20,10 @@ from src.education_agent.teacher_exam import TeacherExamQuery
 from src.followup_agent.workflow import DOMAIN as FOLLOWUP_DOMAIN
 from src.followup_agent.workflow import FOLLOWUP_SKILL
 from src.healthcare_agent.skills import HealthcareSkill
+from src.procurement_agent.models import DOMAIN as PROCUREMENT_DOMAIN
+from src.procurement_agent.models import INTAKE_PROMPT as PROCUREMENT_INTAKE_PROMPT
+from src.procurement_agent.models import ProcurementIntake
+from src.procurement_agent.tools import PROCUREMENT_SKILL
 from src.providers.page_metadata.client import normalize_site_url
 from src.travel_agent.intake import TRAVEL_DOMAIN, TRAVEL_INTAKE_PROMPT, TravelIntake
 from src.travel_agent.tools import TRAVEL_SKILL
@@ -32,6 +36,7 @@ class Specialist(StrEnum):
     EXAM_PREP = EXAM_PREP_DOMAIN
     FOLLOWUP = FOLLOWUP_DOMAIN
     TRAVEL = TRAVEL_DOMAIN
+    PROCUREMENT = PROCUREMENT_DOMAIN
 
 
 class Route(StrEnum):
@@ -41,11 +46,12 @@ class Route(StrEnum):
     EXAM_PREP = Specialist.EXAM_PREP
     FOLLOWUP = Specialist.FOLLOWUP
     TRAVEL = Specialist.TRAVEL
+    PROCUREMENT = Specialist.PROCUREMENT
     COURSE_REVIEW = "course_review"
     CLARIFY = "clarify"
 
 
-ROUTE_PROMPT_KEY = "workspace.route.v5"
+ROUTE_PROMPT_KEY = "workspace.route.v6"
 SKILL_LOADED_EVENT = "skill.loaded"
 SUPERVISOR_NODE = "supervisor"
 ASK_PAGE = "请发要检查的公开网页链接或域名。"
@@ -64,6 +70,7 @@ class RouteDecision(BaseModel):
     resources: ResourceQuery | None = None
     teacher_exam: TeacherExamQuery | None = None
     travel: TravelIntake | None = None
+    procurement: ProcurementIntake | None = None
     target_index: int | None = Field(default=None, ge=1, description="候选页面从 1 开始的序号")
     question: str | None = Field(default=None, max_length=300, description="意图不清时的追问")
 
@@ -96,7 +103,9 @@ ROUTING_PROMPT = (
 ) + "\n" + FOLLOWUP_SKILL.prompt_fragment + "\n" + TRAVEL_SKILL.prompt_fragment + (
     "\n选择 travel 后填写 travel 字段，不需要网页。"
     "报价只能摘自最后一条用户消息。"
-) + TRAVEL_INTAKE_PROMPT
+) + TRAVEL_INTAKE_PROMPT + "\n" + PROCUREMENT_SKILL.prompt_fragment + (
+    "\n仅在选择 shopping_procurement 后填写 procurement，needs_page 设为 false。"
+) + PROCUREMENT_INTAKE_PROMPT
 
 
 def explicit_healthcare_skill(question: str) -> HealthcareSkill | None:

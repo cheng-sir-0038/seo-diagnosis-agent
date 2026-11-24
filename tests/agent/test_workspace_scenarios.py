@@ -30,6 +30,11 @@ from src.healthcare_agent.postgraduate import POSTGRADUATE_TOOL, seed_postgradua
 from src.models.common import Capability
 from src.observability.client import ObservabilityClient
 from src.observability.storage import ObservabilityDatabase
+from src.procurement_agent.models import ProcurementIntake
+from src.procurement_agent.tools import BUILD_LIST as PROCUREMENT_LIST
+from src.procurement_agent.tools import CATALOG as PROCUREMENT_CATALOG
+from src.procurement_agent.tools import COMPARE as PROCUREMENT_COMPARE
+from src.procurement_agent.tools import RECONCILE as PROCUREMENT_RECONCILE
 from src.providers.page_metadata.client import FetchedHtmlPage
 from src.providers.page_metadata.provider import PageMetadataProvider
 from src.providers.page_metadata.pyseo_client import (
@@ -63,7 +68,7 @@ class Models(ModelProvider):
     async def invoke(self, *, schema, context, **_):
         self.planner_inputs.append(deepcopy(context))
         planned = self.decisions.popleft()
-        if schema is TravelIntake:
+        if schema in (TravelIntake, ProcurementIntake):
             decision = schema.model_validate(planned)
         elif isinstance(planned, dict):
             decision = schema.model_validate({"needs_page": False, **planned})
@@ -185,6 +190,107 @@ def travel_result(events, name):
         payload["result"]["data"]
         for payload in reversed(payloads(events, "tool.completed")) if payload["name"] == name
     )
+
+
+@pytest.mark.asyncio
+async def test_procurement_reuses_a_run_and_reprices_without_a_provider_key(workspace, monkeypatch):
+    monkeypatch.setattr(chat.settings, "taobao_tbk_app_key", SecretStr(""))
+    need = {"item": "纸杯", "specification": "200ml", "unit": "个", "quantity": 60}
+    quote = (
+        "甲商家：纸杯200ml，1个装，1个起订，1至99个单价14元，满100个单价12元。"
+        "运费60元，含税，无附加费用，无优惠。"
+    )
+    workspace.models.decisions.extend([
+        {"route": "shopping_procurement", "procurement": {"needs": [need], "budget_cny": 1000}},
+        {"quotes": [{
+            "item": "纸杯", "supplier": "甲商家", "specification": "200ml", "unit": "个",
+            "pack_size": 1, "minimum_quantity": 1, "evidence": quote,
+            "tiers": [
+                {"minimum": 1, "maximum": 99, "price_cny": 14, "basis": "unit",
+                 "evidence": "1至99个单价14元"},
+                {"minimum": 100, "price_cny": 12, "basis": "unit", "evidence": "满100个单价12元"},
+            ],
+            "shipping_cny": 60, "tax_cny": 0, "fees_cny": 0, "discount_cny": 0,
+        }]},
+        {"needs": [{"item": "纸杯", "quantity": 120}]},
+    ])
+    async with workspace.serve() as api:
+        receipt, events = await ask(api, "想买60个200ml纸杯，预算1000元，帮我比价。")
+        assert events[-1]["type"] == "run.waiting_for_input"
+        dispatch = payloads(events, "agent.dispatched")[0]
+        assert dispatch["agent"] == "shopping_procurement"
+        assert travel_result(events, PROCUREMENT_CATALOG)["sources"][0]["status"] == "unconfigured"
+        assert travel_result(events, PROCUREMENT_COMPARE)["quotes"] == []
+
+        priced, _, _ = await answer_waiting(api, receipt, events, quote)
+        compare_result = travel_result(priced, PROCUREMENT_COMPARE)
+        assert compare_result["quotes"][0]["total_cny"] == "900.00"
+        assert compare_result["quotes"][0]["evidence"] == quote
+        assert compare_result["view_type"] == "cards"
+
+        changed, _, _ = await answer_waiting(api, receipt, priced, "纸杯改为120个。")
+        new_quote = travel_result(changed, PROCUREMENT_COMPARE)["quotes"][0]
+        assert (new_quote["price_minimum"], new_quote["actual_quantity"]) == (100, 120)
+        assert new_quote["goods_cny"] == "1440.00" and new_quote["total_cny"] is None
+        assert {"确认运费", "确认税费"} <= set(new_quote["issues"])
+        done, _, _ = await answer_waiting(api, receipt, changed, "结束本次整理")
+        assert done[-1]["type"] == "run.completed"
+        assert {tool["agent_run_id"] for tool in payloads(done, "tool.completed")} == {
+            dispatch["agent_run_id"],
+        }
+
+
+@pytest.mark.asyncio
+async def test_procurement_routes_lists_and_reconciles_user_records(workspace, monkeypatch):
+    monkeypatch.setattr(chat.settings, "taobao_tbk_app_key", SecretStr(""))
+    order = "订单 P-102 纸杯200ml 应到60个。"
+    delivery = "收货 P-102 纸杯200ml 实到58个。"
+    payment = "支付 P-102 付款凭证 F-81，实付900元。"
+    invoice = "发票 P-102 已开票900元。"
+    refund = "P-102 退款申请30元，未到账。"
+    records = [
+        {"reference": "P-102", "kind": "order", "item": "纸杯", "quantity": 60,
+         "specification": "200ml", "evidence": order},
+        {"reference": "P-102", "kind": "delivery", "item": "纸杯", "quantity": 58,
+         "specification": "200ml", "evidence": delivery},
+        {"reference": "F-81", "kind": "payment", "document_ref": "F-81", "amount_cny": 900,
+         "evidence": payment},
+        {"reference": "P-102", "kind": "invoice", "amount_cny": 900, "evidence": invoice},
+        {"reference": "P-102", "kind": "refund", "refund_state": "pending", "amount_cny": 30,
+         "evidence": refund},
+    ]
+    workspace.models.decisions.extend([
+        {"route": "shopping_procurement", "procurement": {
+            "procedure": "list", "people": 20, "budget_cny": 800, "needs": [
+                {"item": "纸杯", "unit": "个", "per_person": 2},
+                {"item": "礼袋", "unit": "个", "per_person": 1},
+            ],
+        }},
+        {"route": "shopping_procurement", "procurement": {
+            "procedure": "reconcile", "records": records,
+        }},
+    ])
+    async with workspace.serve() as api:
+        _, list_events = await ask(
+            api, "20人的活动，预算800元，准备纸杯和礼袋。", conversation_id="procurement-list",
+        )
+        list_result = travel_result(list_events, PROCUREMENT_LIST)
+        assert [row["quantity"] for row in list_result["lines"]] == [40, 20]
+        assert all(row["quantity_estimated"] for row in list_result["lines"])
+        assert list_result["plans"] == []
+
+        _, ledger_events = await ask(
+            api, "核对采购到货与支出。\n" + "\n".join([order, delivery, payment, invoice, refund]),
+            conversation_id="procurement-ledger",
+        )
+        orders = travel_result(ledger_events, PROCUREMENT_RECONCILE)["orders"]
+        assert len(orders) == 1
+        ledger = orders[0]
+        assert ledger["lines"][0]["difference"] == -2
+        assert ledger["net_paid_cny"] == "900.00" and ledger["pending_refunds"] == 1
+        assert {item["name"] for item in payloads(ledger_events, "tool.completed")} == {
+            PROCUREMENT_RECONCILE,
+        }
 
 
 @pytest.mark.asyncio

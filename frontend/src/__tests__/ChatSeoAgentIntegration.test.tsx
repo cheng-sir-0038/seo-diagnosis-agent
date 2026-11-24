@@ -251,6 +251,40 @@ describe('ChatPage SEO Agent integration', () => {
     expect(submitAgentInput).toHaveBeenCalledWith('run_1', 'choice_1', 'B', 'answer')
   })
 
+  it('shows the procurement source and price gap in the result card', async () => {
+    const agent = { agent: 'shopping_procurement', agent_run_id: 'procurement' }
+    streamAgentEvents.mockImplementationOnce(async (_url, onEvent: (item: AgentEvent) => void) => {
+      onEvent(event(1, 'run.started', {}))
+      onEvent(event(2, 'agent.dispatched', agent))
+      onEvent(event(3, 'tool.completed', {
+        ...agent, tool_call_id: 'compare', name: 'shopping_compare_quotes', render_hint: 'cards',
+        result: { success: true, data: {
+          view_type: 'cards', items: [{
+            key: 'quote-0', title: '纸杯 · 甲商家', summary: '确认运费',
+            metadata: [{ label: '已知小计', value: '840.00 元' }],
+          }, {
+            key: 'source-0', title: '淘宝联盟', summary: '可以先使用你提供的资料。',
+          }],
+        } },
+      }))
+      onEvent(event(4, 'message.completed', { content: '采购结果已整理。' }))
+      onEvent(event(5, 'run.waiting_for_input', {
+        ...agent, request_id: 'other_quote', questions: ['可以继续补充报价。'],
+      }))
+      return { lastEventId: 5, terminal: true }
+    })
+    render(<ChatPage />)
+    fireEvent.click(screen.getByRole('button', { name: /列活动采购清单/ }))
+    const composer = screen.getByRole('textbox', { name: '给业务助理发送消息' })
+    expect((composer as HTMLTextAreaElement).value).toContain('20 人')
+    fireEvent.click(screen.getByRole('button', { name: '发送消息' }))
+    const report = within(await screen.findByTestId('card-result'))
+    expect(report.getByText('确认运费')).toBeVisible()
+    expect(report.getByText('840.00 元')).toBeVisible()
+    expect(report.getByText('淘宝联盟')).toBeVisible()
+    expect(screen.getByRole('list', { name: '专员进度' })).toHaveTextContent('购物与采购待补充')
+  })
+
   it('shows destination weather and preparation tips before a trip has dates', async () => {
     const specialist = { agent: 'travel', agent_run_id: 'trip' }
     streamAgentEvents.mockImplementationOnce(async (_url, onEvent: (item: AgentEvent) => void) => {

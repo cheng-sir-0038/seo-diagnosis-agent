@@ -128,6 +128,11 @@ class Settings(BaseSettings):
     flyai_executable: str = "flyai"
     baidu_maps_ak: SecretStr = SecretStr("")
 
+    # ---- 淘宝联盟只读商品资料 ----
+    taobao_tbk_app_key: SecretStr = SecretStr("")
+    taobao_tbk_app_secret: SecretStr = SecretStr("")
+    taobao_tbk_adzone_id: str = ""
+
     # ---- Agent 模型 ----
     deepseek_api_key: str = ""
     deepseek_base_url: str = "https://api.deepseek.com"
