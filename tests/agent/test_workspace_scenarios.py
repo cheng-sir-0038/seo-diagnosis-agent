@@ -449,10 +449,10 @@ async def test_trip_collects_conditions_rechecks_time_and_saves_once(workspace, 
         return {
             "status": "ok", "source": "flyai",
             "items": [{
-                "id": "ticket", "name": "直达火车", "mode": "rail", "source": "flyai",
-                "departs_at": f"{travel_date}T09:00:00+08:00",
-                "arrives_at": f"{travel_date}T12:00:00+08:00",
-                "to_stop": "上海虹桥站", "booking_url": "https://www.fliggy.com/",
+                "id": "ticket", "name": "直达航班", "mode": "flight", "source": "flyai",
+                "departs_local": f"{travel_date} 09:00:00",
+                "arrives_local": f"{travel_date} 12:00:00",
+                "to_stop": "上海虹桥机场", "booking_url": "https://www.fliggy.com/",
             }],
         }
 
@@ -509,6 +509,7 @@ async def test_trip_collects_conditions_rechecks_time_and_saves_once(workspace, 
         assert len(calls) == 5
         assert comparison["plans"][0]["known_costs"] == {"CNY": "800"}
         assert comparison["plans"][0]["arrival_status"] == "met"
+        assert comparison["plans"][0]["arrival_at_venue"] == "2026-11-26T12:55:00+08:00"
         assert not comparison["plans"][0]["complete_price"]
         assert comparison["weather"]["source"] == "open_meteo"
         assert any(source["status"] == "error" for source in comparison["providers"])

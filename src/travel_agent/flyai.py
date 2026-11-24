@@ -85,23 +85,16 @@ def _amount(value: object) -> tuple[str | None, str | None, str | None]:
     return match["amount"].replace(",", ""), "CNY" if match["currency"] else None, raw
 
 
-def _local_time(value: str | None) -> datetime | None:
-    if not value or len(value) < 16:
+def parse_transport_time(value: object) -> datetime | None:
+    if not isinstance(value, str) or len(value) < 16:
         return None
     try:
-        return datetime.fromisoformat(value)
+        instant = datetime.fromisoformat(value)
     except ValueError:
         return None
-
-
-def _timestamp(value: datetime | None, mode: _Mode) -> str | None:
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        if mode != "rail":
-            return None
-        value = value.replace(tzinfo=_CHINA_TIME_ZONE)
-    return value.isoformat()
+    if instant.tzinfo is None:
+        instant = instant.replace(tzinfo=_CHINA_TIME_ZONE)
+    return instant
 
 
 def _candidate_id(kind: str, *parts: object) -> str:
@@ -129,7 +122,8 @@ def _transport_item(row: _Row, mode: _Mode, travel_date: date) -> _Row | None:
     name = " / ".join(filter(None, numbers)) or f"{from_stop} → {to_stop}"
     departure_local = _text(first.get("depDateTime"))
     arrival_local = _text(last.get("arrDateTime"))
-    departure, arrival = _local_time(departure_local), _local_time(arrival_local)
+    departure = parse_transport_time(departure_local)
+    arrival = parse_transport_time(arrival_local)
     if departure is not None and departure.date() != travel_date:
         return None
     classes = {_text(segment.get("seatClassName")) for segment in segments}
@@ -148,8 +142,8 @@ def _transport_item(row: _Row, mode: _Mode, travel_date: date) -> _Row | None:
         "booking_url": _booking_url(row.get("jumpUrl")),
         "from_stop": from_stop,
         "to_stop": to_stop,
-        "departs_at": _timestamp(departure, mode),
-        "arrives_at": _timestamp(arrival, mode),
+        "departs_at": departure.isoformat() if departure is not None else None,
+        "arrives_at": arrival.isoformat() if arrival is not None else None,
         "departs_local": departure_local,
         "arrives_local": arrival_local,
         "fare_class": fare_class,

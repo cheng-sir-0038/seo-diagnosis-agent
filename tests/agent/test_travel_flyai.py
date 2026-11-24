@@ -65,12 +65,22 @@ def cli(tmp_path: Path) -> Callable[[str], str]:
     return create
 
 
-async def test_transport_reads_documented_train_and_observed_flight_fields(cli, monkeypatch):
+@pytest.mark.parametrize(
+    ("flight_arrival", "expected_arrival"),
+    [
+        ("2026-12-08 08:58:00", "2026-12-08T08:58:00+08:00"),
+        ("2026-12-08T09:58:00+09:00", "2026-12-08T09:58:00+09:00"),
+        ("2026-12-08", None),
+    ],
+)
+async def test_transport_reads_documented_train_and_observed_flight_fields(
+    cli, monkeypatch, flight_arrival, expected_arrival
+):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "isolated-test-value")
     monkeypatch.setenv("DEBUG_FLYAI_MCP_URL", "https://example.com")
     rail = _trip("G1234", adult_price="¥225.00")
     flight = _trip("MU1234", ticket_price=1112.00)
-    flight["journeys"][0]["segments"][0]["seatClassName"] = "经济舱"
+    flight["journeys"][0]["segments"][0].update(seatClassName="经济舱", arrDateTime=flight_arrival)
     responses = {"search-train": _response(rail), "search-flight": _response(flight)}
     executable = cli(
         "assert args == ['--origin=杭州', '--destination=上海', '--dep-date=2026-12-08']\n"
@@ -97,7 +107,8 @@ async def test_transport_reads_documented_train_and_observed_flight_fields(cli, 
     assert flight_item["mode"] == "flight"
     assert flight_item["from_stop"] == "杭州东"
     assert flight_item["fare_class"] == "经济舱"
-    assert flight_item["departs_at"] is None
+    assert flight_item["departs_at"] == "2026-12-08T08:00:00+08:00"
+    assert flight_item["arrives_at"] == expected_arrival
     assert flight_item["departs_local"] == "2026-12-08 08:00:00"
     assert flight_item["amount"] == "1112.0"
     assert flight_item["currency"] is None

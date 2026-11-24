@@ -6,7 +6,10 @@ from typing import Any
 
 import httpx
 import pytest
+from fastapi import FastAPI
+from pydantic import SecretStr
 
+from src.api.routes.workspace import travel
 from src.travel_agent import context
 
 _LOCAL_TODAY = date(2026, 11, 24)
@@ -63,6 +66,7 @@ def _forecast_response(*days: str, timezone: str = "Asia/Shanghai") -> httpx.Res
             "timezone": timezone,
             "daily": {
                 "time": days,
+                "weather_code": [2] * count,
                 "temperature_2m_max": [17.2] * count,
                 "temperature_2m_min": [10.4] * count,
                 "precipitation_probability_max": [0] * count,
@@ -90,6 +94,7 @@ async def test_weather_uses_chinese_city_wgs84_and_local_date(upstream) -> None:
     assert result["items"] == [
         {
             "date": _LOCAL_TODAY.isoformat(),
+            "weather_code": 2,
             "temperature_max_c": 17.2,
             "temperature_min_c": 10.4,
             "precipitation_probability_max_pct": 0,
@@ -102,6 +107,7 @@ async def test_weather_uses_chinese_city_wgs84_and_local_date(upstream) -> None:
     assert geocoding.url.params["language"] == "zh"
     assert geocoding.url.params["countryCode"] == "CN"
     assert forecast.url.host == "api.open-meteo.com"
+    assert "weather_code" in forecast.url.params["daily"].split(",")
     assert forecast.url.params["latitude"] == "30.58333"
     assert forecast.url.params["longitude"] == "114.26667"
     assert forecast.url.params["timezone"] == "Asia/Shanghai"
@@ -257,7 +263,12 @@ async def test_commute_driving_uses_bd09_and_hides_key_in_logs(upstream, caplog)
                 "status": 0,
                 "result": {
                     "routes": [
-                        {"duration": 1501, "distance": 34200},
+                        {
+                            "duration": 1501, "distance": 34200, "steps": [
+                                {"path": "114.2199,30.7766;114.3601,30.67"},
+                                {"path": "114.3601,30.67;114.4167,30.5011"},
+                            ],
+                        },
                     ]
                 },
             },
@@ -272,6 +283,16 @@ async def test_commute_driving_uses_bd09_and_hides_key_in_logs(upstream, caplog)
     assert result["items"] == [
         {"mode": "driving", "duration_minutes": 26, "distance_meters": 34200}
     ]
+    assert result["map"] == {
+        "origin": [114.2199, 30.7766],
+        "destination": [114.4167, 30.5011],
+        "path": [(114.2199, 30.7766), (114.3601, 30.67), (114.4167, 30.5011)],
+    }
+    map_url = httpx.URL(result["source_url"])
+    assert map_url.host == "api.map.baidu.com" and map_url.path == "/direction"
+    assert map_url.params["origin"] == "latlng:30.7766,114.2199"
+    assert map_url.params["destination"] == "latlng:30.5011,114.4167"
+    assert map_url.params["coord_type"] == "bd09ll"
     origin, destination, route = requests
     assert origin.url.path == destination.url.path == "/geocoding/v3/"
     assert origin.url.params["city"] == "武汉"
@@ -285,6 +306,46 @@ async def test_commute_driving_uses_bd09_and_hides_key_in_logs(upstream, caplog)
     assert "HTTP Request" in caplog.text
     assert secret not in caplog.text
     assert secret not in str(result)
+
+
+async def test_map_preview_reuses_route_and_fetches_legacy_geometry(upstream, monkeypatch):
+    secret = "test-preview-ak"
+    monkeypatch.setattr(travel.settings, "baidu_maps_ak", SecretStr(secret))
+    png = b"\x89PNG\r\n\x1a\nimage"
+    requests = upstream(
+        httpx.Response(200, json={"status": 0, "result": {"routes": [
+            {"steps": [{"path": "114.22,30.77;114.41,30.50"}]},
+        ]}}),
+        httpx.Response(200, content=png),
+        httpx.Response(200, json={"status": 240}),
+    )
+    app = FastAPI()
+    app.include_router(travel.router)
+    url = "/workspace/travel/map-preview"
+    coords = {"origin": [114.22, 30.77], "destination": [114.41, 30.5]}
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as api:
+        invalid = await api.post(url, json={**coords, "origin": [114.22, 91]})
+        assert invalid.status_code == 422
+        assert requests == []
+
+        historical = await api.post(url, json=coords)
+        assert historical.status_code == 200
+        assert historical.headers["content-type"] == "image/png" and historical.content == png
+        assert secret not in historical.text
+        assert requests[0].url.params["origin"] == "30.77,114.22"
+        assert requests[0].url.params["steps_info"] == "1"
+        assert requests[1].url.params["paths"] == "114.22000,30.77000;114.41000,30.50000"
+        assert requests[1].url.params["ak"] == secret
+
+        unavailable = await api.post(url, json={**coords, "path": [
+            coords["origin"], coords["destination"],
+        ]})
+        assert unavailable.status_code == 502
+        assert [request.url.path for request in requests] == [
+            "/directionlite/v1/driving", "/staticimage/v2", "/staticimage/v2",
+        ]
+        assert secret not in unavailable.text
 
 
 @pytest.mark.asyncio

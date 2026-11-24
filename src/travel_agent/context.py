@@ -7,6 +7,7 @@ from datetime import UTC, date, datetime, timedelta
 from math import ceil, isfinite
 from typing import Any
 from unicodedata import normalize
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -16,6 +17,8 @@ _FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 _BAIDU_GEOCODING_URL = "https://api.map.baidu.com/geocoding/v3/"
 _BAIDU_DRIVING_URL = "https://api.map.baidu.com/directionlite/v1/driving"
 _BAIDU_PLACE_URL = "https://api.map.baidu.com/place/v3/region"
+_BAIDU_STATIC_MAP_URL = "https://api.map.baidu.com/staticimage/v2"
+MAX_ROUTE_POINTS = 320
 _POI_SUFFIXES = (
     "国际机场",
     "航站楼",
@@ -45,6 +48,7 @@ _WIND_ADVICE_KMH = 35
 _HTTP_TIMEOUT = 5.0
 _CITY_FEATURE_CODES = {"PPLC", "PPLA", "PPLA2"}
 _DAILY_FIELDS = {
+    "weather_code": "weather_code",
     "temperature_2m_max": "temperature_max_c",
     "temperature_2m_min": "temperature_min_c",
     "precipitation_probability_max": "precipitation_probability_max_pct",
@@ -423,6 +427,89 @@ async def _baidu_point(
     return f"{coordinates[0]},{coordinates[1]}"
 
 
+def _sample_path(points: list[tuple[float, float]], limit: int) -> list[tuple[float, float]]:
+    if len(points) <= limit:
+        return points
+    return [points[round(i * (len(points) - 1) / (limit - 1))] for i in range(limit)]
+
+
+def _route_path(route: dict) -> list[tuple[float, float]]:
+    # Baidu's step paths use longitude,latitude, unlike its driving query parameters.
+    points: list[tuple[float, float]] = []
+    steps = route.get("steps")
+    if not isinstance(steps, list):
+        return points
+    for step in steps:
+        path = step.get("path") if isinstance(step, dict) else None
+        if not isinstance(path, str) or not path:
+            return []
+        for pair in path.strip(";").split(";"):
+            try:
+                longitude, latitude = map(float, pair.split(","))
+            except ValueError:
+                return []
+            if _coordinates(latitude, longitude) is None:
+                return []
+            point = (longitude, latitude)
+            if not points or points[-1] != point:
+                points.append(point)
+    return _sample_path(points, MAX_ROUTE_POINTS) if len(points) >= 2 else []
+
+
+async def _baidu_driving(client: httpx.AsyncClient, start: str, end: str) -> dict:
+    return await _baidu_result(client, _BAIDU_DRIVING_URL, {
+        "origin": start, "destination": end, "coord_type": "bd09ll",
+        "ret_coordtype": "bd09ll", "steps_info": 1,
+    })
+
+
+async def route_map_preview(
+    origin: tuple[float, float],
+    destination: tuple[float, float],
+    path: list[tuple[float, float]],
+    *,
+    api_key: str,
+) -> bytes | None:
+    async with httpx.AsyncClient(
+        timeout=_HTTP_TIMEOUT, transport=_BaiduTransport(api_key)
+    ) as client:
+        if not path:
+            # Older receipts saved only the two coordinates in their map link.
+            try:
+                data = await _baidu_driving(
+                    client, f"{origin[1]},{origin[0]}", f"{destination[1]},{destination[0]}"
+                )
+                routes = data.get("routes")
+                if isinstance(routes, list) and routes and isinstance(routes[0], dict):
+                    path = _route_path(routes[0])
+            except _ProviderError:
+                pass
+        lngs, lats = zip(origin, destination, *path, strict=True)
+        west, east, south, north = min(lngs), max(lngs), min(lats), max(lats)
+        x_pad = max((east - west) * 0.14, 0.002)
+        y_pad = max((north - south) * 0.14, 0.002)
+        southwest = f"{max(-180, west - x_pad):.6f},{max(-90, south - y_pad):.6f}"
+        northeast = f"{min(180, east + x_pad):.6f},{min(90, north + y_pad):.6f}"
+        params = {
+            "width": 640, "height": 340, "bbox": f"{southwest};{northeast}", "coordtype": "bd09ll",
+            "markers": f"{origin[0]:.6f},{origin[1]:.6f}|{destination[0]:.6f},{destination[1]:.6f}",
+            "markerStyles": "m,A,0x4f46d0|m,B,0xb04452",
+        }
+        if path:
+            params["paths"] = ";".join(
+                f"{x:.5f},{y:.5f}" for x, y in _sample_path(path, 50)
+            )
+            params["pathStyles"] = "0x6750db,5,0.95"
+        try:
+            response = await client.get(_BAIDU_STATIC_MAP_URL, params=params)
+            response.raise_for_status()
+        except httpx.HTTPError:
+            return None
+        if response.content.startswith(b"\x89PNG\r\n\x1a\n"):
+            return response.content
+        return None
+
+
 async def estimate_commute(
     origin: str, destination: str, city: str, *, api_key: str
 ) -> dict[str, Any]:
@@ -433,7 +520,8 @@ async def estimate_commute(
     origin, destination, city = origin.strip(), destination.strip(), city.strip()
     if not (origin and destination and city):
         return {**result, "message": "请提供城市、出发地址和到达地址。"}
-    result.update(queried_at=datetime.now(UTC).isoformat(), city=city)
+    result.update(queried_at=datetime.now(UTC).isoformat(), city=city,
+                  origin=origin, destination=destination)
     try:
         async with httpx.AsyncClient(
             timeout=_HTTP_TIMEOUT, transport=_BaiduTransport(api_key.strip())
@@ -444,11 +532,7 @@ async def estimate_commute(
             end = await _baidu_point(client, destination, city, "到达地点", result)
             if end is None:
                 return result
-            data = await _baidu_result(
-                client,
-                _BAIDU_DRIVING_URL,
-                {"origin": start, "destination": end, "coord_type": "bd09ll"},
-            )
+            data = await _baidu_driving(client, start, end)
         routes = data.get("routes", [])
         if not routes:
             return {**result, "message": "百度地图未返回驾车路线。"}
@@ -461,9 +545,24 @@ async def estimate_commute(
     except _ProviderError as exc:
         return _failure(result, exc)
 
+    map_query = urlencode({
+        "origin": f"latlng:{start}",
+        "destination": f"latlng:{end}",
+        "mode": "driving",
+        "region": city,
+        "output": "html",
+        "src": "webapp.seodiagnosis.workbench",
+        "coord_type": "bd09ll",
+    })
     return {
         **result,
         "status": "ok",
+        "source_url": f"https://api.map.baidu.com/direction?{map_query}",
+        "map": {
+            "origin": [float(value) for value in reversed(start.split(","))],
+            "destination": [float(value) for value in reversed(end.split(","))],
+            "path": _route_path(routes[0]),
+        },
         "items": [
             {
                 "mode": "driving",

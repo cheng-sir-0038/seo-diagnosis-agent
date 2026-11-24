@@ -97,6 +97,11 @@ def test_quote_rolls_up_transport_by_passenger_and_hotel_by_room_night():
     (plan,) = report["plans"]
     assert report["issues"] == []
     assert plan["known_cost"] == "1397.20"
+    assert plan["cost_items"] == {
+        "outbound": {"status": "included", "amount": "301.00", "currency": "CNY"},
+        "return": {"status": "included", "amount": "301.00", "currency": "CNY"},
+        "hotel": {"status": "included", "amount": "795.20", "currency": "CNY"},
+    }
     assert plan["currency"] == "CNY"
     assert plan["complete_price"] is True
     assert plan["budget_status"] == "exceeded"
@@ -139,6 +144,7 @@ def test_day_trip_uses_two_legs_without_hotel_and_accepts_total_price():
     assert plan["hotel"] is None
     assert plan["return_transport"] == "back"
     assert plan["known_cost"] == "451.50"
+    assert "hotel" not in plan["cost_items"]
     assert plan["complete_price"]
 
 
@@ -159,6 +165,10 @@ def test_unknown_basis_or_incomplete_quote_never_becomes_a_full_cost():
         hotels=[_hotel(price_basis=None)],
     )["plans"]
     assert plan["known_cost"] == "602.00"
+    assert plan["cost_items"]["outbound"] == {
+        "status": "partial", "amount": "301.00", "currency": "CNY",
+    }
+    assert plan["cost_items"]["hotel"] == {"status": "price_unconfirmed"}
     assert not plan["complete_price"]
     assert any("去程" in item for item in plan["missing"])
     assert any("住宿" in item for item in plan["missing"])
@@ -253,6 +263,7 @@ def test_no_offer_and_invalid_return_dates_have_no_artificial_zero():
 def test_complete_transport_and_hotel_do_not_confirm_budget_with_unknown_ground_cost():
     (plan,) = _plan(request=_request(venue="会场", budget_cny=2000))["plans"]
     assert plan["complete_price"]
+    assert plan["cost_items"]["ground"] == {"status": "price_unconfirmed"}
     assert plan["budget_status"] == "unconfirmed"
     assert any("接驳费用" in warning for warning in plan["warnings"])
 

@@ -11,6 +11,7 @@ from src.agent.models import AgentRun, HumanInputState
 from src.agent.providers.base import ToolCall
 from src.agent.runtime.executor import AgentExecutor
 from src.seo_agent.workflows.structured_model import StructuredModelRunner
+from src.travel_agent.flyai import parse_transport_time
 from src.travel_agent.intake import (
     TRAVEL_INTAKE_PROMPT_KEY,
     TRAVEL_TIMEZONE,
@@ -139,7 +140,7 @@ async def _call(
 
 
 def _fly_candidates(receipt: dict, direction: str, kind: str) -> list[dict]:
-    return [
+    candidates = [
         {
             **item,
             "id": f"{direction}-{item['id']}",
@@ -149,6 +150,19 @@ def _fly_candidates(receipt: dict, direction: str, kind: str) -> list[dict]:
         }
         for item in receipt.get("items", [])
     ]
+    if kind == "transport":
+        # Reused FlyAI receipts may only contain the local clock values.
+        for candidate in candidates:
+            for timestamp, local in (
+                ("departs_at", "departs_local"),
+                ("arrives_at", "arrives_local"),
+            ):
+                if candidate.get(timestamp):
+                    continue
+                instant = parse_transport_time(candidate.get(local))
+                if instant is not None:
+                    candidate[timestamp] = instant.isoformat()
+    return candidates
 
 
 def _source(receipt: dict, label: str, source: str) -> dict:

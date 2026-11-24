@@ -196,8 +196,9 @@ def _cost(
     check_in: date | None,
     check_out: date | None,
     missing: list[str],
-) -> tuple[dict[str, Decimal], bool]:
+) -> tuple[dict[str, Decimal], bool, dict[str, dict]]:
     totals: dict[str, Decimal] = {}
+    cost_items: dict[str, dict] = {}
     nights = (check_out - check_in).days if check_in is not None and check_out is not None else None
     room_required = nights != 0
     hotel_dates_match = nights is not None and (
@@ -207,9 +208,9 @@ def _cost(
     room_nights = None
     if nights is not None and hotel_dates_match and request.rooms is not None:
         room_nights = nights * request.rooms
-    legs = [("去程交通", outbound), ("返程交通", inbound)]
+    legs = [("outbound", "去程交通", outbound), ("return", "返程交通", inbound)]
     if room_required:
-        legs.append(("住宿", hotel))
+        legs.append(("hotel", "住宿", hotel))
         if hotel and not hotel_dates_match:
             missing.append("与行程一致的住宿日期")
         if request.rooms is None:
@@ -220,29 +221,37 @@ def _cost(
     complete = request.travelers is not None and (
         not room_required or (request.rooms is not None and hotel_dates_match)
     )
-    for label, offer in legs:
+    for kind, label, offer in legs:
         if not offer:
             missing.append(f"{label}候选")
+            cost_items[kind] = {"status": "no_offer"}
             complete = False
             continue
+        dates_unconfirmed = kind == "hotel" and not hotel_dates_match
         quote = _quote(
             offer,
             travelers=request.travelers,
-            room_nights=room_nights if label == "住宿" else None,
+            room_nights=room_nights if kind == "hotel" else None,
         )
-        if label == "住宿" and not hotel_dates_match:
-            quote = None
-        if quote is None:
+        if quote is None or dates_unconfirmed:
             missing.append(f"{label}的可核算报价")
+            status = "stay_unconfirmed" if dates_unconfirmed else "price_unconfirmed"
+            cost_items[kind] = {"status": status}
             complete = False
             continue
         currency, amount = quote
         totals[currency] = totals.get(currency, Decimal(0)) + amount
-        if offer.get("full_price") is not True:
+        full_price = offer.get("full_price") is True
+        cost_items[kind] = {
+            "status": "included" if full_price else "partial",
+            "amount": format(amount, "f"),
+            "currency": currency,
+        }
+        if not full_price:
             missing.append(f"{label}的完整费用")
             complete = False
 
-    return totals, complete and len(totals) == 1
+    return totals, complete and len(totals) == 1, cost_items
 
 
 def _make_plan(
@@ -258,7 +267,7 @@ def _make_plan(
     offer_ids = [offer.get("id") for offer in (outbound, inbound, hotel)]
     missing: list[str] = []
     warnings: list[str] = []
-    totals, complete_price = _cost(
+    totals, complete_price, cost_items = _cost(
         request,
         outbound=outbound,
         inbound=inbound,
@@ -274,6 +283,7 @@ def _make_plan(
     arrival_commute = _route_minutes(routes, outbound) if request.venue else None
     hotel_commute = _route_minutes(routes, hotel) if request.venue else None
     if request.venue:
+        cost_items["ground"] = {"status": "price_unconfirmed"}
         warnings.append("已知报价未含地面接驳，相关费用待核对。")
         if hotel and hotel_commute is None:
             missing.append("酒店到会场的接驳时间")
@@ -309,6 +319,7 @@ def _make_plan(
         "hotel": offer_ids[2],
         "known_cost": known_costs[currency] if currency is not None else None,
         "known_costs": known_costs,
+        "cost_items": cost_items,
         "currency": currency,
         "complete_price": complete_price,
         "missing": missing,
