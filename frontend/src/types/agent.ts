@@ -126,12 +126,20 @@ export interface SavedAgentRun {
   followupKey?: string
 }
 
+export interface PendingInputSubmission {
+  runId: string
+  requestId: string
+  messageId: string
+  action: 'answer' | 'use_available'
+}
+
 export interface Conversation {
   id: string
   title: string
   messages: ChatMessage[]
   updatedAt: string
   activeRun?: SavedAgentRun
+  pendingInputSubmission?: PendingInputSubmission
   draftDocuments?: DocumentSummary[]
 }
 

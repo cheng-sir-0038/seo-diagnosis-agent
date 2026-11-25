@@ -321,6 +321,117 @@ describe('ChatPage SEO Agent integration', () => {
     expect(submitAgentInput).toHaveBeenCalledWith('run_1', 'choice_1', 'B', 'answer')
   })
 
+  it('keeps a saved answer after a scheduling error and recovers its own reply', async () => {
+    const firstTurn = [
+      event(1, 'run.started', {}),
+      event(2, 'message.completed', { content: '### 第一道题\n\n求解 x + 2 = 3。' }),
+      event(3, 'run.waiting_for_input', { request_id: 'question-1', questions: ['请回复第 1 题选项。'] }),
+    ]
+    const receipt = event(4, 'input.submitted', { request_id: 'question-1', answer: 'A', action: 'answer' })
+    const secondTurn = [
+      event(5, 'run.resumed', {}),
+      event(6, 'message.completed', { content: '第 1 题答对了。\n\n### 第二道题\n\n求解 2x = 4。' }),
+      event(7, 'run.waiting_for_input', { request_id: 'question-2', questions: ['请回复第 2 题选项。'] }),
+    ]
+    streamAgentEvents.mockImplementationOnce(async (_url, publish: (item: AgentEvent) => void) => {
+      firstTurn.forEach(publish)
+      return { lastEventId: 3, terminal: true }
+    }).mockImplementationOnce(async (_url, publish: (item: AgentEvent) => void) => {
+      secondTurn.forEach(publish)
+      return { lastEventId: 7, terminal: true }
+    })
+    submitAgentInput.mockImplementationOnce(async () => {
+      getAgentRun.mockResolvedValue({
+        id: 'run_1', status: 'RECOVERY_BLOCKED', checkpoint: { id: 'checkpoint-1' },
+        error_message: '调度暂不可用', events: [...firstTurn, receipt],
+      })
+      throw Object.assign(new Error('补充已保存，运行暂时无法恢复'), { status: 503 })
+    })
+    resumeAgentRun.mockImplementationOnce(async () => {
+      getAgentRun.mockResolvedValue({
+        id: 'run_1', status: 'WAITING_FOR_INPUT', checkpoint: { id: 'checkpoint-2' },
+        events: [...firstTurn, receipt, ...secondTurn],
+      })
+      return { run_id: 'run_1', status: 'recovering' }
+    })
+
+    const first = render(<ChatPage />)
+    const answer = () => within(screen.getByRole('region', { name: '对话消息' })).getByText('A')
+    const send = (value: string) => {
+      fireEvent.change(screen.getByRole('textbox', { name: '给业务助理发送消息' }), { target: { value } })
+      fireEvent.click(screen.getByRole('button', { name: '发送消息' }))
+    }
+    send('请出两道方程题')
+    expect(await screen.findByRole('heading', { name: '第一道题' })).toBeInTheDocument()
+    send('A')
+    expect(await screen.findByRole('button', { name: '恢复任务' })).toBeInTheDocument()
+    expect(answer()).toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: '给业务助理发送消息' })).toHaveValue('')
+    expect(first.container.querySelectorAll('.chat-message.assistant')).toHaveLength(1)
+
+    first.unmount()
+    const second = render(<ChatPage />)
+    fireEvent.click(await screen.findByRole('button', { name: '恢复任务' }))
+    expect(await screen.findByRole('heading', { name: '第二道题' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: '第一道题' })).toBeInTheDocument()
+    expect(screen.getAllByText('第 1 题答对了。')).toHaveLength(1)
+    expect(answer()).toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: '给业务助理发送消息' })).toHaveValue('')
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(createAgentRun).toHaveBeenCalledTimes(1)
+    expect(submitAgentInput).toHaveBeenCalledTimes(1)
+    expect(resumeAgentRun).toHaveBeenCalledWith('run_1')
+    expect(streamAgentEvents.mock.calls.at(-1)?.[2].afterEventId).toBe(4)
+
+    second.unmount()
+    render(<ChatPage />)
+    expect(await screen.findByRole('heading', { name: '第二道题' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: '第一道题' })).toBeInTheDocument()
+    expect(answer()).toBeInTheDocument()
+  })
+
+  it('keeps an unconfirmed answer across reload and restores its draft only after checking the same question', async () => {
+    const waiting = event(2, 'run.waiting_for_input', { request_id: 'original-question', questions: ['请补充规格。'] })
+    streamAgentEvents.mockImplementationOnce(async (_url, publish: (item: AgentEvent) => void) => {
+      publish(event(1, 'message.completed', { content: '请先确认采购条件。' }))
+      publish(waiting)
+      return { lastEventId: 2, terminal: true }
+    })
+    submitAgentInput.mockImplementationOnce(async () => {
+      getAgentRun.mockRejectedValue(new Error('读取暂时失败'))
+      throw new TypeError('连接中断')
+    })
+    const title = '给活动买纸杯'
+    const answer = '200 ml'
+    const composer = () => screen.getByRole('textbox', { name: '给业务助理发送消息' })
+    const send = () => screen.getByRole('button', { name: '发送消息' })
+    const first = render(<ChatPage />)
+    fireEvent.change(composer(), { target: { value: title } })
+    fireEvent.click(send())
+    expect(await screen.findByText('请补充规格。')).toBeInTheDocument()
+    fireEvent.change(composer(), { target: { value: answer } })
+    fireEvent.click(send())
+    expect(await screen.findByRole('button', { name: '重新核对' })).toBeInTheDocument()
+    expect(composer()).toBeDisabled()
+    expect(composer()).toHaveValue('')
+
+    first.unmount()
+    render(<ChatPage />)
+    const recheck = await screen.findByRole('button', { name: '重新核对' })
+    const transcript = within(screen.getByRole('region', { name: '对话消息' }))
+    expect(transcript.getByText(answer)).toBeInTheDocument()
+    getAgentRun.mockResolvedValue({
+      id: 'run_1', status: 'WAITING_FOR_INPUT', events: [waiting],
+    })
+    fireEvent.click(recheck)
+    await waitFor(() => expect(composer()).toHaveValue(answer))
+    expect(composer()).toBeEnabled()
+    expect(transcript.queryByText(answer)).not.toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent('补充尚未保存')
+    expect(submitAgentInput).toHaveBeenCalledTimes(1)
+    expect(resumeAgentRun).not.toHaveBeenCalled()
+  })
+
   it('shows procurement requirements, amounts and sources in separate tables', async () => {
     const agent = { agent: 'shopping_procurement', agent_run_id: 'procurement' }
     streamAgentEvents.mockImplementationOnce(async (_url, onEvent: (item: AgentEvent) => void) => {

@@ -41,7 +41,7 @@ export async function submitAgentInput(
   runId: string, requestId: string, answer: string,
   action: 'answer' | 'use_available' = 'answer', followupKey?: string,
 ): Promise<CreateRunResponse> {
-  const headers = new Headers({ 'Content-Type': 'application/json' })
+  const headers = new Headers({ 'Content-Type': 'application/json', ...workspaceHeaders() })
   if (followupKey) headers.set('X-Followup-Key', followupKey)
   const response = await fetch(agentApiUrl(`${CHAT_RUNS}/${runId}/input`), {
     method: 'POST', headers,
@@ -49,9 +49,10 @@ export async function submitAgentInput(
   })
   if (!response.ok) {
     const detail = await response.json().catch(() => ({}))
-    throw new Error(typeof detail.detail === 'string' ? detail.detail
+    const message = typeof detail.detail === 'string' ? detail.detail
       : response.status === 422 ? '补充信息格式不正确，请输入 1 至 2000 字的内容。'
-        : `提交补充信息失败（${response.status}）`)
+        : `提交补充信息失败（${response.status}）`
+    throw Object.assign(new Error(message), { status: response.status })
   }
   return response.json() as Promise<CreateRunResponse>
 }

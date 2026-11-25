@@ -55,6 +55,7 @@ import type {
   ChatMessage,
   Conversation,
   HumanInputRequest,
+  PendingInputSubmission,
   SavedAgentRun,
   RunState,
   ToolRun,
@@ -175,6 +176,60 @@ interface ConnectionIssue {
   message: string
 }
 
+const isRunInProgress = (status: RunState['status']) =>
+  status === 'pending' || status === 'running' || status === 'recovering'
+
+function savedTurn(runId: string, afterSequence: number, replyId?: string, prior?: ChatMessage): SavedAgentRun {
+  const url = `/api/v1/chat/runs/${encodeURIComponent(runId)}`
+  return {
+    runId, afterSequence, replyId, eventsUrl: `${url}/events`, cancelUrl: `${url}/cancel`,
+    priorAgentRuns: prior?.agentRuns, priorSkills: prior?.skills, followupKey: prior?.followupKey,
+  }
+}
+
+function readTurn(detail: AgentRunDetail, saved: SavedAgentRun) {
+  return readRunSnapshot(detail, saved.afterSequence, {
+    ...initialRunState, agentRuns: saved.priorAgentRuns ?? [], skills: saved.priorSkills ?? [],
+  })
+}
+
+function storeRunReply(conversation: Conversation, turn: SavedAgentRun, state: RunState): Conversation {
+  const matchesTurn = (message: ChatMessage) => message.role === 'assistant' && message.runId === turn.runId
+    && (message.id === turn.replyId || (message.afterSequence ?? 0) === turn.afterSequence)
+  const existing = conversation.messages.filter(matchesTurn).at(-1)
+  const user = conversation.messages.filter(message => message.role === 'user').at(-1)
+  const fallback = state.tools.some(tool => tool.status === 'completed')
+    ? '已保留本次取得的数据，见下方。'
+    : state.status === 'cancelled' ? '本轮已停止。'
+      : state.status === 'failed' || state.status === 'recovery_blocked' ? '' : '本轮没有取得可展示的结果。'
+  const message: ChatMessage = {
+    id: existing?.id ?? turn.replyId ?? (user ? `${user.id}-reply` : `${turn.runId}-reply`),
+    role: 'assistant',
+    content: state.assistantText || existing?.content || fallback,
+    createdAt: existing?.createdAt ?? new Date().toISOString(),
+    toolResults: persistableToolResults(state.tools),
+    agentRuns: state.agentRuns,
+    skills: state.skills,
+    runId: turn.runId,
+    runStatus: state.status,
+    afterSequence: turn.afterSequence,
+    throughSequence: Math.max(state.lastSequence, turn.afterSequence),
+    error: state.error,
+    partial: state.partial,
+    inputRequest: state.status === 'waiting_for_input' ? state.humanInput : undefined,
+    followupKey: state.agentRuns.some(item => item.agent === 'followup') ? turn.followupKey : undefined,
+  }
+  return {
+    ...conversation,
+    activeRun: !isRunInProgress(state.status) && conversation.activeRun?.runId === turn.runId
+      && conversation.activeRun.afterSequence === turn.afterSequence
+      ? undefined : conversation.activeRun,
+    messages: existing ? conversation.messages.map(item => item.id === existing.id ? message : item)
+      : [...conversation.messages, message],
+    updatedAt: new Date().toISOString(),
+  }
+}
+
 export function ChatPage() {
   const [conversations, setConversations] = useState<Conversation[]>(loadConversations)
   const [activeId, setActiveId] = useState(() => loadActiveConversationId(conversations))
@@ -214,7 +269,9 @@ export function ChatPage() {
   const runRef = useRef(initialRunState)
   const activeIdRef = useRef(activeId)
   const activeConnectionRef = useRef<ActiveRunConnection | undefined>(undefined)
+  const submittingInputs = useRef(new Set<string>())
   const active = conversations.find((item) => item.id === activeId) ?? conversations[0]
+  const pendingSubmission = active.pendingInputSubmission
   const draftDocuments = active.draftDocuments ?? []
   const input = drafts[active.id] ?? ''
   const setInput = (value: string) => setDrafts(items => ({ ...items, [active.id]: value }))
@@ -229,7 +286,7 @@ export function ChatPage() {
   }
   const awaitingPractice = !!taskReply?.inputRequest
     && taskReply.toolResults?.some(tool => tool.name === mathPracticeToolName)
-  const running = run.status === 'running' || run.status === 'pending' || run.status === 'recovering'
+  const running = isRunInProgress(run.status)
   const lastMessage = active.messages.at(-1)
   const lastUser = active.messages.filter(message => message.role === 'user').at(-1)
   const currentReplyId = !running && run.runId && lastMessage?.role === 'assistant' && lastMessage.runId === run.runId
@@ -242,9 +299,11 @@ export function ChatPage() {
     agentRuns: run.agentRuns, toolResults: run.tools, runId: run.runId }
   const messages = !showLiveReply ? active.messages : active.messages.some(item => item.id === liveId)
     ? active.messages.map(item => item.id === liveId ? liveMessage : item) : [...active.messages, liveMessage]
+  const visibleMessages = messages.filter(item => !(item.runStatus === 'recovery_blocked'
+    && item.afterSequence && !item.content && !item.toolResults?.length))
   const emptyConversation = active.messages.length === 0 && !run.assistantText && run.tools.length === 0
   const uploadingHere = uploading.includes(active.id)
-  const canAttach = !running && !taskReply?.inputRequest && !active.activeRun
+  const canAttach = !running && !pendingSubmission && !taskReply?.inputRequest && !active.activeRun
   const isConversation = view === 'chat' && !emptyConversation
   const { lg, xxl } = Grid.useBreakpoint()
   const showHistory = historyOpen ?? Boolean(lg)
@@ -256,14 +315,15 @@ export function ChatPage() {
     : run.status
   const partial = currentStatus === 'completed' && (run.runId === taskReply?.runId && run.status !== 'idle' ? run.partial : taskReply?.partial)
   const [statusLabel, statusTone] = taskStatus(currentStatus, partial)
-  const pendingInput = running || awaitingFollowup || currentStatus !== 'waiting_for_input' ? undefined : taskReply?.inputRequest
+  const pendingInput = running || pendingSubmission || awaitingFollowup || currentStatus !== 'waiting_for_input'
+    ? undefined : taskReply?.inputRequest
   const failed = currentStatus === 'failed' || currentStatus === 'recovery_blocked'
   const actionRunId = inspectedRunId ?? run.runId ?? taskReply?.runId
   const firstReplyIndex = actionRunId ? active.messages.findIndex(message => message.runId === actionRunId) : -1
   const taskQuestion = firstReplyIndex >= 0
     ? active.messages.slice(0, firstReplyIndex).reverse().find(message => message.role === 'user') : lastUser
   const heading = taskTitle ?? (taskQuestion?.documents?.length ? '资料问答' : taskQuestion?.content.slice(0, 120)) ?? active.title
-  const canResume = failed && verified?.id === actionRunId && !!verified?.checkpoint
+  const canResume = failed && !pendingSubmission && verified?.id === actionRunId && !!verified?.checkpoint
     && ['FAILED', 'RECOVERY_BLOCKED'].includes(verified.status.toUpperCase())
   const conversationsByRun = useMemo(() => {
     const byRun = new Map<string, Conversation>()
@@ -423,41 +483,7 @@ export function ChatPage() {
       if (conversation.id !== connection.conversationId
         || conversation.activeRun?.runId !== connection.runId
         || conversation.activeRun.afterSequence !== connection.afterSequence) return conversation
-      const settled = ['completed', 'cancelled', 'waiting_for_input', 'failed', 'recovery_blocked'].includes(state.status)
-      const activeRun = settled ? undefined : conversation.activeRun
-      const fallback = state.tools.some(tool => tool.status === 'completed')
-        ? '已保留本次取得的数据，见下方。'
-        : state.status === 'cancelled' ? '本轮已停止。'
-          : state.status === 'failed' || state.status === 'recovery_blocked' ? '' : '本轮没有取得可展示的结果。'
-      const lastUser = conversation.messages.map((message) => message.role).lastIndexOf('user')
-      const existing = conversation.messages.findIndex((message, index) => message.id === connection.replyId
-        || index > lastUser && message.runId === connection.runId)
-      const assistantMessage: ChatMessage = {
-        id: connection.replyId ?? `${conversation.messages[lastUser]?.id}-reply`,
-        role: 'assistant',
-        content: state.assistantText || fallback,
-        createdAt: new Date().toISOString(),
-        toolResults: persistableToolResults(state.tools),
-        agentRuns: state.agentRuns,
-        skills: state.skills,
-        runId: connection.runId,
-        runStatus: state.status,
-        afterSequence: connection.afterSequence,
-        throughSequence: state.lastSequence,
-        error: state.error,
-        partial: state.partial,
-        inputRequest: state.humanInput,
-        followupKey: state.agentRuns.some(item => item.agent === 'followup')
-          ? connection.followupKey : undefined,
-      }
-      return {
-        ...conversation,
-        activeRun,
-        messages: existing < 0 ? [...conversation.messages, assistantMessage]
-          : conversation.messages.map((message, index) => index === existing
-            ? { ...assistantMessage, id: message.id, createdAt: message.createdAt } : message),
-        updatedAt: new Date().toISOString(),
-      }
+      return storeRunReply(conversation, connection, state)
     }))
   }
 
@@ -530,7 +556,87 @@ export function ChatPage() {
     return consumeConnection(connection)
   }
 
+  const reconcileInputSubmission = async (
+    submission: PendingInputSubmission, user: ChatMessage, cause?: unknown, draft?: string,
+  ) => {
+    const detail = await getAgentRun(submission.runId).catch(() => undefined)
+    const events = detail?.id === submission.runId ? detail.events : undefined
+    const submitted = events?.find(item => (item.event_type ?? item.type) === 'input.submitted'
+      && item.payload.request_id === submission.requestId)
+    const prior = replies.filter(reply => reply.runId === submission.runId
+      && reply.inputRequest?.requestId === submission.requestId).at(-1)
+    const isCurrent = activeIdRef.current === active.id
+
+    if (detail && submitted && submitted.payload.answer === user.content
+      && (submitted.payload.action ?? 'answer') === submission.action) {
+      const turn = savedTurn(submission.runId, submitted.sequence, `${user.id}-reply`, prior)
+      const state = readTurn(detail, turn)
+      setActiveConversation(conversation => {
+        if (conversation.pendingInputSubmission?.messageId !== user.id) return conversation
+        const settled = { ...conversation, pendingInputSubmission: undefined }
+        return isRunInProgress(state.status) ? { ...settled, activeRun: turn }
+          : storeRunReply(settled, turn, state)
+      })
+      if (!isCurrent) return
+      if (isRunInProgress(state.status)) {
+        resetRun('pending', turn)
+        void attachRun(turn, active.id)
+      } else {
+        setVerified(detail)
+        setCancelUrl(undefined)
+        runRef.current = state
+        dispatch(state)
+      }
+      return
+    }
+
+    const status = detail?.status.toUpperCase()
+    const waiting = events?.filter(item => (item.event_type ?? item.type) === 'run.waiting_for_input').at(-1)
+    const stillWaiting = status === 'WAITING_FOR_INPUT' && waiting != null
+    const canRestoreDraft = stillWaiting && waiting.payload.request_id === submission.requestId
+    const httpStatus = cause instanceof Error && 'status' in cause ? cause.status : undefined
+    const rejected = typeof httpStatus === 'number' && httpStatus >= 400 && httpStatus < 500 && httpStatus !== 409
+    const changed = Boolean(submitted || (stillWaiting && !canRestoreDraft) || (events?.length && status
+      && ['COMPLETED', 'FAILED', 'CANCELLED', 'RECOVERY_BLOCKED'].includes(status)))
+    if (!rejected && !changed && !canRestoreDraft) {
+      if (isCurrent) resetRun('idle')
+      return
+    }
+
+    setActiveConversation(conversation => conversation.pendingInputSubmission?.messageId === user.id ? {
+      ...conversation, pendingInputSubmission: undefined,
+      messages: conversation.messages.filter(message => message.id !== user.id),
+    } : conversation)
+    if (!changed) {
+      setInput(draft ?? (submission.action === 'answer' && !prior?.followupKey ? user.content : ''))
+    }
+    if (!isCurrent) return
+    setInspectedRunId(submission.runId)
+    resetRun('idle')
+    showDocumentError(changed ? '补充请求已更新，请查看本次任务。'
+      : cause instanceof Error ? cause.message : '补充尚未保存，请重新提交。')
+  }
+
+  const recheckInput = async () => {
+    if (!pendingSubmission || submittingInputs.current.has(active.id)) return
+    const user = active.messages.find(message => message.id === pendingSubmission.messageId)
+    if (!user) return
+    submittingInputs.current.add(active.id)
+    setCancelUrl(undefined)
+    runRef.current = { ...initialRunState, status: 'pending', stage: '正在核对补充' }
+    dispatch(runRef.current)
+    try {
+      await reconcileInputSubmission(pendingSubmission, user)
+    } finally {
+      submittingInputs.current.delete(active.id)
+    }
+  }
+
   const restoreActiveRun = useEffectEvent(() => {
+    if (pendingSubmission) {
+      void recheckInput()
+      return
+    }
     const saved = active.activeRun
     if (activeConnectionRef.current || !saved) return
     resetRun('pending', saved)
@@ -551,10 +657,10 @@ export function ChatPage() {
   const reconnectActiveRun = async (retry = false) => {
     if (reconnecting || (retry && (!canResume || !actionRunId))) return
     let connection = activeConnectionRef.current
-    if (retry && connection?.runId !== actionRunId && actionRunId) {
-      const url = `/api/v1/chat/runs/${encodeURIComponent(actionRunId)}`
-      connection = { runId: actionRunId, conversationId: active.id, eventsUrl: `${url}/events`,
-        cancelUrl: `${url}/cancel`, afterSequence: 0, lastEventId: 0, followupKey: taskReply?.followupKey }
+    if (retry && actionRunId) {
+      const reply = taskReply?.runId === actionRunId ? taskReply : undefined
+      const turn = savedTurn(actionRunId, reply?.afterSequence ?? 0, reply?.id, reply)
+      connection = { ...turn, conversationId: active.id, lastEventId: turn.afterSequence }
       activeConnectionRef.current = connection
     }
     if (!connection) return
@@ -562,15 +668,14 @@ export function ChatPage() {
     setConnectionIssue(undefined)
     try {
       if (retry) {
-        const state = readRunSnapshot(verified!, connection.afterSequence)
+        const state = readTurn(verified!, connection)
         await resumeAgentRun(connection.runId)
         if (activeConnectionRef.current !== connection) return
-        connection = { ...connection, replyId: taskReply?.id, lastEventId: Math.max(state.lastSequence, connection.lastEventId) }
+        connection = { ...connection, lastEventId: Math.max(state.lastSequence, connection.lastEventId) }
         activeConnectionRef.current = connection
         const saved = { ...connection }
         setActiveConversation(conversation => ({ ...conversation, activeRun: saved }))
-        runRef.current = { ...(state.tools.length || runRef.current.runId !== connection.runId ? state : runRef.current),
-          status: 'recovering', stage: '正在恢复任务', error: undefined }
+        runRef.current = { ...state, status: 'recovering', stage: '正在恢复任务', error: undefined }
         dispatch(runRef.current)
         setCancelUrl(connection.cancelUrl)
         setVerified(undefined)
@@ -583,10 +688,11 @@ export function ChatPage() {
         if (activeConnectionRef.current !== connection) return
         if (detail?.status.toUpperCase() === 'RECOVERY_BLOCKED') {
           setVerified(detail)
-          runRef.current = readRunSnapshot(detail)
-          dispatch(runRef.current)
-          setActiveConversation(conversation => ({ ...conversation, messages: conversation.messages.map(item =>
-            item.id === taskReply?.id ? { ...item, runStatus: 'recovery_blocked', error: detail.error_message ?? undefined } : item) }))
+          const turn = connection
+          const state = readTurn(detail, turn)
+          runRef.current = state
+          dispatch(state)
+          setActiveConversation(conversation => storeRunReply(conversation, turn, state))
           setReconnecting(false)
           return
         }
@@ -620,7 +726,8 @@ export function ChatPage() {
     const content = followupAction ?? (action === 'use_available'
       ? '请先用现有事实生成草稿，未确认的内容保留待补充，结束本轮追问。'
       : input.trim() || (documents.length ? '请概括所选资料，并给出关键事实及出处。' : ''))
-    if (!content || running || uploadingHere || (inspectedRunId && !taskReply)) return
+    if (!content || running || pendingSubmission || submittingInputs.current.has(active.id)
+      || reconnecting || uploadingHere || (inspectedRunId && !taskReply)) return
 
     followLatest.current = true
     readingResult.current = false
@@ -631,6 +738,8 @@ export function ChatPage() {
     setInput('')
     setInspectedRunId(undefined)
     setConnectionIssue(undefined)
+    setCancelUrl(undefined)
+    setDocumentError(previous => previous?.conversationId === active.id ? undefined : previous)
     const userMessage: ChatMessage = {
       id: crypto.randomUUID(),
       role: 'user',
@@ -639,25 +748,32 @@ export function ChatPage() {
       ...(documents.length ? { documents } : {}),
     }
     const history = [...active.messages, userMessage]
+    const request = currentStatus === 'waiting_for_input' ? taskReply?.inputRequest : undefined
+    const previousRunId = taskReply?.runId
+    const submission = request && previousRunId
+      ? { runId: previousRunId, requestId: request.requestId, messageId: userMessage.id, action }
+      : undefined
+    const prior = submission ? { priorAgentRuns: taskReply?.agentRuns, priorSkills: taskReply?.skills } : undefined
+    if (submission) submittingInputs.current.add(active.id)
     setActiveConversation((conversation) => ({
       ...conversation,
       title: conversation.messages.length === 0 ? content.slice(0, 28) : conversation.title,
       messages: history,
+      pendingInputSubmission: submission,
       updatedAt: new Date().toISOString(),
     }))
-    const request = currentStatus === 'waiting_for_input' ? taskReply?.inputRequest : undefined
-    const previousRunId = taskReply?.runId
-    const prior = request && previousRunId
-      ? { priorAgentRuns: taskReply.agentRuns, priorSkills: taskReply.skills }
-      : undefined
     resetRun('pending', prior)
 
     try {
       const followupKey = request ? taskReply?.followupKey : undefined
       const access: [string?] = followupKey ? [followupKey] : []
-      const created = request && previousRunId
-        ? await submitAgentInput(previousRunId, request.requestId, content, action, ...access)
+      const created = submission
+        ? await submitAgentInput(submission.runId, submission.requestId, content, action, ...access)
         : await createAgentRun(history, active.id)
+      if (submission && created.status.toUpperCase() === 'RECOVERY_BLOCKED') {
+        await reconcileInputSubmission(submission, userMessage)
+        return
+      }
       const saved: SavedAgentRun = {
         replyId: `${userMessage.id}-reply`,
         ...prior,
@@ -669,22 +785,21 @@ export function ChatPage() {
       }
       setActiveConversation((conversation) => ({
         ...conversation, activeRun: saved,
+        pendingInputSubmission: undefined,
         ...(documents.length ? { draftDocuments: [] } : {}),
       }))
-      if (activeIdRef.current === active.id) await attachRun(saved, active.id)
+      if (activeIdRef.current === active.id) void attachRun(saved, active.id)
     } catch (cause) {
-      if (documents.length || request) {
+      if (submission) {
+        await reconcileInputSubmission(submission, userMessage, cause, input)
+        return
+      }
+      if (documents.length) {
         setActiveConversation(conversation => ({
           ...conversation, title: active.title, updatedAt: active.updatedAt,
           messages: conversation.messages.filter(message => message.id !== userMessage.id),
         }))
         setInput(input)
-        if (request && activeIdRef.current === active.id) {
-          setInspectedRunId(previousRunId)
-          resetRun('idle')
-          showDocumentError((cause as Error).message)
-          return
-        }
       }
       if (activeIdRef.current !== active.id) return
       applyEvent({
@@ -695,6 +810,8 @@ export function ChatPage() {
         created_at: new Date().toISOString(),
         payload: { message: (cause as Error).message },
       })
+    } finally {
+      if (submission) submittingInputs.current.delete(active.id)
     }
   }
 
@@ -749,10 +866,15 @@ export function ChatPage() {
     resetRun('idle')
   }
 
-  const composer = awaitingFollowup && !running && !connectionIssue && run.status !== 'failed' ? (
+  const composer = awaitingFollowup && !pendingSubmission && !running && !connectionIssue && !failed ? (
     <div className="chat-composer-wrap"><small>通过上方的复诊资料区继续本次整理。</small></div>
   ) : (
     <div className="chat-composer-wrap">
+      {pendingSubmission && !running && (
+        <Alert type="warning" showIcon title="暂时无法确认补充是否已保存"
+          description="核对提交结果后可以继续本次任务。"
+          action={<Button size="small" onClick={() => void recheckInput()}>重新核对</Button>} />
+      )}
       {connectionIssue ? (
         <Alert
           type="warning"
@@ -771,7 +893,8 @@ export function ChatPage() {
           type="error"
           showIcon
           title={(run.runId === actionRunId ? run.error : undefined) ?? (verified?.id === actionRunId ? verified?.error_message : undefined) ?? taskReply?.error ?? statusLabel}
-          description={canResume ? '可从本次任务的检查点继续。' : undefined}
+          description={canResume ? (taskReply?.afterSequence
+            ? '补充已保存，可从本次任务的检查点继续。' : '可从本次任务的检查点继续。') : undefined}
           action={canResume ? (
             <Button size="small" loading={reconnecting} onClick={() => void reconnectActiveRun(true)}>
               恢复任务
@@ -807,7 +930,7 @@ export function ChatPage() {
             autoComplete="off"
             aria-label="给业务助理发送消息"
             value={input}
-            disabled={running || awaitingFollowup}
+            disabled={running || Boolean(pendingSubmission) || awaitingFollowup || reconnecting}
             placeholder={awaitingPractice ? '输入选项字母、跳过或结束练习'
               : pendingInput ? '输入补充信息…' : emptyConversation ? '请输入需求、粘贴网址或上传资料…' : '继续与主 Agent 对话…'}
             autoSize={{ minRows: 1, maxRows: 5 }}
@@ -830,7 +953,8 @@ export function ChatPage() {
                 aria-label="发送消息"
                 type="primary"
                 icon={<SendOutlined />}
-                disabled={(!input.trim() && (!canAttach || !draftDocuments.length)) || awaitingFollowup || uploadingHere}
+                disabled={(!input.trim() && (!canAttach || !draftDocuments.length))
+                  || Boolean(pendingSubmission) || awaitingFollowup || uploadingHere || reconnecting}
                 onClick={() => void send()}
               />
             </Tooltip>
@@ -855,40 +979,44 @@ export function ChatPage() {
   const recordedTools = liveDetails || (currentReplyId && detailReply?.id === currentReplyId) ? run.tools : detailReply?.toolResults
   const detailStatus = replyStatus(detailReply)
   const statsRunId = view === 'chat' && showDetails && !liveDetails ? detailReply?.runId : undefined
-  const lookupId = isConversation && !running ? (inspectedRunId ?? (failed || run.status === 'idle' ? actionRunId : undefined) ?? statsRunId) : undefined
+  const lookupId = isConversation && !running && !pendingSubmission
+    ? (inspectedRunId ?? (failed || run.status === 'idle' ? actionRunId : undefined) ?? statsRunId) : undefined
   const syncStoredReply = useEffectEvent((detail: AgentRunDetail) => {
-    if (!Array.isArray(detail.events) || activeConnectionRef.current && abortRef.current) return
-    const snapshot = readRunSnapshot(detail)
-    const previous = replies.filter(message => message.runId === detail.id).at(-1)
-    if (['running', 'pending', 'recovering'].includes(snapshot.status)) {
-      if (active.activeRun || !inspectedRunId && previous !== latestAssistant) return
-      const url = `/api/v1/chat/runs/${encodeURIComponent(detail.id)}`
-      const saved = { runId: detail.id, eventsUrl: `${url}/events`, cancelUrl: `${url}/cancel`, afterSequence: 0,
-        followupKey: previous?.followupKey }
-      setActiveConversation(conversation => ({ ...conversation, activeRun: saved }))
-      resetRun('pending')
+    if (!detail.events?.length || pendingSubmission || activeConnectionRef.current && abortRef.current) return
+    const submitted = detail.events.filter(item => (item.event_type ?? item.type) === 'input.submitted').at(-1)
+    const afterSequence = submitted?.sequence ?? 0
+    const runReplies = replies.filter(reply => reply.runId === detail.id)
+    const previous = runReplies.filter(reply => (reply.afterSequence ?? 0) === afterSequence).at(-1)
+    const question = submitted && runReplies.filter(reply =>
+      reply.inputRequest?.requestId === submitted.payload.request_id).at(-1)
+    const next = question && active.messages[active.messages.indexOf(question) + 1]
+    const existingAnswer = next?.role === 'user' && next.content === submitted?.payload.answer ? next : undefined
+    const recoveredAnswer: ChatMessage | undefined = submitted && !previous && !existingAnswer
+      && typeof submitted.payload.answer === 'string' ? {
+        id: `${detail.id}-input-${submitted.sequence}`, role: 'user',
+        content: submitted.payload.answer, createdAt: submitted.created_at,
+      } : undefined
+    const user = existingAnswer ?? recoveredAnswer
+    const replyId = previous?.id ?? (user ? `${user.id}-reply` : `${detail.id}-${afterSequence}-reply`)
+    const saved = savedTurn(detail.id, afterSequence, replyId, question ?? previous)
+    const state = readTurn(detail, saved)
+    const withAnswer = (conversation: Conversation) => recoveredAnswer
+      && !conversation.messages.some(message => message.id === recoveredAnswer.id)
+      ? { ...conversation, messages: [...conversation.messages, recoveredAnswer] } : conversation
+    if (isRunInProgress(state.status)) {
+      if (active.activeRun || !inspectedRunId && runReplies.at(-1) !== latestAssistant) return
+      setActiveConversation(conversation => ({ ...withAnswer(conversation), activeRun: saved }))
+      resetRun('pending', saved)
       void attachRun(saved, active.id)
       return
     }
-    if (!detail.events.length) return
-    if (previous && previous.runStatus === snapshot.status && previous.error === snapshot.error
-      && previous.inputRequest?.requestId === snapshot.humanInput?.requestId && !!previous.partial === !!snapshot.partial) return
-    const turnStart = [...detail.events].reverse().find(item => (item.event_type ?? item.type) === 'input.submitted')?.sequence ?? 0
-    const turn = readRunSnapshot(detail, turnStart)
-    const message: ChatMessage = { ...previous, id: previous?.id ?? crypto.randomUUID(), role: 'assistant', runId: detail.id,
-      createdAt: previous?.createdAt ?? detail.events.at(-1)!.created_at,
-      content: turn.assistantText || previous?.content || '', runStatus: snapshot.status, error: snapshot.error,
-      partial: snapshot.partial, inputRequest: snapshot.status === 'waiting_for_input' ? snapshot.humanInput : undefined,
-      afterSequence: turnStart, throughSequence: snapshot.lastSequence,
-      toolResults: persistableToolResults(turn.tools), agentRuns: snapshot.agentRuns, skills: snapshot.skills }
-    setActiveConversation(conversation => ({ ...conversation,
-      messages: previous ? conversation.messages.map(item => item.id === previous.id ? message : item)
-        : [...conversation.messages, message].sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
-      activeRun: conversation.activeRun?.runId === detail.id ? undefined : conversation.activeRun,
-    }))
-    if (runRef.current.runId === detail.id && runRef.current.status !== snapshot.status) {
-      runRef.current = turn
-      dispatch(turn)
+    if (previous && previous.runStatus === state.status && previous.error === state.error
+      && previous.inputRequest?.requestId === state.humanInput?.requestId && !!previous.partial === !!state.partial
+      && (previous.throughSequence ?? state.lastSequence) >= state.lastSequence) return
+    setActiveConversation(conversation => storeRunReply(withAnswer(conversation), saved, state))
+    if (runRef.current.runId === detail.id && runRef.current.status !== state.status) {
+      runRef.current = state
+      dispatch(state)
     }
   })
   useEffect(() => {
@@ -1116,7 +1244,7 @@ export function ChatPage() {
                   setAwayFromLatest(!followLatest.current)
                 }}>
                 <div className="chat-message-list" ref={messageListRef}>
-                  {messages.map(item => (
+                  {visibleMessages.map(item => (
                     <article
                       className={`chat-message ${item.role}${item === liveMessage ? ' streaming' : ''}`}
                       key={item.id}
@@ -1150,7 +1278,7 @@ export function ChatPage() {
                               <Suspense fallback={replyLoading}>
                                 <FollowupPanel
                                   runId={item.runId} access={item.followupKey}
-                                  canContinue={item.id === taskReply?.id && !!item.inputRequest && !running}
+                                  canContinue={item.id === taskReply?.id && !!item.inputRequest && !pendingSubmission && !running}
                                   onContinue={choice => void send('answer', choice)}
                                 />
                               </Suspense>
