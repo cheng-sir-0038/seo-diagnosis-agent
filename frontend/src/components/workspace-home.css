@@ -1,0 +1,284 @@
+.workspace-main:has(> .workspace-home-scroll) {
+  background: #f5f6fc;
+}
+
+.workbench-home {
+  --desk-ink: #13172a;
+  --desk-accent: #5942e7;
+  --desk-line: #dfe3ef;
+  --home-surface: #fff;
+  --home-tint: #e8eaff;
+  --workspace-shadow: 0 3px 10px rgb(35 42 90 / 5%);
+  --home-domain-inset: clamp(0px, calc(22vw - 282px), 86px);
+  --home-recent-inset: clamp(0px, calc(9vw - 116px), 34px);
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", system-ui, sans-serif;
+}
+
+/* Keep these rules scoped above the shared workbench defaults. */
+.workspace-home-scroll > .workbench-home {
+  padding-inline: clamp(20px, 1.68vw, 28px) 14px;
+}
+
+.workbench-home .workbench-intro {
+  padding-left: clamp(0px, calc(22vw - 229px), 138px);
+}
+.workbench-home .workbench-intro h1 {
+  font-size: clamp(30px, 3.1vw, 51px);
+  letter-spacing: -.006em;
+}
+.workbench-home .workbench-intro p {
+  font-size: clamp(15px, 1.5vw, 25px);
+}
+.workbench-home .workbench-illustration {
+  width: min(53%, 620px);
+  max-height: 178px;
+}
+
+.workbench-home .workbench-composer {
+  --chat-column-width: 1064px;
+  width: min(var(--chat-column-width), 100%);
+}
+.workbench-home .chat-composer-wrap {
+  scrollbar-gutter: auto;
+}
+.workbench-home .workbench-composer .chat-composer {
+  min-height: 64px;
+  padding: 9px 12px 9px 22px;
+  border-color: var(--desk-accent);
+  border-radius: 17px;
+  background: var(--home-surface);
+  box-shadow: 0 4px 12px rgb(89 66 231 / 12%);
+}
+.workbench-home .workbench-composer .chat-composer:focus-within {
+  box-shadow: 0 0 0 3px rgb(89 66 231 / 16%);
+}
+.workbench-home .chat-composer textarea.ant-input {
+  color: var(--desk-ink);
+  line-height: 24px;
+}
+.workbench-home .chat-composer textarea::placeholder {
+  color: var(--desk-muted);
+}
+.workbench-home .workbench-composer .chat-composer > .ant-btn {
+  width: 64px;
+  background: var(--desk-accent);
+}
+.workbench-home .workbench-composer .chat-composer > .ant-btn:enabled:hover {
+  background: #4b35cc;
+}
+.workbench-home .workbench-composer .chat-composer > .ant-btn:disabled {
+  background: #8979ee;
+}
+
+.workbench-home .workbench-domains {
+  margin: 36px 0 24px var(--home-domain-inset);
+}
+.workbench-home .workbench-domain {
+  min-height: 144px;
+  gap: 12px;
+  padding: 16px 16px 16px clamp(12px, 1.4vw, 23px);
+}
+.workbench-home .workbench-domain-title {
+  gap: clamp(8px, .85vw, 14px);
+}
+.workbench-home .workbench-domain-title strong {
+  font-size: clamp(15px, 1.4vw, 23px);
+}
+.workbench-home .workbench-domain-title .anticon {
+  font-size: clamp(23px, 2.65vw, 44px);
+}
+.workbench-home .workbench-domain-description {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  color: #424c63;
+  font-size: clamp(13px, 1vw, 16px);
+}
+.workbench-home .workbench-domain-description .anticon {
+  width: 31px;
+  height: 31px;
+}
+.workbench-home .workbench-examples {
+  margin-left: var(--home-domain-inset);
+}
+
+.workbench-home .workbench-recent {
+  min-height: 0;
+  margin-left: var(--home-recent-inset);
+  padding: 11px 15px 10px;
+}
+.workbench-home .workbench-panel h2 {
+  font-size: clamp(17px, 1.35vw, 23px);
+  line-height: 1.25;
+}
+.workbench-home .workbench-panel-header {
+  padding-inline: 7px 12px;
+}
+.workbench-home .workbench-panel-header a {
+  color: var(--desk-accent);
+  font-size: clamp(13px, 1vw, 16px);
+}
+.workbench-home .workbench-task-list {
+  margin-top: 8px;
+  border-color: var(--desk-line);
+}
+.workbench-home .workbench-task-list button {
+  min-height: 47px;
+  grid-template-columns: 42px minmax(0, 1fr) minmax(88px, .27fr) minmax(112px, .22fr) 14px;
+  gap: 12px;
+  padding-inline: clamp(10px, 1.3vw, 22px);
+  background: var(--home-surface);
+}
+.workbench-home .workbench-task-list button:hover {
+  background: #f3f3ff;
+}
+.workbench-home .workbench-task-list button strong {
+  font-size: clamp(14px, 1.05vw, 17px);
+}
+.workbench-home .workbench-task-list time {
+  font-size: clamp(12px, .9vw, 15px);
+}
+.workbench-home .workbench-task-list .workspace-row-icon {
+  width: 42px;
+  background: var(--home-tint);
+  color: var(--desk-accent);
+}
+.workbench-home .workbench-task-list .workspace-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding-inline: 10px;
+  font-size: clamp(12px, .9vw, 15px);
+}
+
+.workbench-home .workbench-scenes {
+  margin-top: 24px;
+}
+.workbench-home .workbench-scenes h2 {
+  margin: 0 7px 12px;
+}
+.workbench-home .workbench-scene {
+  min-height: 90px;
+  align-content: center;
+  background: #f4f3ff;
+}
+.workbench-home .workbench-scene:hover {
+  background: var(--home-tint);
+}
+.workbench-home .workbench-scene > span {
+  flex-wrap: nowrap;
+  gap: 9px;
+}
+.workbench-home .workbench-scene strong {
+  font-size: clamp(14px, 1vw, 16px);
+}
+.workbench-home .workbench-scene .anticon {
+  font-size: clamp(22px, 1.8vw, 30px);
+}
+
+.workbench-home :is(.workbench-domain, .workbench-examples button, .workbench-panel-header a, .workbench-task-list button, .workbench-scene):focus-visible {
+  outline: 2px solid var(--desk-accent);
+  outline-offset: -3px;
+}
+
+@media (min-width: 1280px) {
+  .workbench-home .workbench-illustration {
+    right: clamp(0px, calc(20vw - 256px), 76px);
+  }
+  .workbench-home .workbench-composer {
+    margin-inline: clamp(0px, calc((100% - var(--chat-column-width)) / 2 + 32px), 100% - min(var(--chat-column-width), 100%)) auto;
+  }
+}
+
+@media (max-width: 1100px) {
+  .workbench-home .workbench-domain {
+    min-height: 120px;
+    padding-inline: 10px;
+  }
+  .workbench-home .workbench-domain-description .anticon {
+    width: 22px;
+    height: 22px;
+    font-size: 10px;
+  }
+}
+
+@media (min-width: 841px) and (max-width: 1024px), (min-width: 601px) and (max-width: 720px) {
+  .workbench-home .workbench-domains, .workbench-home .workbench-scene-grid {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+  }
+  .workbench-home :is(.workbench-domain, .workbench-scene) {
+    grid-column: span 2;
+  }
+  .workbench-home :is(.workbench-domain, .workbench-scene):nth-child(n + 4) {
+    grid-column: span 3;
+  }
+}
+
+@media (max-width: 600px) {
+  .workspace-home-scroll > .workbench-home {
+    padding-inline: 14px;
+  }
+  .workbench-home .workbench-intro h1 {
+    letter-spacing: -.026em;
+  }
+  .workbench-home .workbench-intro p {
+    font-size: 13px;
+  }
+  .workbench-home .workbench-illustration {
+    width: min(56%, 225px);
+  }
+  .workbench-home .workbench-composer .chat-composer {
+    min-height: 56px;
+    padding: 7px 8px 7px 10px;
+    border-radius: 14px;
+  }
+  .workbench-home .workbench-composer .chat-composer > .ant-btn {
+    width: 44px;
+  }
+  .workbench-home .chat-composer textarea.ant-input:placeholder-shown {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .workbench-home .workbench-domains {
+    margin-block: 20px 16px;
+  }
+  .workbench-home .workbench-domain {
+    min-height: 92px;
+    gap: 8px;
+    padding: 10px;
+  }
+  .workbench-home .workbench-domain:last-child {
+    min-height: 74px;
+  }
+  .workbench-home .workbench-recent, .workbench-home .workbench-scenes {
+    padding-inline: 10px;
+  }
+  .workbench-home .workbench-panel-header {
+    padding-inline: 2px;
+  }
+  .workbench-home .workbench-task-list button {
+    grid-template-columns: 26px minmax(0, 1fr) auto;
+    padding-inline: 7px;
+    gap: 7px;
+  }
+  .workbench-home .workbench-task-list .workspace-row-icon {
+    width: 26px;
+  }
+  .workbench-home .workbench-task-list .workspace-state {
+    gap: 4px;
+    padding-inline: 6px;
+  }
+  .workbench-home .workbench-scenes {
+    margin-top: 16px;
+  }
+  .workbench-home .workbench-scene:last-child {
+    grid-column: 1 / -1;
+    min-height: 66px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .workbench-home :is(.workbench-domain, .chat-composer) {
+    transition: none;
+  }
+}

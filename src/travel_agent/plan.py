@@ -4,8 +4,8 @@ import hashlib
 import json
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
-from itertools import product
-from typing import Any
+from itertools import groupby, product
+from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
@@ -21,6 +21,8 @@ _Offer = dict[str, Any]
 class TripRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
+    transport: Literal["round_trip", "one_way", "none"] | None = None
+    lodging: bool | None = None
     origin: str | None = Field(default=None, min_length=1, max_length=80)
     destination: str | None = Field(default=None, min_length=1, max_length=80)
     depart_on: date | None = None
@@ -40,6 +42,22 @@ class TripRequest(BaseModel):
         if isinstance(value, str):
             return datetime.fromisoformat(value)
         raise ValueError("到场截止时间需包含日期、时间和时区。")
+
+
+    @property
+    def wants_outbound(self) -> bool:
+        return self.transport != "none"
+
+    @property
+    def wants_return(self) -> bool:
+        return self.transport not in {"one_way", "none"}
+
+    @property
+    def wants_lodging(self) -> bool:
+        if self.lodging is not None:
+            return self.lodging
+        # Keep old dated itineraries with a room count, without inferring a stay from dates alone.
+        return (self.transport == "none" or self.rooms is not None) and self.depart_on != self.return_on
 
 
 def _zoned(value: Any) -> datetime | None:
@@ -150,12 +168,11 @@ def _check_arrival(
     if request.arrive_by is None:
         return "not_requested", None
 
-    required = {
-        "有时区的去程到站时间": arrival,
-        "会场地址": request.venue,
-        "到站后前往会场的接驳时间": minutes,
-        "到场缓冲时间": request.buffer_minutes,
-    }
+    required = {"有时区的去程到站时间": arrival}
+    if request.venue:
+        required["到站后前往到访地点的接驳时间"] = minutes
+    if request.venue or request.buffer_minutes is not None:
+        required["抵达缓冲时间"] = request.buffer_minutes
     missing.extend(label for label, value in required.items() if value is None)
     if arrival is None:
         return "unconfirmed", None
@@ -200,7 +217,7 @@ def _cost(
     totals: dict[str, Decimal] = {}
     cost_items: dict[str, dict] = {}
     nights = (check_out - check_in).days if check_in is not None and check_out is not None else None
-    room_required = nights != 0
+    room_required = request.wants_lodging and nights != 0
     hotel_dates_match = nights is not None and (
         _date(hotel.get("check_in")),
         _date(hotel.get("check_out")),
@@ -208,7 +225,11 @@ def _cost(
     room_nights = None
     if nights is not None and hotel_dates_match and request.rooms is not None:
         room_nights = nights * request.rooms
-    legs = [("outbound", "去程交通", outbound), ("return", "返程交通", inbound)]
+    legs = []
+    if request.wants_outbound:
+        legs.append(("outbound", "去程交通", outbound))
+    if request.wants_return:
+        legs.append(("return", "返程交通", inbound))
     if room_required:
         legs.append(("hotel", "住宿", hotel))
         if hotel and not hotel_dates_match:
@@ -286,10 +307,10 @@ def _make_plan(
         cost_items["ground"] = {"status": "price_unconfirmed"}
         warnings.append("已知报价未含地面接驳，相关费用待核对。")
         if hotel and hotel_commute is None:
-            missing.append("酒店到会场的接驳时间")
+            missing.append("酒店至到访地点的接驳时间")
     arrival_status, estimated = _check_arrival(request, arrival, arrival_commute, missing)
     if arrival_status == "late":
-        warnings.append("按已有时刻和接驳信息，无足够时间在截止前到达会场。")
+        warnings.append("按已有时刻和接驳信息，无足够时间在截止前抵达。")
     budget_status = _check_budget(request, cny=totals.get("CNY"), complete=complete_price)
     if budget_status == "exceeded":
         warnings.append("已知人民币报价小计超过预算。")
@@ -343,12 +364,12 @@ def _plans_for_pair(
     return_departure = _zoned(inbound.get("departs_at"))
     if arrival is not None and return_departure is not None and return_departure <= arrival:
         return []
-    check_in = arrival.date() if arrival is not None else request.depart_on
-    check_out = return_departure.date() if return_departure is not None else request.return_on
+    check_in = request.depart_on if request.transport == "none" or arrival is None else arrival.date()
+    check_out = request.return_on if return_departure is None else return_departure.date()
     if check_in is not None and check_out is not None and check_out < check_in:
         return []
     choices = [hotel for hotel in hotels if _matching_hotel(hotel, check_in, check_out)]
-    if check_in is not None and check_in == check_out:
+    if not request.wants_lodging or (check_in is not None and check_in == check_out):
         choices = []
     return [
         _make_plan(request, routes, outbound, inbound, hotel, arrival, check_in, check_out)
@@ -395,14 +416,22 @@ def _choose(
 
 def _pick(plans: list[dict], modes: dict[str, str]) -> list[dict]:
     ordered = sorted(plans, key=_priority)
-    complete = [plan for plan in ordered if plan["complete_price"]]
-    partial = [plan for plan in ordered if not plan["complete_price"]]
     mode_pairs = {
         plan["id"]: (modes.get(plan["transport"]), modes.get(plan["return_transport"]))
         for plan in plans
     }
-    picked = _choose(complete, _MAX_PLANS - bool(partial), mode_pairs, [])
-    picked += _choose(partial, _MAX_PLANS - len(picked), mode_pairs, picked)
+    picked: list[dict] = []
+    for _, group in groupby(ordered, key=lambda plan: _constraint_rank(plan)[0]):
+        slots = _MAX_PLANS - len(picked)
+        if not slots:
+            break
+        tier = list(group)
+        complete = [plan for plan in tier if plan["complete_price"]]
+        partial = [plan for plan in tier if not plan["complete_price"]]
+        # Keep a price-incomplete alternative within the same conflict tier when space allows.
+        reserve_partial = slots > 1 and bool(partial)
+        picked += _choose(complete, slots - reserve_partial, mode_pairs, picked)
+        picked += _choose(partial, _MAX_PLANS - len(picked), mode_pairs, picked)
     return [dict(plan, label=f"方案 {index}") for index, plan in enumerate(picked, 1)]
 
 
@@ -414,14 +443,14 @@ def build_travel_plan(
     hotels: list[dict],
     commute_by_offer: dict[str, dict],
 ) -> dict:
-    if request.depart_on and request.return_on and request.return_on < request.depart_on:
+    if (request.wants_return or request.wants_lodging) and request.depart_on and request.return_on and request.return_on < request.depart_on:
         return {"plans": [], "issues": ["返程日期早于出发日期，请核对行程。"]}
 
     outbound_choices = [
-        offer for offer in _offers(outbound) if _matching_departure(offer, request.depart_on)
+        offer for offer in _offers(outbound) if request.wants_outbound and _matching_departure(offer, request.depart_on)
     ]
     inbound_choices = [
-        offer for offer in _offers(inbound) if _matching_departure(offer, request.return_on)
+        offer for offer in _offers(inbound) if request.wants_return and _matching_departure(offer, request.return_on)
     ]
     hotel_choices = _offers(hotels)
     plans: list[dict] = []

@@ -28,10 +28,10 @@ interface ProductContextValue {
 
 const ProductContext = createContext<ProductContextValue | null>(null)
 
-export function ProductProvider({ children }: { children: ReactNode }) {
+export function ProductProvider({ children, loadExistingSite = true }: { children: ReactNode; loadExistingSite?: boolean }) {
   const [config, setConfig] = useState<ProductConfig | null>(loadProductConfig)
   const [site, setSite] = useState<Site | null>(null)
-  const [loading, setLoading] = useState(Boolean(config))
+  const [loading, setLoading] = useState(loadExistingSite && Boolean(config))
   const [error, setError] = useState<string | null>(null)
 
   const refreshSite = async () => {
@@ -48,51 +48,37 @@ export function ProductProvider({ children }: { children: ReactNode }) {
   }
 
   useEffect(() => {
-    const timer = window.setTimeout(() => {
-      if (config) void refreshSite()
-      else setLoading(false)
-    }, 0)
+    if (!loadExistingSite || !config) return
+    const timer = window.setTimeout(() => void refreshSite(), 0)
     return () => window.clearTimeout(timer)
     // Product identity changes only when siteId changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [config?.siteId])
+  }, [config?.siteId, loadExistingSite])
 
   const initialize = async (input: SetupInput) => {
     setLoading(true)
     setError(null)
     try {
-      const createdSite = await productApi.createSite({
-        name: input.siteName,
-        domain: input.domain,
+      const registered = await productApi.registerSite({
+        name: input.siteName.trim(),
+        domain: input.domain.trim(),
         default_country: input.country,
         default_language: input.language,
         timezone: input.timezone,
-      })
-      const [owner, agent, executor] = await Promise.all([
-        productApi.createActor({ actor_type: 'USER', name: input.ownerName, email: input.ownerEmail }),
-        productApi.createActor({ actor_type: 'SEO_AGENT', name: 'SEO 优化专员' }),
-        productApi.createActor({
-          actor_type: 'HUMAN_OPERATOR',
-          name: input.executorName,
-          email: input.executorEmail,
-        }),
-      ])
-      await productApi.createSubscription({
-        site_id: createdSite.id,
-        subscriber_actor_id: owner.id,
-        recipient_email: input.ownerEmail,
-        recipient_role: 'APPROVER',
-        is_default_approver: true,
+        owner_name: input.ownerName.trim(),
+        owner_email: input.ownerEmail.trim(),
+        executor_name: input.executorName.trim(),
+        executor_email: input.executorEmail.trim(),
       })
       const next: ProductConfig = {
-        siteId: createdSite.id,
-        ownerActorId: owner.id,
-        agentActorId: agent.id,
-        executorActorId: executor.id,
+        siteId: registered.site.id,
+        ownerActorId: registered.owner_actor_id,
+        agentActorId: registered.agent_actor_id,
+        executorActorId: registered.executor_actor_id,
       }
       saveProductConfig(next)
       setConfig(next)
-      setSite(createdSite)
+      setSite(registered.site)
     } catch (cause) {
       setError((cause as Error).message)
       throw cause

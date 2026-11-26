@@ -22,7 +22,7 @@ const labels: Record<string, string> = {
   followup_save_confirmed: '保存已确认资料和待办',
   travel_transport: '查询高铁与航班',
   travel_hotels: '查询酒店和参考价',
-  travel_commute: '查询到会场的接驳路线',
+  travel_commute: '查询到指定地点的接驳路线',
   travel_compare_plans: '比对交通与住宿',
   travel_weather: '查目的地天气和出行建议',
   travel_save_plan: '保存所选出差方案',

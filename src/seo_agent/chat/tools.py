@@ -534,6 +534,11 @@ def build_seo_agent_registry(
     image_generator: CloudflareShareImages | None = None,
     geo_citation_client: GeoCitationClient | None = None,
 ) -> ToolRegistry:
+    """Build the SEO/GEO specialist's registry from live capabilities and scope.
+
+    Investigation tools can read evidence and prepare advisory artifacts. Site
+    changes and production publishing are handled outside this registry.
+    """
     live_capabilities = facade.live_capabilities()
     if not site.get("domain"):
         live_capabilities = live_capabilities & {

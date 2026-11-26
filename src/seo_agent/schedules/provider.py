@@ -75,16 +75,22 @@ class LocalScheduleProvider:
         timezone: str = "UTC",
         kwargs: dict[str, Any] | None = None,
     ) -> None:
+        trigger = CronTrigger(hour=hour, minute=minute, day_of_week=day_of_week, timezone=timezone)
+        arguments = kwargs or {}
+        existing = self.scheduler.get_job(job_id)
+        # Reconciliation should preserve the next fire time when nothing changed.
+        if (
+            existing is not None and isinstance(existing.trigger, CronTrigger)
+            and str(existing.trigger) == str(trigger)
+            and existing.trigger.timezone == trigger.timezone
+            and existing.func == callback and existing.kwargs == arguments
+        ):
+            return
         self.scheduler.add_job(
             callback,
-            trigger=CronTrigger(
-                hour=hour,
-                minute=minute,
-                day_of_week=day_of_week,
-                timezone=timezone,
-            ),
+            trigger=trigger,
             id=job_id,
-            kwargs=kwargs or {},
+            kwargs=arguments,
             replace_existing=True,
             coalesce=True,
             max_instances=1,

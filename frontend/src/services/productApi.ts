@@ -14,7 +14,10 @@ import type {
   AgentIssue,
   EvaluationRun,
   MetricSummary,
+  ObservabilityOverview,
   ObservabilityTrace,
+  ObservabilityTraceScope,
+  ObservabilityWindow,
   PromptDataset,
   PromptDefinition,
   PromptDeployment,
@@ -23,6 +26,12 @@ import type {
 } from '../types/product'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
+
+export class ProductRequestError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message)
+  }
+}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
@@ -42,10 +51,23 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       // Keep generic message for non-JSON errors.
     }
-    throw new Error(detail)
+    throw new ProductRequestError(detail, response.status)
   }
   if (response.status === 204) return undefined as T
   return (await response.json()) as T
+}
+
+function observabilityQuery(window?: ObservabilityWindow, ...filters: [string, string | undefined][]) {
+  const params = new URLSearchParams()
+  if (window) {
+    params.set('start_at', window.start_at)
+    params.set('end_at', window.end_at)
+  }
+  for (const [name, value] of filters) {
+    if (value) params.set(name, value)
+  }
+  const query = params.toString()
+  return query ? `?${query}` : ''
 }
 
 export const productApi = {
@@ -68,26 +90,39 @@ export const productApi = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
-  listObservabilityTraces: (status?: string, signal?: AbortSignal) =>
+  getObservabilityOverview: (window?: ObservabilityWindow, signal?: AbortSignal, hideMaintenance?: boolean) =>
+    request<ObservabilityOverview>(`/api/v1/observability/overview${observabilityQuery(window, ['hide_maintenance', hideMaintenance ? 'true' : undefined])}`, { signal }),
+  listObservabilityTraces: (status?: string, signal?: AbortSignal, window?: ObservabilityWindow, scope?: ObservabilityTraceScope) =>
     request<ObservabilityTrace[]>(
-      `/api/v1/observability/traces${status ? `?status=${encodeURIComponent(status)}` : ''}`,
+      `/api/v1/observability/traces${observabilityQuery(window, ['status', status], ['scope', scope])}`,
       { signal },
     ),
-  getObservabilityTrace: (traceId: string, signal?: AbortSignal) =>
-    request<ObservabilityTrace>(`/api/v1/observability/traces/${encodeURIComponent(traceId)}`, { signal }),
-  listAgentIssues: (status?: string, signal?: AbortSignal) =>
-    request<AgentIssue[]>(
-      `/api/v1/observability/issues${status ? `?status=${encodeURIComponent(status)}` : ''}`,
+  getObservabilityTrace: (traceId: string, signal?: AbortSignal, hideMaintenance?: boolean) =>
+    request<ObservabilityTrace>(
+      `/api/v1/observability/traces/${encodeURIComponent(traceId)}${observabilityQuery(undefined, ['hide_maintenance', hideMaintenance ? 'true' : undefined])}`,
       { signal },
     ),
+  findObservabilityTraces: (identifier: string, signal?: AbortSignal, scope?: ObservabilityTraceScope) =>
+    request<ObservabilityTrace[]>(
+      `/api/v1/observability/traces${observabilityQuery(undefined, ['identifier', identifier], ['scope', scope])}`,
+      { signal },
+    ),
+  listAgentIssues: (status?: string, signal?: AbortSignal, window?: ObservabilityWindow, limit?: number, hideMaintenance?: boolean) => {
+    const params = new URLSearchParams(observabilityQuery(window,
+      status === 'pending' ? ['pending', 'true'] : ['status', status],
+      ['hide_maintenance', hideMaintenance ? 'true' : undefined],
+    ))
+    if (limit !== undefined) params.set('limit', String(limit))
+    return request<AgentIssue[]>(`/api/v1/observability/issues${params.size ? `?${params}` : ''}`, { signal })
+  },
   setAgentIssueStatus: (issueId: string, status: string) =>
     request<AgentIssue>(`/api/v1/observability/issues/${issueId}/status`, {
       method: 'PATCH',
       body: JSON.stringify({ status }),
     }),
-  listMetricSummary: (metricName?: string, signal?: AbortSignal) =>
+  listMetricSummary: (metricName?: string, signal?: AbortSignal, window?: ObservabilityWindow, hideMaintenance?: boolean) =>
     request<MetricSummary[]>(
-      `/api/v1/observability/metrics${metricName ? `?metric_name=${encodeURIComponent(metricName)}` : ''}`,
+      `/api/v1/observability/metrics${observabilityQuery(window, ['metric_name', metricName], ['hide_maintenance', hideMaintenance ? 'true' : undefined])}`,
       { signal },
     ),
   listPrompts: () => request<PromptDefinition[]>('/api/v1/promptops/prompts'),
@@ -165,6 +200,19 @@ export const productApi = {
     request<PromptExperiment[]>(
       `/api/v1/promptops/experiments${promptId ? `?prompt_id=${encodeURIComponent(promptId)}` : ''}`,
     ),
+  registerSite: (payload: {
+    name: string
+    domain: string
+    default_country: string
+    default_language: string
+    timezone: string
+    owner_name: string
+    owner_email: string
+    executor_name: string
+    executor_email: string
+  }) => request<{ site: Site; owner_actor_id: string; agent_actor_id: string; executor_actor_id: string }>(
+    '/api/v1/seo-agent/system/site-registrations', { method: 'POST', body: JSON.stringify(payload) },
+  ),
   listSites: () => request<Site[]>('/api/v1/seo-agent/system/sites'),
   getSite: (siteId: string) => request<Site>(`/api/v1/seo-agent/system/sites/${siteId}`),
   createSite: (payload: {

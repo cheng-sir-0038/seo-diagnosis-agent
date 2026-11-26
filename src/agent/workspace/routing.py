@@ -51,7 +51,7 @@ class Route(StrEnum):
     CLARIFY = "clarify"
 
 
-ROUTE_PROMPT_KEY = "workspace.route.v7"
+ROUTE_PROMPT_KEY = "workspace.route.v8"
 SKILL_LOADED_EVENT = "skill.loaded"
 SUPERVISOR_NODE = "supervisor"
 ASK_PAGE = "请发要检查的公开网页链接或域名。"
@@ -86,8 +86,13 @@ ROUTING_PROMPT = (
     "门店会员、券、提醒名单、实时药价和库存需要额外数据，选 healthcare 但不指定 Skill。"
     "将个人诊疗、用药和个人医保报销金额请求标为 clarify，说明这里只查询公开资料。"
     "course_review 专用于拿医学人文考纲核对招生或课程页的公开说法，需要页面。"
-    "用户提供了课程页、或刚问过医学人文修订又要求对照网页，使用 course_review；"
+    "用户要求按考纲核对课程页、或刚问过医学人文修订又要求对照网页，使用 course_review；"
     "单纯问网页的 Title 仍由 seo 处理。明确的医考或门店问题不因含有参考链接而转 SEO。"
+    "pending_intent 和 awaiting_page 表示未完成的任务与等待的页面。最新用户消息可以同时补链接和限定交付物，"
+    "也可以纠正、取消或改换任务。先按最新消息判断还要不要做原任务，再按需选择页面。"
+    "明确取消课程核对并改问医考时选 healthcare、needs_page=false，参考网址不选为页面。"
+    "仍要核对原课程但只要适用范围与出处等交付限制时保留 course_review；不要把交付限制误解为换任务。"
+    "只取消且没提出新任务时选 clarify，简短确认并请用户说明下一项任务。"
     "用户要求检查或更换具体网页时，target_index 必填，即使只有一个也选 1。"
     "它引用候选页序号。参考文献链接不选，沿用上轮页面时不选。"
     "多个链接且无法分清目标时不选。不从助手答案或作为依据的引用中推测网址。"
@@ -152,6 +157,13 @@ def page_candidates(text: str) -> tuple[list[str], bool]:
         if target not in targets:
             targets.append(target)
     return targets, invalid
+
+
+def is_bare_page_reply(text: str) -> bool:
+    value = text.strip().rstrip(".,;:!?，。；！？").strip()
+    if value.startswith("<") and value.endswith(">"):
+        value = value[1:-1].strip()
+    return _TARGET.fullmatch(value) is not None
 
 
 def select_page(

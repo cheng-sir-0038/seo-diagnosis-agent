@@ -166,6 +166,7 @@ class AgentExecutor:
 
     @asynccontextmanager
     async def specialist(self, run: AgentRun, agent: str, *, sender: str) -> AsyncIterator[str]:
+        """Attribute receipts to one specialist and reuse its unfinished ID on resume."""
         previous = next(
             (event for event in reversed(run.events)
              if event.type in _SPECIALIST_LIFECYCLE and event.payload.get("agent") == agent
@@ -275,6 +276,27 @@ class AgentExecutor:
 
         while iteration < self.max_iterations:
             self._check_cancel(run)
+            if not evidence_answer and not extra_user_context:
+                continuation = self._planned_continuation(run, tool_count < self.max_tool_calls)
+                if isinstance(continuation, str):
+                    await self._complete(run, messages, continuation, iteration, tool_count)
+                    return
+                if isinstance(continuation, ToolCall):
+                    messages.append(_assistant_tool_call(continuation))
+                    run.pending_tool_calls = [
+                        {**_serialize_tool_call(continuation), "planned": True},
+                    ]
+                    await self._save_checkpoint(
+                        run, messages, iteration=iteration, tool_count=tool_count,
+                        stage="tools_pending",
+                    )
+                    iteration, tool_count = await self._execute_pending_tools(
+                        run, messages, iteration=iteration, tool_count=tool_count,
+                    )
+                    if await self._wait_for_input(run, messages):
+                        return
+                    iteration = min(iteration, self.max_iterations - 1)
+                    continue
             if evidence_answer and (answer := evidence_answer(run)) is not None:
                 await self._complete(run, messages, answer, iteration, tool_count)
                 return
@@ -523,6 +545,33 @@ class AgentExecutor:
             "completion_mode": run.completion_mode or "normal",
         })
 
+    def _planned_continuation(self, run: AgentRun, can_call: bool) -> ToolCall | str | None:
+        """Let an opt-in workflow schedule its next step or deliver a receipt-based answer."""
+        for tool in self.tools.values():
+            continuation = getattr(tool, "planned_continuation", None)
+            if continuation and (step := continuation(run, can_call, self.tools.names())) is not None:
+                return step
+        return None
+
+    async def _recover_planned_tool(self, run: AgentRun, call: ToolCall) -> dict[str, Any] | None:
+        for event in reversed(run.events):
+            if event.payload.get("tool_call_id") != call.id:
+                continue
+            if event.type in {"tool.completed", "tool.failed"}:
+                # The receipt can be persisted before its message checkpoint.
+                return event.payload["result"]
+            if event.type == "tool.started":
+                # An interrupted provider call has unknown outcome. Do not replay it automatically.
+                result = ToolResult(
+                    success=False, error="工具调用已中断，结果未确认。", error_code="INTERRUPTED",
+                ).model_dump(mode="json")
+                await self.emit(run, "tool.failed", {
+                    "tool_call_id": call.id, "name": call.name, "result": result,
+                    "error_code": "INTERRUPTED", "latency_ms": None,
+                })
+                return result
+        return None
+
     async def _execute_pending_tools(
         self,
         run: AgentRun,
@@ -533,9 +582,18 @@ class AgentExecutor:
     ) -> tuple[int, int]:
         while run.pending_tool_calls:
             self._check_cancel(run)
-            call = _deserialize_tool_call(run.pending_tool_calls[0])
-            cached = _find_cached_success(messages, call)
-            if cached is not None:
+            pending_call = run.pending_tool_calls[0]
+            call = _deserialize_tool_call(pending_call)
+            planned = bool(pending_call.get("planned"))
+            receipt = await self._recover_planned_tool(run, call) if planned else None
+            cached = None if planned else _find_cached_success(messages, call)
+            if receipt is not None:
+                tool_count += 1
+                messages.append({
+                    "role": "tool", "tool_call_id": call.id, "name": call.name,
+                    "content": json.dumps(receipt, ensure_ascii=False),
+                })
+            elif cached is not None:
                 result_payload, reused_from_call_id = cached
                 await self._reuse_tool_result(
                     run,
@@ -548,7 +606,7 @@ class AgentExecutor:
                 tool_count += 1
                 if tool_count > self.max_tool_calls:
                     raise RuntimeError("超过最大工具调用次数")
-                await self._execute_tool(run, call, messages)
+                await self._execute_tool(run, call, messages, planned=planned)
             payload = json.loads(messages[-1]["content"])
             request = (payload.get("metadata") or {}).get("human_input")
             waiting = run.human_input
@@ -700,6 +758,8 @@ class AgentExecutor:
         run: AgentRun,
         call: ToolCall,
         messages: list[dict[str, Any]],
+        *,
+        planned: bool = False,
     ) -> None:
         try:
             tool = self.tools.get(call.name)
@@ -742,6 +802,10 @@ class AgentExecutor:
                     and pending.tool_arguments == call.arguments
                 ):
                     metadata["human_input_resume"] = pending.model_dump(mode="json")
+                if prepare_turn := getattr(tool, "turn_runtime_metadata", None):
+                    metadata.update(prepare_turn(run))
+                if planned and (prepare := getattr(tool, "planned_runtime_metadata", None)):
+                    metadata.update(prepare(run))
                 result = await asyncio.wait_for(
                     tool.execute(
                         call.arguments,

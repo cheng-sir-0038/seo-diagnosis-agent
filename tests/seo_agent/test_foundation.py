@@ -3,14 +3,20 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-from sqlalchemy import inspect
+from sqlalchemy import insert, inspect, update
 
 from src.seo_agent.adapters.base import AdapterHealth, AdapterStatus, BaseAdapter
 from src.seo_agent.adapters.registry import AdapterDefinition, AdapterRegistry
 from src.seo_agent.checkpoints import CheckpointManager
 from src.seo_agent.db.database import SeoAgentDatabase
+from src.seo_agent.db.models import SiteRow
 from src.seo_agent.graphs.foundation import build_foundation_graph
-from src.seo_agent.services.system import SeoAgentSystemService
+from src.seo_agent.notifications.service import NotificationService
+from src.seo_agent.services.system import (
+    InvalidSiteDomainError,
+    SeoAgentSystemService,
+    normalize_site_domain,
+)
 
 
 class ReadyAdapter(BaseAdapter):
@@ -263,5 +269,102 @@ async def test_seo_agent_system_api_uses_postgres(pg_url: str, monkeypatch) -> N
         assert duplicate.status_code == 409
         assert listed.status_code == 200
         assert listed.json()[0]["domain"] == "api.example.com"
+    finally:
+        await database.shutdown()
+
+
+@pytest.mark.parametrize(("value", "domain"), [
+    ("  HTTPS://WWW.Example.COM.:443/products?q=1#shipping  ", "www.example.com"),
+    ("bücher.example", "xn--bcher-kva.example"),
+    ("https://[2001:db8::1]/", "2001:db8::1"),
+])
+def test_site_normalization_accepts_hostnames_and_http_urls(value: str, domain: str) -> None:
+    assert normalize_site_domain(value) == domain
+
+
+@pytest.mark.parametrize("value", ["", "https://", "ftp://example.com", "bad host.org",
+    "example.com:bad", "https://user:pass@example.com", "bad..example", "https://?host=x.com",
+])
+def test_site_normalization_rejects_invalid_registration_values(value: str) -> None:
+    with pytest.raises(InvalidSiteDomainError):
+        normalize_site_domain(value)
+
+
+async def test_registration_rolls_back_and_can_retry_without_partial_site(pg_url, monkeypatch):
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+
+    from src.api.routes import seo_agent_system as route
+
+    database = SeoAgentDatabase(pg_url)
+    await database.startup()
+    system = SeoAgentSystemService(database)
+    monkeypatch.setattr(route, "seo_agent_system_service", system)
+    app = FastAPI()
+    app.include_router(route.router)
+    endpoint = "/seo-agent/system/site-registrations"
+    registration = {
+        "name": "Example", "domain": " HTTPS://WWW.Example.ORG./offers?q=1 ",
+        "default_country": "GB", "default_language": "en-GB", "timezone": "Europe/London",
+        "owner_name": "Site Owner", "owner_email": "owner@example.org",
+        "executor_name": "Editor", "executor_email": "editor@example.org",
+    }
+    create_subscription = NotificationService.create_subscription
+
+    async def fail_after_writing_subscription(self, **kwargs):
+        await create_subscription(self, **kwargs)
+        raise RuntimeError("simulated subscription failure")
+
+    try:
+        transport = ASGITransport(app=app, raise_app_exceptions=False)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            invalid = await client.post(endpoint, json={**registration, "domain": "https://?"})
+            assert invalid.status_code == 422
+            with monkeypatch.context() as temporary:
+                temporary.setattr(
+                    NotificationService, "create_subscription", fail_after_writing_subscription,
+                )
+                assert (await client.post(endpoint, json=registration)).status_code == 500
+            assert await system.list_sites() == []
+            assert await system.list_actors() == []
+            response = await client.post(endpoint, json=registration)
+            assert response.status_code == 201
+            rejected = await client.post(
+                endpoint, json={**registration, "domain": "www.example.org"},
+            )
+            assert rejected.status_code == 409
+        payload = response.json()
+        site = payload["site"]
+        assert site["domain"] == "www.example.org" and site["default_country"] == "GB"
+        assert {row["id"]: row["actor_type"] for row in await system.list_actors()} == {
+            payload["owner_actor_id"]: "USER", payload["agent_actor_id"]: "SEO_AGENT",
+            payload["executor_actor_id"]: "HUMAN_OPERATOR",
+        }
+        [subscription] = await NotificationService(database).list_subscriptions(site["id"])
+        assert subscription["subscriber_actor_id"] == payload["owner_actor_id"]
+        assert subscription["is_default_approver"] == 1
+    finally:
+        await database.shutdown()
+
+
+async def test_lookup_matches_legacy_urls_without_merging_subdomains(pg_url):
+    database = SeoAgentDatabase(pg_url)
+    await database.startup()
+    service = SeoAgentSystemService(database)
+    fields = {"default_country": "GB", "default_language": "en-GB", "timezone": "UTC"}
+    try:
+        await database.execute(insert(SiteRow).values(
+            id="legacy", name="Legacy", domain="https://WWW.example.org./old?ref=abc",
+            created_at="2026-01-01", updated_at="2026-01-01", **fields,
+        ))
+        assert (await service.find_site_by_host("example.org"))["id"] == "legacy"
+        canonical = await service.create_site(name="Apex", domain="example.org", **fields)
+        assert (await service.find_site_by_host("example.org"))["id"] == canonical["id"]
+        assert (await service.find_site_by_host("www.example.org"))["id"] == "legacy"
+        assert await service.find_site_by_host("shop.example.org") is None
+        await database.execute(update(SiteRow).where(SiteRow.id == "legacy").values(
+            status="ARCHIVED", archived_at="2026-01-03",
+        ))
+        assert (await service.find_site_by_host("www.example.org"))["archived_at"] == "2026-01-03"
     finally:
         await database.shutdown()

@@ -2,12 +2,14 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { ChatPage } from '../pages/ChatPage'
-import type { AgentEvent } from '../types/agent'
+import type { CreateRunResponse } from '../services/agentApi'
+import type { AgentEvent, Conversation } from '../types/agent'
 
 const createAgentRun = vi.fn()
 const streamAgentEvents = vi.fn()
 const cancelAgentRun = vi.fn()
 const listAgentTasks = vi.fn()
+const listWorkspaceTasks = vi.fn()
 const getAgentRun = vi.fn()
 const resumeAgentRun = vi.fn()
 const submitAgentInput = vi.fn()
@@ -18,6 +20,7 @@ vi.mock('../services/agentApi', () => ({
   streamAgentEvents: (...args: unknown[]) => streamAgentEvents(...args),
   cancelAgentRun: (...args: unknown[]) => cancelAgentRun(...args),
   listAgentTasks: (...args: unknown[]) => listAgentTasks(...args),
+  listWorkspaceTasks: (...args: unknown[]) => listWorkspaceTasks(...args),
   getAgentRun: (...args: unknown[]) => getAgentRun(...args),
   getWorkspaceRunStats: () => Promise.resolve({ elapsed_ms: null, total_tokens: null }),
   resumeAgentRun: (...args: unknown[]) => resumeAgentRun(...args),
@@ -47,6 +50,8 @@ describe('ChatPage SEO Agent integration', () => {
   beforeEach(() => {
     window.localStorage.clear()
     window.sessionStorage.clear()
+    window.history.replaceState(null, '', '/')
+    listWorkspaceTasks.mockReset().mockResolvedValue([])
     Element.prototype.scrollIntoView = vi.fn()
     createAgentRun.mockResolvedValue({
       run_id: 'run_1',
@@ -653,14 +658,14 @@ describe('ChatPage SEO Agent integration', () => {
     expect(fees.getAllByText('1,200 元', { exact: true })).toHaveLength(2)
     expect(fees.getByText('参考价 260')).toBeVisible()
     expect(fees.getByText('参考价 94 元')).toBeVisible()
-    expect(fees.getByText('会场接驳')).toBeVisible()
+    expect(fees.getByText('地面接驳')).toBeVisible()
     expect(fees.getByText('待报价')).toBeVisible()
     expect(fees.queryByText(/接驳时间|住宿房型/)).toBeNull()
     fireEvent.click(result.getByRole('tab', { name: '方案对比' }))
     expect(result.getByText('已知费用小计')).toBeVisible()
-    fireEvent.click(result.getByText('交通与住宿'))
-    expect(result.getByText('酒店到会场约 22 分钟')).toBeInTheDocument()
-    expect(result.getByText('抵达后到会场约 35 分钟')).toBeInTheDocument()
+    fireEvent.click(result.getByText('方案明细'))
+    expect(result.getByText('从酒店出发约 22 分钟')).toBeInTheDocument()
+    expect(result.getByText('抵达后接驳约 35 分钟')).toBeInTheDocument()
     expect(result.getByText('出发 2026-12-03 08:15 +08:00')).toBeVisible()
     expect(result.getByText('到达 2026-12-03 09:40 +08:00')).toBeVisible()
     fireEvent.click(result.getByText('候选与来源'))
@@ -838,6 +843,320 @@ describe('ChatPage SEO Agent integration', () => {
     expect(await screen.findByRole('status', { name: '分析进度' })).toHaveTextContent('正在准备任务')
     expect(screen.getByLabelText('停止生成')).toBeDisabled()
     expect(screen.queryByRole('region', { name: '本次结果' })).not.toBeInTheDocument()
+  })
+
+  it('asks before replacing a typed home draft with a starter', () => {
+    render(<ChatPage />)
+    const composer = screen.getByLabelText('给业务助理发送消息')
+    fireEvent.change(composer, { target: { value: '我还没有写完的问题' } })
+    fireEvent.click(screen.getByRole('button', { name: /页面检查/ }))
+    expect(composer).toHaveValue('我还没有写完的问题')
+    fireEvent.click(screen.getByRole('button', { name: '保留草稿' }))
+    expect(composer).toHaveValue('我还没有写完的问题')
+    fireEvent.click(screen.getByRole('button', { name: /页面检查/ }))
+    fireEvent.click(screen.getByRole('button', { name: '替换草稿' }))
+    expect((composer as HTMLTextAreaElement).value).toContain('https://breadtopia.com/')
+    expect(createAgentRun).not.toHaveBeenCalled()
+  })
+
+  async function openHistoryConversation(title: string) {
+    act(() => {
+      window.history.replaceState(null, '', '/#/history')
+      window.dispatchEvent(new HashChangeEvent('hashchange'))
+    })
+    fireEvent.click(await screen.findByRole('button', { name: new RegExp(title) }))
+    return screen.findByRole('textbox', { name: '给业务助理发送消息' })
+  }
+
+  it.each([false, true])('keeps a delayed creation with its conversation (finishes in background: %s)', async (finishesInBackground) => {
+    let accept!: (receipt: CreateRunResponse) => void
+    createAgentRun.mockImplementationOnce(() => new Promise(resolve => { accept = resolve }))
+    let publish!: (item: AgentEvent) => void
+    let finish!: () => void
+    streamAgentEvents.mockImplementationOnce((_url, onEvent: typeof publish) => new Promise(resolve => {
+      publish = onEvent
+      finish = () => resolve({ lastEventId: 2, terminal: true })
+    }))
+    const send = (text: string) => {
+      fireEvent.change(screen.getByLabelText('给业务助理发送消息'), { target: { value: text } })
+      fireEvent.click(screen.getByRole('button', { name: '发送消息' }))
+    }
+    render(<ChatPage />)
+    send('正在创建的第一个任务')
+    fireEvent.click(screen.getByRole('button', { name: '新建对话' }))
+    fireEvent.change(screen.getByLabelText('给业务助理发送消息'), { target: { value: '另一会话的草稿' } })
+
+    const acceptFirst = async () => {
+      await act(async () => accept({ run_id: 'run_1', status: 'pending', events_url: '/first-events', cancel_url: '/first-cancel' }))
+    }
+    if (finishesInBackground) {
+      await acceptFirst()
+      expect(screen.getByLabelText('给业务助理发送消息')).toHaveValue('另一会话的草稿')
+      expect(streamAgentEvents).not.toHaveBeenCalled()
+    }
+
+    const composer = await openHistoryConversation('正在创建的第一个任务')
+    expect(composer).toBeDisabled()
+    if (!finishesInBackground) {
+      expect(screen.getByRole('button', { name: '停止生成' })).toBeDisabled()
+      expect(screen.queryByRole('button', { name: '发送消息' })).not.toBeInTheDocument()
+      await acceptFirst()
+    }
+    await waitFor(() => expect(screen.getByRole('button', { name: '停止生成' })).toBeEnabled())
+    expect(createAgentRun).toHaveBeenCalledTimes(1)
+    expect(streamAgentEvents).toHaveBeenCalledTimes(1)
+    expect(streamAgentEvents.mock.calls[0][0]).toBe('/first-events')
+    await act(async () => {
+      publish(event(1, 'message.completed', { content: '第一个任务的回复' }))
+      publish(event(2, 'run.completed', {}))
+      finish()
+    })
+    expect(await screen.findByText('第一个任务的回复')).toBeInTheDocument()
+    expect(composer).toBeEnabled()
+  })
+
+  it('keeps an attachment draft after a background rejection and replaces the failed attempt on retry', async () => {
+    const document = {
+      id: 'a'.repeat(32), name: '待核对资料.md', in_library: false,
+      size_bytes: 20, text_chars: 10, uploaded_at: '2026-11-24T00:00:00Z',
+    }
+    const conversation: Conversation = {
+      id: 'with-document', title: '新会话', updatedAt: document.uploaded_at,
+      messages: [], draftDocuments: [document],
+    }
+    window.localStorage.setItem('agent-workspace-conversations-v2', JSON.stringify([conversation]))
+    let reject!: (error: Error) => void
+    createAgentRun.mockImplementationOnce(() => new Promise((_resolve, fail) => { reject = fail }))
+    const send = () => fireEvent.click(screen.getByRole('button', { name: '发送消息' }))
+    render(<ChatPage />)
+    fireEvent.change(screen.getByLabelText('给业务助理发送消息'), { target: { value: '核对附件中的表格' } })
+    send()
+    fireEvent.click(screen.getByRole('button', { name: '新建对话' }))
+    const otherComposer = screen.getByLabelText('给业务助理发送消息')
+    fireEvent.change(otherComposer, { target: { value: '另一会话的草稿' } })
+    await act(async () => reject(new Error('选中资料暂不可用。')))
+    expect(otherComposer).toHaveValue('另一会话的草稿')
+    expect(screen.queryByText('选中资料暂不可用。')).not.toBeInTheDocument()
+
+    const composer = await openHistoryConversation('核对附件中的表格')
+    expect(composer).toHaveValue('核对附件中的表格')
+    expect(screen.getByRole('alert')).toHaveTextContent('选中资料暂不可用。')
+    expect(screen.getByRole('list', { name: '待发送附件' })).toHaveTextContent(document.name)
+    send()
+    expect(await screen.findByText('分析完成')).toBeInTheDocument()
+    expect(createAgentRun).toHaveBeenCalledTimes(2)
+    expect(createAgentRun.mock.calls[1]).toEqual([[
+      expect.objectContaining({ content: '核对附件中的表格', documents: [document] }),
+    ], 'with-document'])
+    const transcript = within(screen.getByRole('region', { name: '对话消息' }))
+    expect(transcript.getAllByText('核对附件中的表格')).toHaveLength(1)
+  })
+
+  it.each(['waiting_for_input', 'completed', 'failed'] as const)(
+    'opens the older %s receipt without changing the live run or its controls', async (status) => {
+      const createdAt = '2026-11-24T00:00:00Z'
+      const conversation: Conversation = {
+        id: 'shared', title: '早期任务', updatedAt: createdAt,
+        messages: [
+          { id: 'old-question', role: 'user', content: '早期问题', createdAt },
+          { id: 'old-reply', role: 'assistant', content: '这是旧任务的结果。', createdAt, runId: 'old', runStatus: status,
+            inputRequest: status === 'waiting_for_input' ? { requestId: 'old-input', questions: ['旧任务的规格是什么？'], allowUseAvailable: true } : undefined,
+            toolResults: [{ id: 'old-tool', name: 'medical_exam_syllabus', status: 'completed', render_hint: 'cards',
+              result: { view_type: 'cards', items: [{ key: 'old-citation', title: '旧任务的考纲', url: 'https://old.example/syllabus' }] } }] },
+          { id: 'live-question', role: 'user', content: '当前任务', createdAt },
+        ],
+        activeRun: { runId: 'live', afterSequence: 0, replyId: 'live-reply', eventsUrl: '/live/events', cancelUrl: '/live/cancel' },
+      }
+      window.localStorage.setItem('agent-workspace-conversations-v2', JSON.stringify([conversation]))
+      window.history.replaceState(null, '', '/#/tasks')
+      listWorkspaceTasks.mockResolvedValue([{
+        id: 'old-task', conversation_id: 'shared', current_run_id: 'old', title: '早期任务', status: status.toUpperCase(),
+        can_resume: status === 'failed', partial: false, created_at: createdAt, updated_at: createdAt,
+      }])
+      getAgentRun.mockImplementationOnce(async () => ({ id: 'old', status: status.toUpperCase(), checkpoint: { attempt: 1 } }))
+      let publish!: (item: AgentEvent) => void
+      let liveSignal!: AbortSignal
+      streamAgentEvents.mockImplementationOnce((_url, onEvent, options) => new Promise(() => {
+        publish = onEvent
+        liveSignal = options.signal
+      }))
+      cancelAgentRun.mockResolvedValue({ run_id: 'live', status: 'cancelled' })
+
+      render(<ChatPage />)
+      await waitFor(() => expect(streamAgentEvents).toHaveBeenCalledTimes(1))
+      fireEvent.click(await screen.findByRole('button', { name: /早期任务/ }))
+      expect(screen.getByRole('heading', { name: '早期任务' })).toBeInTheDocument()
+      expect((await screen.findByText('这是旧任务的结果。')).closest('article')).toHaveAttribute('aria-current', 'true')
+      if (status === 'waiting_for_input') expect(screen.getByText('旧任务的规格是什么？')).toBeVisible()
+      expect(screen.queryByRole('textbox', { name: '给业务助理发送消息' })).not.toBeInTheDocument()
+      for (const name of ['停止生成', '恢复任务', '发送消息', '先用现有信息生成']) {
+        expect(screen.queryByRole('button', { name })).not.toBeInTheDocument()
+      }
+      await act(async () => publish({ ...event(1, 'message.delta', { delta: '当前任务仍在执行' }), run_id: 'live' }))
+      expect(liveSignal.aborted).toBe(false)
+      expect(screen.getByRole('heading', { name: '早期任务' })).toBeInTheDocument()
+      const drawer = await openExecutionDrawer()
+      fireEvent.click(drawer.getByRole('tab', { name: '引用来源 1' }))
+      expect(drawer.getByRole('link', { name: '旧任务的考纲' })).toHaveAttribute('href', 'https://old.example/syllabus')
+      fireEvent.click(drawer.getByRole('button', { name: 'Close' }))
+      expect(cancelAgentRun).not.toHaveBeenCalled()
+      expect(resumeAgentRun).not.toHaveBeenCalled()
+      expect(submitAgentInput).not.toHaveBeenCalled()
+      expect(createAgentRun).not.toHaveBeenCalled()
+
+      fireEvent.click(screen.getByRole('button', { name: '返回当前任务' }))
+      expect(screen.getByRole('heading', { name: '当前任务' })).toBeInTheDocument()
+      expect(await screen.findByText('当前任务仍在执行')).toBeVisible()
+      fireEvent.click(screen.getByRole('button', { name: '停止生成' }))
+      await waitFor(() => expect(cancelAgentRun).toHaveBeenCalledWith('/live/cancel'))
+      expect(streamAgentEvents).toHaveBeenCalledTimes(1)
+    },
+  )
+
+  it('hydrates an older task receipt without overwriting the active run or the saved transcript', async () => {
+    const createdAt = '2026-11-24T00:00:00Z'
+    const conversation: Conversation = {
+      id: 'shared', title: '旧任务问题', updatedAt: createdAt,
+      messages: [
+        { id: 'old-question', role: 'user', content: '旧任务问题', createdAt },
+        { id: 'live-question', role: 'user', content: '当前任务', createdAt },
+      ],
+      activeRun: { runId: 'live', afterSequence: 0, replyId: 'live-reply', eventsUrl: '/live/events', cancelUrl: '/live/cancel' },
+    }
+    window.localStorage.setItem('agent-workspace-conversations-v2', JSON.stringify([conversation]))
+    window.history.replaceState(null, '', '/#/tasks')
+    listWorkspaceTasks.mockResolvedValue([{
+      id: 'old-task', conversation_id: 'shared', current_run_id: 'old', title: '旧任务问题', status: 'COMPLETED',
+      can_resume: false, partial: false, created_at: createdAt, updated_at: createdAt,
+    }])
+    getAgentRun.mockImplementationOnce(async () => ({ id: 'old', status: 'COMPLETED', events: [
+      event(1, 'message.completed', { content: '从旧任务记录找回的结论。' }), event(2, 'run.completed', {}),
+    ] }))
+    streamAgentEvents.mockImplementationOnce(() => new Promise(() => {}))
+    render(<ChatPage />)
+    fireEvent.click(await screen.findByRole('button', { name: /旧任务问题/ }))
+    expect((await screen.findByText('从旧任务记录找回的结论。')).closest('article')).toHaveAttribute('aria-current', 'true')
+    expect(screen.getByRole('heading', { name: '旧任务问题' })).toBeVisible()
+    expect(JSON.parse(localStorage.getItem('agent-workspace-conversations-v2') ?? '[]')).toEqual([conversation])
+    fireEvent.click(screen.getByRole('button', { name: '返回当前任务' }))
+    expect(screen.queryByText('从旧任务记录找回的结论。')).not.toBeInTheDocument()
+    expect(streamAgentEvents).toHaveBeenCalledTimes(1)
+  })
+
+  it('searches saved answers and displayed result fields and opens the exact matching turn', async () => {
+    const createdAt = '2026-11-24T00:00:00Z'
+    const conversation: Conversation = {
+      id: 'saved', title: '业务会话', updatedAt: createdAt,
+      messages: [
+        { id: 'question', role: 'user', content: '查看本次检索结果', createdAt },
+        {
+          id: 'match', role: 'assistant', content: '已核查华中考区。<｜DSML｜tool_calls>隐藏控制文本</｜DSML｜tool_calls>',
+          runId: 'first', runStatus: 'completed', createdAt,
+          toolResults: [{
+            id: 'report', name: 'medical_exam_syllabus', status: 'completed', render_hint: 'cards',
+            arguments: { secret: '内部参数标记' },
+            result: { success: true, metadata: { secret: '内部元数据标记' }, data: {
+              view_type: 'cards', raw: { data: '内部证据标记' },
+              items: [{ key: 'result', title: '考纲变更', summary: '规定必须核对最新版公开考试公告。', internal: '内部条目标记' }],
+            } },
+          }],
+        },
+        { id: 'question-2', role: 'user', content: '继续核查', createdAt },
+        { id: 'reply-2', role: 'assistant', content: '这是更新的回复。', runId: 'second', runStatus: 'completed', createdAt },
+      ],
+    }
+    localStorage.setItem('agent-workspace-conversations-v2', JSON.stringify([conversation]))
+    window.history.replaceState(null, '', '/#/history')
+    render(<ChatPage />)
+    const search = screen.getByRole('textbox', { name: '搜索会话' })
+    const searchFor = (value: string) => fireEvent.change(search, { target: { value } })
+    for (const term of ['隐藏控制文本', '内部参数标记', '内部元数据标记', '内部证据标记', '内部条目标记']) {
+      searchFor(term)
+      expect(screen.getByText('没有匹配的会话。')).toBeInTheDocument()
+    }
+    searchFor('华中考区')
+    expect(screen.getByText('已核查华中考区。')).toBeInTheDocument()
+    searchFor('最新版公开考试公告')
+    expect(listWorkspaceTasks.mock.calls.every(([ids]) => JSON.stringify(ids) === '["saved"]')).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: /业务会话.*规定必须核对最新版公开考试公告/ }))
+    const matchingAnswer = await screen.findByText('规定必须核对最新版公开考试公告。')
+    const resultMessage = matchingAnswer.closest('article.chat-message')
+    expect(resultMessage).toHaveAttribute('aria-current', 'true')
+    expect(resultMessage).toHaveFocus()
+    expect(screen.getByText('这是更新的回复。').closest('article')).not.toHaveAttribute('aria-current')
+    fireEvent.click(screen.getByRole('button', { name: '返回当前对话' }))
+    expect(screen.getByRole('textbox', { name: '给业务助理发送消息' })).toBeEnabled()
+  })
+
+  it('uses the same safe item citations in executed cards and the deduplicated source list', async () => {
+    streamAgentEvents.mockImplementationOnce(async (_url, publish: (item: AgentEvent) => void) => {
+      publish(event(1, 'tool.completed', {
+        tool_call_id: 'source-tool', name: 'medical_exam_syllabus', render_hint: 'cards',
+        result: { success: true, data: {
+          view_type: 'cards', sources: ['https://public.example/syllabus'], raw: { url: 'https://private.example/raw' },
+          items: [
+            { key: 'one', title: '公开考纲公告', url: 'https://PUBLIC.example:443/syllabus' },
+            { key: 'two', title: '官方报名公告', source_url: 'https://public.example/registration' },
+            { key: 'repeat', title: '重复的考纲', url: 'https://public.example/syllabus' },
+            { key: 'unsafe', title: '不安全链接', url: 'javascript:alert(1)' },
+            { key: 'credentials', title: '含凭据链接', url: 'https://user:secret@private.example/' },
+          ],
+        } },
+      }))
+      publish(event(2, 'message.completed', { content: '已核实两条来源。' }))
+      publish(event(3, 'run.completed', {}))
+    })
+    render(<ChatPage />)
+    fireEvent.change(screen.getByRole('textbox', { name: '给业务助理发送消息' }), { target: { value: '核查考纲和报名公告' } })
+    fireEvent.click(screen.getByRole('button', { name: '发送消息' }))
+    const cards = within(await screen.findByTestId('card-result'))
+    const syllabus = cards.getByRole('link', { name: '公开考纲公告' })
+    const registration = cards.getByRole('link', { name: '官方报名公告' })
+    expect(cards.getAllByRole('link')).toHaveLength(3)
+    const drawer = await openExecutionDrawer()
+    fireEvent.click(drawer.getByRole('tab', { name: '引用来源 2' }))
+    expect(drawer.getAllByRole('link')).toEqual([
+      drawer.getByRole('link', { name: '公开考纲公告' }), drawer.getByRole('link', { name: '官方报名公告' }),
+    ])
+    expect(drawer.getByRole('link', { name: '公开考纲公告' })).toHaveAttribute('href', syllabus.getAttribute('href'))
+    expect(drawer.getByRole('link', { name: '官方报名公告' })).toHaveAttribute('href', registration.getAttribute('href'))
+  })
+
+  it('starts a separate task while waiting and keeps the original answer draft tied to the same run', async () => {
+    streamAgentEvents.mockImplementationOnce(async (_url, publish: (item: AgentEvent) => void) => {
+      publish(event(1, 'message.completed', { content: '请选择尺寸。' }))
+      publish(event(2, 'run.waiting_for_input', { request_id: 'size', questions: ['需要什么尺寸？'] }))
+      return { lastEventId: 2, terminal: true }
+    }).mockImplementationOnce(async (_url, publish: (item: AgentEvent) => void) => {
+      publish({ ...event(1, 'message.completed', { content: '这是独立任务的回复。' }), run_id: 'independent' })
+      publish({ ...event(2, 'run.completed', {}), run_id: 'independent' })
+      return { lastEventId: 2, terminal: true }
+    })
+    const send = () => fireEvent.click(screen.getByRole('button', { name: '发送消息' }))
+    const change = (value: string) => fireEvent.change(screen.getByLabelText('给业务助理发送消息'), { target: { value } })
+    render(<ChatPage />)
+    change('原始采购任务')
+    send()
+    const newTask = await screen.findByRole('button', { name: '开始新任务' })
+    change('大号')
+    fireEvent.click(newTask)
+    expect(screen.getByLabelText('给业务助理发送消息')).toHaveValue('')
+    createAgentRun.mockResolvedValueOnce({ run_id: 'independent', status: 'pending', events_url: '/independent/events', cancel_url: '/independent/cancel' })
+    change('一项独立任务')
+    send()
+    expect(await screen.findByText('这是独立任务的回复。')).toBeInTheDocument()
+    expect(createAgentRun).toHaveBeenCalledTimes(2)
+    expect(createAgentRun.mock.calls[1][1]).not.toBe(createAgentRun.mock.calls[0][1])
+    expect(createAgentRun.mock.calls[1][0]).toEqual([expect.objectContaining({ content: '一项独立任务' })])
+    expect(submitAgentInput).not.toHaveBeenCalled()
+
+    const composer = await openHistoryConversation('原始采购任务')
+    expect(composer).toHaveValue('大号')
+    expect(screen.getByText('需要什么尺寸？')).toBeInTheDocument()
+    submitAgentInput.mockResolvedValueOnce({ run_id: 'run_1', status: 'recovering', events_url: '/events', cancel_url: '/cancel', after_sequence: 3 })
+    send()
+    await waitFor(() => expect(submitAgentInput).toHaveBeenCalledWith('run_1', 'size', '大号', 'answer'))
+    expect(createAgentRun).toHaveBeenCalledTimes(2)
   })
 
   it('sends the current conversation and renders structured evidence directly in the chat', async () => {

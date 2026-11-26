@@ -33,6 +33,31 @@ describe('SEO Agent API', () => {
     expect(body).toEqual({ messages: [{ role: 'user', content: message.content }], conversation_id: 'conversation_1' })
   })
 
+  it('omits empty assistant history without discarding user messages or nonempty replies', async () => {
+    const fetchMock = vi.fn<(_input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>()
+      .mockResolvedValue(new Response('{}', { status: 201 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await createAgentRun([
+      message,
+      { ...message, id: 'failure', role: 'assistant', content: '', runStatus: 'failed' },
+      { ...message, id: 'user_2', content: '接着核对' },
+      { ...message, id: 'blank', role: 'assistant', content: ' \n ' },
+      { ...message, id: 'reply', role: 'assistant', content: '  已核对  ' },
+      { ...message, id: 'user_3', content: '给我下一步' },
+    ], 'conversation_1')
+
+    expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toEqual({
+      conversation_id: 'conversation_1',
+      messages: [
+        { role: 'user', content: message.content },
+        { role: 'user', content: '接着核对' },
+        { role: 'assistant', content: '  已核对  ' },
+        { role: 'user', content: '给我下一步' },
+      ],
+    })
+  })
+
   it('loads persisted Agent tasks by site and status group', async () => {
     const fetchMock = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(() => Promise.resolve(new Response(JSON.stringify([{
       id: 'agtask_1',

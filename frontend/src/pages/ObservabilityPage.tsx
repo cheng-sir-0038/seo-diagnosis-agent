@@ -1,19 +1,19 @@
 import {
-  ApartmentOutlined, CalendarOutlined, ClockCircleOutlined, CloseOutlined, ExclamationCircleOutlined, FileTextOutlined, PullRequestOutlined,
-  ReloadOutlined, RightOutlined, SearchOutlined, ToolOutlined, WarningOutlined,
+  ApartmentOutlined, ArrowLeftOutlined, CalendarOutlined, ClockCircleOutlined, ExclamationCircleOutlined, FileTextOutlined,
+  PullRequestOutlined, ReloadOutlined, RightOutlined, SearchOutlined, ToolOutlined, WarningOutlined,
 } from '@ant-design/icons'
-import { Alert, Button, Drawer, Empty, Grid, Input, Select, Switch, Table, Tabs } from 'antd'
+import { Alert, Button, Drawer, Empty, Grid, Input, Pagination, Select, Switch, Table, Tabs } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useId, useRef, useState, useSyncExternalStore, type ReactNode } from 'react'
 
 import { PageHeader } from '../components/PageHeader'
-import { StatusPill } from '../components/StatusPill'
 import { RawJsonResult } from '../components/renderers/RawJsonResult'
 import { toolIcon, toolLabel } from '../components/toolLabels'
-import { productApi } from '../services/productApi'
+import { productApi, ProductRequestError } from '../services/productApi'
 import { isSpecialist, specialists } from '../specialists'
 import type { Conversation } from '../types/agent'
-import type { AgentIssue, MetricSummary, ModelCallRecord, ObservabilityEvent, ObservabilitySpan, ObservabilityTrace, ToolCallRecord } from '../types/product'
+import type { AgentIssue, MetricSummary, ModelCallRecord, ObservabilityEvent, ObservabilityOverview, ObservabilitySpan, ObservabilityTrace, ToolCallRecord } from '../types/product'
+import './observability.css'
 
 const dateTime = new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' })
 const counter = new Intl.NumberFormat('zh-CN')
@@ -26,9 +26,20 @@ const metricLabels: Record<string, string> = {
   'model.tokens.total': '模型 Token 用量',
   'tool.latency_ms': '工具调用耗时',
   'tool.call.count': '工具调用计数',
+  'issue.occurrence.count': '问题发生次数',
 }
-const openStates = new Set(['OPEN', 'REOPENED', 'INVESTIGATING'])
-const issueOptions = ['OPEN', 'INVESTIGATING', 'RESOLVED', 'IGNORED', 'ARCHIVED']
+const operationLabels: Record<string, string> = {
+  'workspace.documents': '资料问答',
+  'workspace.chat': '主 Agent 对话',
+  'seo_agent.chat': 'SEO / GEO 站点对话',
+  'scheduler.opportunity_scan': '定时扫描 SEO 机会',
+  'scheduler.daily_digest': '生成 SEO 日报',
+  'scheduler.weekly_digest': '生成 SEO 周报',
+}
+const timeOptions = [{ value: 24, label: '最近 24 小时' }, { value: 168, label: '最近 7 天' }, { value: 0, label: '全部时间' }]
+const severityLabels: Record<string, string> = {
+  CRITICAL: '严重', ERROR: '错误', WARNING: '警告', INFO: '信息', DEBUG: '调试',
+}
 const traceOptions = ['全部状态', '进行中', '已完成', '部分完成', '失败', '等待补充', '已停止', '已中断']
 const executionStates: Record<string, { text: string, tone: string }> = {
   RUNNING: { text: '进行中', tone: 'running' },
@@ -119,7 +130,36 @@ const eventLabels: Record<string, string> = {
   'message.completed': '回答生成完成',
 }
 type ConversationLink = Pick<Conversation, 'id' | 'title'>
-type TraceResponse = { id: string, trace?: ObservabilityTrace }
+type TraceResponse = { id: string, trace?: ObservabilityTrace, unavailable?: boolean }
+type ObservationView = 'traces' | 'issues' | 'metrics'
+const observationPath = '#/observability'
+// Keep known maintenance records out of list/detail responses from older servers.
+const maintenanceOperations = new Set(['scheduler.notification_outbox', 'scheduler.automation_sync'])
+const isProductTrace = (trace: ObservabilityTrace) => !maintenanceOperations.has(trace.operation_name)
+
+function subscribeToHash(listener: () => void) {
+  window.addEventListener('hashchange', listener)
+  return () => window.removeEventListener('hashchange', listener)
+}
+
+function readObservationRoute(hash: string) {
+  const [path, search] = hash.split('?', 2)
+  const params = new URLSearchParams(path === observationPath ? search : undefined)
+  const view = params.get('view')
+  const tab: ObservationView = view === 'issues' || view === 'metrics' ? view : 'traces'
+  const traceId = params.get('trace')
+  return { tab, traceId: tab === 'traces' && traceId && traceId.length <= 200 ? traceId : undefined }
+}
+
+function navigateObservation(hash: string, mode: 'push' | 'replace', openedFromList = false) {
+  const oldURL = window.location.href
+  if (window.location.hash === hash) return
+  const state = { ...window.history.state, observationDetailFromList: openedFromList }
+  if (mode === 'push') window.history.pushState(state, '', hash)
+  else window.history.replaceState(state, '', hash)
+  // Notify the workbench router as well as the local view after pushState/replaceState.
+  window.dispatchEvent(new HashChangeEvent('hashchange', { oldURL, newURL: window.location.href }))
+}
 
 function formatTime(value?: string | null) {
   return value && !Number.isNaN(Date.parse(value)) ? dateTime.format(new Date(value)) : '—'
@@ -162,10 +202,34 @@ function TraceState({ trace }: { trace: ObservabilityTrace }) {
 }
 
 function operationLabel(name: string) {
-  if (name === 'workspace.documents') return '资料问答'
-  if (name === 'workspace.chat') return '主 Agent 对话'
-  if (name === 'seo_agent.chat') return 'SEO / GEO 站点对话'
-  return name
+  return Object.hasOwn(operationLabels, name) ? operationLabels[name] : name
+}
+
+function describeIssue(issue: AgentIssue) {
+  const component = issue.component ?? ''
+  const knownTool = component === 'page_seo_suggestions' ? '生成页面 SEO 建议' : toolLabel(component)
+  const operation = operationLabel(component)
+  const step = Object.hasOwn(stepLabels, component) ? stepLabels[component] : undefined
+  const title = knownTool !== component ? `${knownTool}工具失败`
+    : step ? `${step}失败`
+      : operation !== component ? `${operation}失败`
+        : '运行出现问题'
+  const recorded = issue.title
+  let reason = '展开详情查看记录的错误信息。'
+  if (/Failed to parse|JSONDecodeError|OutputParserException/i.test(`${issue.issue_type} ${recorded}`)) {
+    reason = '返回内容不符合预期格式，无法读取结果。'
+  } else if (/Cannot connect|ConnectionError|ClientConnectorError/i.test(`${issue.issue_type} ${recorded}`)) {
+    reason = '无法连接目标页面或数据服务。'
+  } else if (/Timeout|timed out|超时/i.test(`${issue.issue_type} ${recorded}`)) {
+    reason = '等待响应超时。'
+  } else if (/页面 HTML 请求失败/i.test(recorded)) {
+    reason = '未能获取目标页面的内容。'
+  }
+  return { title, reason }
+}
+
+function IssueSeverity({ severity }: { severity: string }) {
+  return <span className="obs-issue-severity" data-severity={severity}>{severityLabels[severity] ?? severity}</span>
 }
 
 export function ObservabilityPage({ conversationForRun, onOpenConversation }: {
@@ -175,215 +239,288 @@ export function ObservabilityPage({ conversationForRun, onOpenConversation }: {
   const { xl: wide } = Grid.useBreakpoint()
   const [attempt, setAttempt] = useState(0)
   const [autoRefresh, setAutoRefresh] = useState(false)
-  const [hours, setHours] = useState(0)
+  const [hours, setHours] = useState(24)
   const [query, setQuery] = useState('')
   const [status, setStatus] = useState('全部状态')
-  const [tab, setTab] = useState('traces')
-  const [selectedId, setSelectedId] = useState<string | null>()
+  const hash = useSyncExternalStore(subscribeToHash, () => window.location.hash)
+  const { tab, traceId: activeTraceId } = readObservationRoute(hash)
+  const tableRef = useRef<HTMLElement>(null)
+  const detailHeading = useRef<HTMLHeadingElement>(null)
+  const lastRoute = useRef<{ tab: ObservationView, traceId?: string }>(undefined)
+  const [tracePage, setTracePage] = useState(1)
   const [detailTab, setDetailTab] = useState<{ traceId: string, tab: string }>()
   const [detailResponse, setDetailResponse] = useState<TraceResponse>()
   const [detailAttempt, setDetailAttempt] = useState(0)
-  const [issueAction, setIssueAction] = useState<{ id?: string, error?: string }>({})
-  const [data, setData] = useState<{
+  const [issuePage, setIssuePage] = useState(1)
+  const [lookupTarget, setLookupTarget] = useState<{ identifier: string }>()
+  const [lookupResponse, setLookupResponse] = useState<{ target: typeof lookupTarget, traces?: ObservabilityTrace[] }>()
+  const [response, setData] = useState<{
+    overview?: ObservabilityOverview
     traces?: ObservabilityTrace[]
     issues?: AgentIssue[]
     metrics?: MetricSummary[]
     attempt: number
-    fetchedAt: number
+    hours: number
     incomplete: boolean
   }>()
+  const data = response?.hours === hours ? response : undefined
   const loading = data?.attempt !== attempt
+  const scopedTraces = data?.traces?.filter(isProductTrace)
+  const traceLoading = loading
+  const visibleIssues = data?.issues?.filter(issue => !maintenanceOperations.has(issue.component ?? ''))
+  const issuePageSize = 10
+  const currentIssuePage = Math.min(issuePage, Math.max(1, Math.ceil((visibleIssues?.length ?? 0) / issuePageSize)))
 
   useEffect(() => {
     const controller = new AbortController()
     const signal = controller.signal
+    const now = Date.now()
+    const timeWindow = hours ? {
+      start_at: new Date(now - hours * 3_600_000).toISOString(),
+      end_at: new Date(now).toISOString(),
+    } : undefined
     void Promise.allSettled([
-      productApi.listObservabilityTraces(undefined, signal),
-      productApi.listAgentIssues(undefined, signal),
-      productApi.listMetricSummary(undefined, signal),
-    ]).then(([traces, issues, metrics]) => {
+      productApi.getObservabilityOverview(timeWindow, signal, true),
+      productApi.listObservabilityTraces(undefined, signal, timeWindow, 'product'),
+      productApi.listAgentIssues(undefined, signal, timeWindow, undefined, true),
+      productApi.listMetricSummary(undefined, signal, timeWindow, true),
+    ]).then(([overview, traces, issues, metrics]) => {
       if (signal.aborted) return
-      setData(previous => ({
-        traces: traces.status === 'fulfilled' ? traces.value : previous?.traces,
-        issues: issues.status === 'fulfilled' ? issues.value : previous?.issues,
-        metrics: metrics.status === 'fulfilled' ? metrics.value : previous?.metrics,
+      setData({
+        overview: overview.status === 'fulfilled' ? overview.value : undefined,
+        traces: traces.status === 'fulfilled' ? traces.value : undefined,
+        issues: issues.status === 'fulfilled' ? issues.value : undefined,
+        metrics: metrics.status === 'fulfilled' ? metrics.value : undefined,
         attempt,
-        fetchedAt: traces.status === 'fulfilled' ? Date.now() : previous?.fetchedAt ?? 0,
-        incomplete: traces.status === 'rejected' || issues.status === 'rejected' || metrics.status === 'rejected',
-      }))
+        hours,
+        incomplete: [overview, traces, issues, metrics].some(result => result.status === 'rejected'),
+      })
     })
     return () => controller.abort()
-  }, [attempt])
+  }, [attempt, hours])
 
   useEffect(() => {
-    if (!autoRefresh || loading) return
+    if (!autoRefresh || traceLoading) return
     const timer = window.setTimeout(() => setAttempt(count => count + 1), 30_000)
     return () => window.clearTimeout(timer)
-  }, [autoRefresh, loading, attempt])
+  }, [autoRefresh, traceLoading, attempt])
 
-  const timeTraces = useMemo(() => {
-    const traces = data?.traces ?? []
-    return hours ? traces.filter(trace => Date.parse(trace.started_at) >= (data?.fetchedAt ?? 0) - hours * 3_600_000) : traces
-  }, [data, hours])
+  useEffect(() => {
+    if (!lookupTarget) return
+    const controller = new AbortController()
+    productApi.findObservabilityTraces(lookupTarget.identifier, controller.signal, 'product').then(traces => {
+      if (!controller.signal.aborted) setLookupResponse({ target: lookupTarget, traces: traces.filter(isProductTrace) })
+    }).catch(() => {
+      if (!controller.signal.aborted) setLookupResponse({ target: lookupTarget })
+    })
+    return () => controller.abort()
+  }, [lookupTarget])
+
+  const lookup = lookupTarget && lookupResponse?.target === lookupTarget ? lookupResponse : undefined
   const normalizedQuery = query.trim().toLowerCase()
   const linkedConversation = (trace: ObservabilityTrace) => {
     const { application_run_id: runId } = traceMetadata(trace)
     return runId ? conversationForRun?.(runId) : undefined
   }
   const labelForTrace = (trace: ObservabilityTrace) => linkedConversation(trace)?.title ?? operationLabel(trace.operation_name)
-  const visibleTraces = timeTraces.filter(trace => {
+  const visibleTraces = (scopedTraces ?? []).filter(trace => {
     const { application_run_id: runId } = traceMetadata(trace)
     const matchesStatus = status === '全部状态' || traceState(trace).text === status
     return matchesStatus && [trace.id, trace.operation_name, labelForTrace(trace), runId]
       .some(value => value?.toLowerCase().includes(normalizedQuery))
   })
-  const activeTrace = tab === 'traces'
-    ? selectedId === undefined && wide ? visibleTraces[0] : visibleTraces.find(trace => trace.id === selectedId)
-    : undefined
-  const activeTraceId = activeTrace?.id
+  const traceRows = lookupTarget ? lookup?.traces ?? [] : visibleTraces
+  const tracePageSize = 7
+  const currentTracePage = Math.min(tracePage, Math.max(1, Math.ceil(traceRows.length / tracePageSize)))
+  const selectedResponse = detailResponse?.id === activeTraceId ? detailResponse : undefined
+  const activeTrace = selectedResponse?.trace ?? traceRows.find(trace => trace.id === activeTraceId)
+
+  function selectTrace(id: string) {
+    const params = new URLSearchParams({ trace: id })
+    navigateObservation(`${observationPath}?${params}`, activeTraceId ? 'replace' : 'push',
+      !activeTraceId || Boolean(window.history.state?.observationDetailFromList))
+  }
+
+  function closeTrace() {
+    if (window.history.state?.observationDetailFromList) window.history.back()
+    else navigateObservation(observationPath, 'replace')
+  }
+
+  function changeTab(nextTab: string) {
+    if (nextTab === tab) return
+    navigateObservation(nextTab === 'traces' ? observationPath : `${observationPath}?view=${nextTab}`, 'push')
+  }
+
+  useEffect(() => {
+    const previous = lastRoute.current
+    lastRoute.current = { tab, traceId: activeTraceId }
+    if (activeTraceId && activeTraceId !== previous?.traceId) {
+      detailHeading.current?.focus()
+    } else if (previous?.tab !== undefined && previous.tab !== tab) {
+      tableRef.current?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')?.focus()
+    } else if (previous?.traceId && !activeTraceId) {
+      const opener = Array.from(tableRef.current?.querySelectorAll<HTMLElement>('[data-trace-trigger]') ?? [])
+        .find(button => button.dataset.traceTrigger === previous.traceId)
+      const focusTarget = opener ?? tableRef.current?.querySelector<HTMLElement>('input')
+      focusTarget?.focus()
+    }
+  }, [tab, activeTraceId])
+
   useEffect(() => {
     if (!activeTraceId) return
     const controller = new AbortController()
-    productApi.getObservabilityTrace(activeTraceId, controller.signal).then(trace => {
-      if (!controller.signal.aborted) setDetailResponse({ id: activeTraceId, trace })
-    }).catch(() => {
-      if (!controller.signal.aborted) setDetailResponse({ id: activeTraceId })
+    productApi.getObservabilityTrace(activeTraceId, controller.signal, true).then(trace => {
+      if (!controller.signal.aborted) setDetailResponse(isProductTrace(trace)
+        ? { id: activeTraceId, trace }
+        : { id: activeTraceId, unavailable: true })
+    }).catch((error: unknown) => {
+      if (!controller.signal.aborted) setDetailResponse({
+        id: activeTraceId, unavailable: error instanceof ProductRequestError && error.status === 404,
+      })
     })
     return () => controller.abort()
   }, [activeTraceId, attempt, detailAttempt])
-  const openIssues = data?.issues?.filter(issue => openStates.has(issue.status))
-  const toolCallCount = data?.metrics?.filter(metric => metric.metric_name === 'tool.call.count' && metric.unit === 'calls')
-    .reduce((total, metric) => total + metric.point_count, 0)
-  const failedCount = data?.traces && timeTraces.filter(trace => trace.status === 'FAILED').length
-  const waitingCount = data?.traces && timeTraces.filter(trace => traceMetadata(trace).application_status === 'waiting_for_input').length
+  const overview = data?.overview
+  const previous = overview?.previous
+  const comparison = hours === 24 ? '前 24 小时' : '前 7 天'
+  const comparableTraces = previous && previous.trace_count > 0 ? previous : undefined
+  const comparableTools = previous && previous.tool_call_count > 0 ? previous.tool_call_count : undefined
 
-  const updateIssue = async (issue: AgentIssue, value: string) => {
-    setIssueAction({ id: issue.id })
-    try {
-      const updated = await productApi.setAgentIssueStatus(issue.id, value)
-      setData(previous => previous && { ...previous, issues: previous.issues?.map(item => item.id === updated.id ? updated : item) })
-      setIssueAction({})
-    } catch {
-      setIssueAction({ error: '未能更新问题状态，请重试。' })
-    }
+  function trend(value?: number, baseline?: number) {
+    if (value === undefined || baseline === undefined || !hours) return undefined
+    const delta = value - baseline
+    return delta === 0 ? `与${comparison}持平` : `较${comparison} ${delta > 0 ? '+' : '−'}${counter.format(Math.abs(delta))}`
   }
 
   const traceColumns: ColumnsType<ObservabilityTrace> = [
     {
-      title: '操作', dataIndex: 'operation_name',
+      title: '运行', dataIndex: 'operation_name',
       render: (_, trace) => {
         const label = labelForTrace(trace)
-        const runId = traceMetadata(trace).application_run_id ?? trace.id
+        const operation = operationLabel(trace.operation_name)
+        const secondary = lookupTarget?.identifier
+          ? lookupTarget.identifier
+          : label !== operation ? operation : undefined
         return (
-          <button type="button" className="observability-trace-button" onClick={() => setSelectedId(trace.id)} aria-pressed={activeTrace?.id === trace.id}>
+          <button type="button" className="obs-trace-button" data-trace-trigger={trace.id} onClick={() => selectTrace(trace.id)} aria-expanded={activeTraceId === trace.id} aria-controls={activeTraceId === trace.id ? 'obs-trace-detail' : undefined}>
             <PullRequestOutlined aria-hidden="true" />
-            <span><strong title={label}>{label}</strong><small title={runId}>{runId}</small></span>
+            <span>
+              <strong title={label}>{label}</strong>
+              {secondary && <small className={lookupTarget ? 'obs-trace-match' : undefined} title={secondary}>{secondary}</small>}
+            </span>
           </button>
         )
       },
     },
-    { title: '状态', width: 96, render: (_, trace) => <TraceState trace={trace} /> },
-    { title: '耗时', dataIndex: 'duration_ms', width: 86, align: 'right', render: duration },
-    { title: '开始时间', dataIndex: 'started_at', width: 130, render: value => <time className="observability-time" dateTime={value}>{formatTime(value)}</time> },
-    { title: '错误', dataIndex: 'error_code', width: 111, ellipsis: true, render: value => value ?? '—' },
+    { title: '状态', width: 84, render: (_, trace) => <TraceState trace={trace} /> },
+    { title: '耗时', dataIndex: 'duration_ms', width: 75, align: 'right', render: duration },
+    { title: '开始时间', dataIndex: 'started_at', width: 120, render: value => <time className="obs-time" dateTime={value}>{formatTime(value)}</time> },
   ]
 
-  const issueColumns: ColumnsType<AgentIssue> = [
-    { title: '问题', dataIndex: 'title', render: (_, issue) => <strong>{issue.title}</strong> },
-    { title: '严重程度', dataIndex: 'severity', width: 112, render: value => <StatusPill value={value} /> },
-    { title: '最近出现', dataIndex: 'last_seen_at', width: 150, render: formatTime },
-    { title: '次数', dataIndex: 'occurrence_count', width: 74, align: 'right', render: metricValue },
-    { title: '状态', dataIndex: 'status', width: 158, render: (_, issue) => (
-      <Select
-        aria-label={`${issue.title} 的状态`}
-        size="small"
-        value={issue.status}
-        disabled={Boolean(issueAction.id)}
-        loading={issueAction.id === issue.id}
-        onChange={value => void updateIssue(issue, value)}
-        options={Array.from(new Set([issue.status, ...issueOptions])).map(state => ({ value: state, label: state }))}
-      />
-    ) },
-  ]
   const metricColumns: ColumnsType<MetricSummary> = [
     { title: '指标', dataIndex: 'metric_name', width: '32%', render: (name: string) => {
       const label = Object.hasOwn(metricLabels, name) ? metricLabels[name] : undefined
-      return <span className="observability-metric-name"><strong>{label ?? name}</strong>{label && <code>{name}</code>}</span>
+      return <span className="obs-metric-name"><strong>{label ?? name}</strong>{label && <code>{name}</code>}</span>
     } },
     { title: '样本数', dataIndex: 'point_count', width: '13%', align: 'right', render: metricValue },
     { title: '平均值', dataIndex: 'average_value', width: '15%', align: 'right', render: metricValue },
     { title: '最小值', dataIndex: 'minimum_value', width: '15%', align: 'right', render: metricValue },
     { title: '最大值', dataIndex: 'maximum_value', width: '15%', align: 'right', render: metricValue },
-    { title: '单位', dataIndex: 'unit', width: '10%', render: value => <span className="observability-metric-unit">{value === 'calls' ? '次' : value ?? '—'}</span> },
+    { title: '单位', dataIndex: 'unit', width: '10%', render: value => <span className="obs-metric-unit">{value === 'calls' || value === 'occurrences' ? '次' : value ?? '—'}</span> },
   ]
 
-  const detail = activeTrace && (
+  const detail = activeTraceId && (
     <TraceDetail
-      key={activeTrace.id}
-      response={detailResponse?.id === activeTrace.id ? detailResponse : undefined}
-      activeTab={detailTab?.traceId === activeTrace.id ? detailTab.tab : 'tree'}
-      onTabChange={tab => setDetailTab({ traceId: activeTrace.id, tab })}
-      conversation={linkedConversation(activeTrace)}
+      key={activeTraceId}
+      response={selectedResponse}
+      activeTab={detailTab?.traceId === activeTraceId ? detailTab.tab : 'tree'}
+      onTabChange={tab => setDetailTab({ traceId: activeTraceId, tab })}
+      title={activeTrace ? labelForTrace(activeTrace) : ''}
+      conversation={activeTrace ? linkedConversation(activeTrace) : undefined}
       onOpenConversation={onOpenConversation}
       onRetry={() => setDetailAttempt(count => count + 1)}
     />
   )
 
   return (
-    <div className="page-content workspace-observability">
+    <div className="obs-console">
       <PageHeader
         title="运行中心 / 观测面板"
-        description="查看运行状态、工具调用、提示词和待处理问题。"
+        description="追踪业务运行，查看工具调用和已记录的问题。"
         actions={(
           <>
             <Select
-              aria-label="Trace 时间范围"
+              aria-label="观测时间范围"
               prefix={<CalendarOutlined aria-hidden="true" />}
               value={hours}
-              onChange={setHours}
-              options={[{ value: 0, label: '最近 100 条 Trace' }, { value: 24, label: '最近 24 小时' }, { value: 168, label: '最近 7 天' }]}
+              onChange={value => {
+                setHours(value)
+                setAttempt(count => count + 1)
+                setTracePage(1)
+                setLookupTarget(undefined)
+                setIssuePage(1)
+              }}
+              options={timeOptions}
             />
-            <Button aria-label="刷新观测" icon={<ReloadOutlined />} loading={loading} onClick={() => setAttempt(value => value + 1)} />
-            <label className="observability-refresh-switch">自动刷新（30 秒）<Switch size="small" checked={autoRefresh} onChange={setAutoRefresh} aria-label="自动刷新" /></label>
+            <Button aria-label="刷新观测" icon={<ReloadOutlined />} loading={loading} onClick={() => setAttempt(value => value + 1)}>刷新</Button>
+            <label className="obs-refresh-switch">自动刷新（30 秒）<Switch size="small" checked={autoRefresh} onChange={setAutoRefresh} aria-label="自动刷新" /></label>
           </>
         )}
       />
       {data?.incomplete && <Alert type="warning" showIcon title="部分观测数据暂时无法读取，刷新后可重试。" />}
-      <section className="metric-grid observability-metrics" aria-label="运行指标">
+      <section className="obs-metrics" aria-label="运行指标">
         {([
-          ['Trace 记录', data?.traces ? timeTraces.length : undefined, '已加载的 Trace', ApartmentOutlined, 'running'],
-          ['失败 Trace', failedCount, '同一 Trace 范围', ExclamationCircleOutlined, 'error'],
-          ['工具调用记录', toolCallCount, '数据库累计', ToolOutlined, 'accent'],
-          ['等待补充 Trace', waitingCount, '同一 Trace 范围', CalendarOutlined, 'waiting'],
-        ] as const).map(([label, value, description, Icon, tone]) => (
-          <article className={`metric-card observability-metric-${tone}`} key={label}>
-            <Icon className="observability-metric-icon" aria-hidden="true" />
-            <div><span>{label}</span><strong>{value === undefined ? '—' : counter.format(value)}</strong><small>{description}</small></div>
+          ['Trace 记录', overview?.trace_count, trend(overview?.trace_count, comparableTraces?.trace_count), '记录业务执行及计划任务结果', ApartmentOutlined, 'blue'],
+          ['整次运行失败', overview?.failed_trace_count, trend(overview?.failed_trace_count, comparableTraces?.failed_trace_count), '仅统计失败的 Trace，工具报错见「问题」', ExclamationCircleOutlined, 'red'],
+          ['工具调用记录', overview?.tool_call_count, trend(overview?.tool_call_count, comparableTools), '按调用开始时间', ToolOutlined, 'violet'],
+          ['等待补充 Trace', overview?.waiting_trace_count, undefined, '按 Trace 当前状态', ClockCircleOutlined, 'amber'],
+        ] as const).map(([label, value, change, description, Icon, tone]) => (
+          <article className={`obs-metric obs-metric--${tone === 'red' && value === 0 ? 'neutral' : tone}`} key={label} aria-label={label}>
+            <div className="obs-metric-heading"><span>{label}</span><Icon className="obs-metric-icon" aria-hidden="true" /></div>
+            <strong>{value == null ? '—' : counter.format(value)}</strong>
+            {tone === 'red' || tone === 'blue' ? (
+              <div className="obs-metric-caption">
+                <small>{description}</small>
+                {change && (tone !== 'red' || value !== comparableTraces?.failed_trace_count) && <small>{change}</small>}
+              </div>
+            ) : <small title={description}>{change ?? description}</small>}
           </article>
         ))}
       </section>
-      <div className={`observability-layout${wide && activeTrace ? ' with-trace' : ''}`}>
-        <section className="workbench-panel observability-table">
-          <Tabs activeKey={tab} onChange={setTab} items={[
+      <div className={`obs-layout${wide && activeTraceId ? ' with-trace' : ''}`}>
+        <section ref={tableRef} className="obs-panel obs-table" aria-label="观测记录">
+          <Tabs activeKey={tab} onChange={changeTab} animated={false} items={[
             {
               key: 'traces', label: 'Trace', children: (
                 <>
-                  <div className="observability-filter">
-                    <Select aria-label="Trace 状态" value={status} onChange={setStatus} options={traceOptions.map(value => ({ value, label: value }))} />
-                    <Input prefix={<SearchOutlined aria-hidden="true" />} aria-label="搜索 Trace" placeholder="搜索运行 ID 或操作名称…" value={query} onChange={event => setQuery(event.target.value)} allowClear />
-                    <span>{visibleTraces.length} 条记录</span>
+                  <div className="obs-filter">
+                    <Input prefix={<SearchOutlined aria-hidden="true" />} aria-label="搜索 Trace" placeholder="搜索标题、操作名称或 ID…" value={query} onChange={event => { setQuery(event.target.value); setLookupTarget(undefined); setTracePage(1) }} allowClear />
+                    <Select aria-label="Trace 状态" disabled={Boolean(lookupTarget)} value={status} onChange={value => { setStatus(value); setTracePage(1) }} options={traceOptions.map(value => ({ value, label: value }))} />
+                    <Button disabled={!query.trim() || query.trim().length > 200} loading={Boolean(lookupTarget && !lookup)} onClick={() => {
+                      setLookupTarget({ identifier: query.trim() })
+                      setTracePage(1)
+                    }}>按 ID 查找</Button>
+                    {!lookupTarget && scopedTraces && <span className="obs-filter-count">{counter.format(visibleTraces.length)} 条已加载记录</span>}
                   </div>
+                  {lookupTarget && <div className="obs-list-note obs-lookup-note">
+                    <span>跨时间精确匹配 Trace ID 或运行 ID。</span>
+                    <Button size="small" type="link" onClick={() => { setLookupTarget(undefined); setQuery(''); setTracePage(1) }}>返回列表</Button>
+                  </div>}
+                  {!lookupTarget && data?.traces?.length === 100 && (
+                    <p className="obs-list-note">本次最多加载 100 条 Trace。查找更早的记录可使用「按 ID 查找」。</p>
+                  )}
                   <Table
-                    className="observability-traces-grid"
+                    key={lookupTarget ? 'lookup' : 'traces'}
+                    className="obs-traces-grid"
                     rowKey="id"
-                    rowClassName={trace => trace.id === activeTrace?.id ? 'observability-trace-selected' : ''}
+                    rowClassName={trace => trace.id === activeTraceId ? 'obs-trace-selected' : ''}
                     columns={traceColumns}
-                    dataSource={visibleTraces}
-                    loading={loading}
+                    dataSource={traceRows}
+                    loading={lookupTarget ? !lookup : traceLoading}
                     size="small"
-                    scroll={{ x: 610 }}
-                    pagination={{ pageSize: 20, hideOnSinglePage: true }}
-                    locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={query || status !== '全部状态' || hours ? '没有匹配的 Trace' : '暂无 Trace'} /> }}
+                    scroll={{ x: 410 }}
+                    pagination={{ current: currentTracePage, onChange: setTracePage, pageSize: tracePageSize, hideOnSinglePage: true, showSizeChanger: false }}
+                    locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={lookupTarget ? (lookup && !lookup.traces ? '无法按 ID 查找，请重试' : '没有匹配此 ID 的 Trace') : !scopedTraces && !traceLoading ? '暂时无法读取 Trace' : normalizedQuery || status !== '全部状态' ? '没有匹配的 Trace' : '暂无运行记录'} /> }}
                   />
                 </>
               ),
@@ -391,42 +528,93 @@ export function ObservabilityPage({ conversationForRun, onOpenConversation }: {
             {
               key: 'issues', label: '问题', children: (
                 <>
-                  {issueAction.error && <Alert type="error" showIcon title={issueAction.error} />}
-                  <Table rowKey="id" columns={issueColumns} dataSource={data?.issues} loading={loading} size="small" scroll={{ x: 660 }} pagination={{ pageSize: 20, hideOnSinglePage: true }} locale={{ emptyText: '暂无聚合问题' }} />
+                  <p className="obs-list-note">{visibleIssues?.length === 100 ? '显示最新 100 条问题，' : ''}按业务运行中最近出现的时间排序，次数为累计值。</p>
+                  {visibleIssues?.length ? (
+                    <>
+                      <ul className="obs-issue-list" aria-label="已记录的问题" aria-busy={loading}>
+                        {visibleIssues.slice((currentIssuePage - 1) * issuePageSize, currentIssuePage * issuePageSize).map(issue => {
+                          const { title, reason } = describeIssue(issue)
+                          return <li className="obs-issue" key={issue.id}>
+                            <div className="obs-issue-main">
+                              <WarningOutlined className="obs-issue-icon" aria-hidden="true" />
+                              <div className="obs-issue-copy">
+                                <div className="obs-issue-heading">
+                                  <h3>{title}</h3>
+                                  <IssueSeverity severity={issue.severity} />
+                                </div>
+                                <p>{reason}</p>
+                              </div>
+                            </div>
+                            <dl className="obs-issue-meta">
+                              <div>
+                                <dt>最近出现</dt>
+                                <dd><time dateTime={issue.last_seen_at}>{formatTime(issue.last_seen_at)}</time></dd>
+                              </div>
+                              <div>
+                                <dt>累计次数</dt>
+                                <dd><strong>{metricValue(issue.occurrence_count)} 次</strong></dd>
+                              </div>
+                            </dl>
+                            <details className="obs-issue-detail">
+                              <summary className="workbench-disclosure">
+                                <span>技术详情</span>
+                              </summary>
+                              <div className="obs-issue-detail-body">
+                                <dl>
+                                  <div><dt>问题 ID</dt><dd>{issue.id}</dd></div>
+                                  {issue.component && <div><dt>组件</dt><dd>{issue.component}</dd></div>}
+                                  <div><dt>错误类型</dt><dd>{issue.issue_type}</dd></div>
+                                </dl>
+                                <div className="obs-issue-error-label">已记录的报错摘要</div>
+                                <pre>{issue.title}</pre>
+                              </div>
+                            </details>
+                          </li>
+                        })}
+                      </ul>
+                      {visibleIssues.length > issuePageSize && <Pagination className="obs-issue-pagination" size="small" current={currentIssuePage} pageSize={issuePageSize} total={visibleIssues.length} showSizeChanger={false} onChange={setIssuePage} />}
+                    </>
+                  ) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={loading ? '正在读取问题…' : visibleIssues ? '当前时间范围没有记录问题' : '暂时无法读取问题'} />}
                 </>
               ),
             },
             {
               key: 'metrics', label: '指标', children: (
-                <Table className="observability-metrics-grid" rowKey={row => `${row.metric_name}:${row.unit ?? ''}`}
+                <Table className="obs-metrics-grid" rowKey={row => `${row.metric_name}:${row.unit ?? ''}`}
                   columns={metricColumns} dataSource={data?.metrics} loading={loading} size="small"
-                  tableLayout="fixed" scroll={{ x: 570 }} pagination={false} locale={{ emptyText: '暂无指标' }} />
+                  tableLayout="fixed" scroll={{ x: 570 }} pagination={false} locale={{ emptyText: !data?.metrics && !loading ? '暂时无法读取指标' : '暂无指标' }} />
               ),
             },
           ]} />
-          {tab === 'traces' && (
-            <section className="observability-issues-preview" aria-label="待处理问题">
-              <div className="workbench-panel-header">
-                <h2><WarningOutlined aria-hidden="true" />待处理问题</h2>
-                <Button type="link" onClick={() => setTab('issues')}>查看全部问题</Button>
+          {tab === 'traces' && !lookupTarget && Boolean(visibleIssues?.length) && (
+            <section className="obs-issues-preview" aria-label="最近问题">
+              <div className="obs-panel-heading">
+                <h2><WarningOutlined aria-hidden="true" />最近问题</h2>
+                <Button type="link" onClick={() => { setIssuePage(1); changeTab('issues') }}>查看问题列表</Button>
               </div>
-              {openIssues?.length ? (
-                <ul>{openIssues.slice(0, 4).map(issue => <li key={issue.id}><strong>{issue.title}</strong><StatusPill value={issue.severity} /><time dateTime={issue.last_seen_at}>{formatTime(issue.last_seen_at)}</time></li>)}</ul>
-              ) : <p className="workbench-empty">{!data?.issues ? (loading ? '正在读取问题…' : '问题数据暂不可用。') : '当前没有待处理的问题。'}</p>}
+              <ul>{visibleIssues?.slice(0, 4).map(issue => <li key={issue.id}><strong>{describeIssue(issue).title}</strong><IssueSeverity severity={issue.severity} /><time dateTime={issue.last_seen_at}>{formatTime(issue.last_seen_at)}</time></li>)}</ul>
             </section>
           )}
         </section>
-        {wide && activeTrace && (
-          <aside className="workbench-panel observability-detail" aria-label="Trace 详情">
-            <div className="workbench-panel-header">
-              <h2><PullRequestOutlined aria-hidden="true" />Trace 详情</h2>
-              <Button type="text" icon={<CloseOutlined />} aria-label="关闭 Trace 详情" onClick={() => setSelectedId(null)} />
+        {wide && activeTraceId && (
+          <aside id="obs-trace-detail" className="obs-panel obs-detail" aria-label="Trace 详情" onKeyDown={event => {
+            if (event.key === 'Escape' && !event.defaultPrevented) closeTrace()
+          }}>
+            <div className="obs-panel-heading">
+              <h2 ref={detailHeading} tabIndex={-1}><PullRequestOutlined aria-hidden="true" />Trace 详情</h2>
+              <Button type="text" size="small" icon={<ArrowLeftOutlined aria-hidden="true" />} onClick={closeTrace}>返回列表</Button>
             </div>
             {detail}
           </aside>
         )}
       </div>
-      {!wide && activeTrace && <Drawer title="Trace 详情" open size="large" onClose={() => setSelectedId(null)}>{detail}</Drawer>}
+      {!wide && (
+        <Drawer title="Trace 详情" className="obs-drawer" open={Boolean(activeTraceId)} size="large"
+          closable={false} onClose={closeTrace}
+          extra={<Button type="text" size="small" icon={<ArrowLeftOutlined aria-hidden="true" />} onClick={closeTrace}>返回列表</Button>}>
+          <div id="obs-trace-detail">{detail}</div>
+        </Drawer>
+      )}
     </div>
   )
 }
@@ -469,7 +657,7 @@ function SpanTree({ spans, callsBySpan, documentRun }: {
     const nodes = groups.get(parent)
     if (!nodes?.length) return null
     return (
-      <ul className="observability-tree">
+      <ul className="obs-tree">
         {nodes.map(span => {
           const calls = callsBySpan.get(span.id)
           return (
@@ -489,15 +677,17 @@ function SpanTree({ spans, callsBySpan, documentRun }: {
   return tree(null)
 }
 
-function JsonEvidence({ label, value, identifier }: { label: string, value?: string, identifier?: string }) {
+function JsonEvidence({ label, value, identifier, event }: { label: ReactNode, value?: string, identifier?: string, event?: boolean }) {
   const [open, setOpen] = useState(false)
   if (!value && !identifier) return null
   const data = open ? readJson(value) : undefined
   return (
-    <details className="observability-json" onToggle={event => setOpen(event.currentTarget.open)}>
-      <summary>{label}</summary>
-      {identifier && <code className="observability-event-id">{identifier}</code>}
-      {open && value && (typeof data === 'string' ? <pre className="json-preview">{data}</pre> : <RawJsonResult data={data} />)}
+    <details className={event ? 'obs-json obs-event-record' : 'obs-json'} onToggle={toggle => setOpen(toggle.currentTarget.open)}>
+      <summary className="workbench-disclosure">{label}</summary>
+      {open && <div className="obs-json-body">
+        {identifier && <code className="obs-event-id">{identifier}</code>}
+        {value && (typeof data === 'string' ? <pre className="json-preview">{data}</pre> : <RawJsonResult data={data} />)}
+      </div>}
     </details>
   )
 }
@@ -511,7 +701,7 @@ function CallHeader({ title, identifier, status, latency, icon: Icon }: {
 }) {
   const state = executionStates[status] ?? { text: status, tone: 'neutral' }
   return (
-    <span className="observability-call-header">
+    <span className="obs-call-header">
       <span className="workspace-row-icon"><Icon aria-hidden="true" /></span>
       <span><strong>{title}</strong>{identifier && identifier !== title && <code>{identifier}</code>}</span>
       <span className={`workspace-state workspace-state-${state.tone}`}>{state.text}</span>
@@ -522,14 +712,13 @@ function CallHeader({ title, identifier, status, latency, icon: Icon }: {
 
 function ToolCallDetails({ call }: { call: ToolCallRecord }) {
   return (
-    <details className="observability-tool-record">
-      <summary>
+    <details className="obs-tool-record">
+      <summary className="workbench-disclosure">
         <CallHeader title={toolTitle(call.tool_name)}
           status={call.status} latency={call.latency_ms} icon={toolIcon(call.tool_name)} />
-        <RightOutlined className="observability-tool-chevron" aria-hidden="true" />
       </summary>
-      <div className="observability-tool-body">
-        <dl className="observability-tool-meta">
+      <div className="obs-tool-body">
+        <dl className="obs-tool-meta">
           <div><dt>工具标识</dt><dd><code>{call.tool_name}</code></dd></div>
           {call.tool_call_id && <div><dt>调用 ID</dt><dd><code>{call.tool_call_id}</code></dd></div>}
           <div><dt>开始时间</dt><dd>{formatTime(call.started_at)}</dd></div>
@@ -538,7 +727,7 @@ function ToolCallDetails({ call }: { call: ToolCallRecord }) {
           <div><dt>重试次数</dt><dd>{counter.format(call.retry_count ?? 0)}</dd></div>
         </dl>
         {(call.error_message || call.error_code) && (
-          <p className="observability-call-error" title={call.error_code ?? undefined}>{call.error_message ?? call.error_code}</p>
+          <p className="obs-call-error" title={call.error_code ?? undefined}>{call.error_message ?? call.error_code}</p>
         )}
         <JsonEvidence label="调用参数" value={call.arguments_json} />
         <JsonEvidence label="返回摘要" value={call.result_summary_json} />
@@ -550,7 +739,7 @@ function ToolCallDetails({ call }: { call: ToolCallRecord }) {
 function TraceToolCalls({ calls }: { calls?: ToolCallRecord[] }) {
   if (!calls?.length) return <p className="workbench-empty">暂无已记录的工具调用。</p>
   return (
-    <ol className="observability-call-list" aria-label="已记录的工具调用">
+    <ol className="obs-call-list" aria-label="已记录的工具调用">
       {calls.map(call => <li key={call.id}><ToolCallDetails call={call} /></li>)}
     </ol>
   )
@@ -582,10 +771,26 @@ function recordedPrompts(value?: string) {
   })
 }
 
+function PromptEvidence({ label, text }: { label: string, text: string }) {
+  // Split only the explicit schema suffix appended by the structured model.
+  const separator = /(\r?\n仅输出符合以下 JSON Schema 的 JSON 对象，不要输出解释或 Markdown：)\r?\n(?=\s*\{)/
+  const match = label === '系统提示词' ? separator.exec(text) : null
+  const schema = match ? text.slice(match.index + match[0].length) : undefined
+  const body = match ? text.slice(0, match.index + match[1].length) : text
+
+  return (
+    <details className="obs-prompt-section">
+      <summary className="workbench-disclosure">{label}</summary>
+      <div className="obs-prompt-copy" role="region" aria-label={`${label}正文`} tabIndex={0}>{body}</div>
+      {schema && <div className="obs-prompt-schema"><JsonEvidence label="JSON Schema" value={schema} /></div>}
+    </details>
+  )
+}
+
 function TracePrompts({ calls, documentRun }: { calls?: ModelCallRecord[], documentRun: boolean }) {
   if (!calls?.length) return <p className="workbench-empty">暂无已记录的模型调用。</p>
   return (
-    <ol className="observability-call-list" aria-label="已记录的模型调用">
+    <ol className="obs-call-list" aria-label="已记录的模型调用">
       {calls.map(call => {
         const prompts = recordedPrompts(call.input_summary_json)
         const key = call.prompt_key ?? call.operation
@@ -595,21 +800,18 @@ function TracePrompts({ calls, documentRun }: { calls?: ModelCallRecord[], docum
             <CallHeader title={title} identifier={call.model}
               status={call.status} latency={call.latency_ms} icon={FileTextOutlined} />
             {(call.prompt_version || call.total_tokens != null) && (
-              <div className="observability-call-meta">
+              <div className="obs-call-meta">
                 {call.prompt_version && <span title={call.prompt_version_id ?? undefined}>版本 {call.prompt_version}</span>}
                 {call.total_tokens != null && <span>{counter.format(call.total_tokens)} tokens</span>}
               </div>
             )}
-            {call.error_code && <p className="observability-call-error">{call.error_code}</p>}
+            {call.error_code && <p className="obs-call-error">{call.error_code}</p>}
             {prompts.length ? prompts.map(({ label, text }, index) => (
-              <details className="observability-json" key={`${label}-${index}`}>
-                <summary>{label}</summary>
-                <pre className="json-preview">{text}</pre>
-              </details>
-            )) : <p className="observability-prompt-empty">暂无已记录的提示词正文。</p>}
-            <details className="observability-json">
-              <summary>技术信息</summary>
-              <dl className="observability-tool-meta">
+              <PromptEvidence key={`${label}-${index}`} label={label} text={text} />
+            )) : <p className="obs-prompt-empty">暂无已记录的提示词正文。</p>}
+            <details className="obs-json">
+              <summary className="workbench-disclosure">技术信息</summary>
+              <dl className="obs-tool-meta">
                 {call.prompt_key && <div><dt>提示词标识</dt><dd><code>{call.prompt_key}</code></dd></div>}
                 {call.operation !== call.prompt_key && <div><dt>操作标识</dt><dd><code>{call.operation}</code></dd></div>}
               </dl>
@@ -636,7 +838,7 @@ function TraceEvents({ events, spans, documentRun }: {
   }
   const bySpan = new Map(spans.map(span => [span.id, span]))
   return (
-    <ol className="observability-events" aria-label="运行事件">
+    <ol className="obs-events" aria-label="运行事件">
       {groups.map(group => {
         const event = group[0]
         const span = event.span_id ? bySpan.get(event.span_id) : undefined
@@ -656,12 +858,11 @@ function TraceEvents({ events, spans, documentRun }: {
           : event.event_type.startsWith('message.') ? FileTextOutlined : ClockCircleOutlined
         return (
           <li key={event.id} data-severity={event.severity}>
-            <span className="workspace-row-icon"><Icon aria-hidden="true" /></span>
-            <div className="observability-event-copy">
-              <strong>{description}</strong>
-            </div>
-            <time dateTime={event.occurred_at}>{formatTime(event.occurred_at)}</time>
-            <JsonEvidence label="事件数据" value={details} identifier={event.event_type} />
+            <JsonEvidence event value={details} identifier={event.event_type} label={<>
+              <span className="workspace-row-icon"><Icon aria-hidden="true" /></span>
+              <strong className="obs-event-copy">{description}</strong>
+              <time dateTime={event.occurred_at}>{formatTime(event.occurred_at)}</time>
+            </>} />
           </li>
         )
       })}
@@ -669,16 +870,20 @@ function TraceEvents({ events, spans, documentRun }: {
   )
 }
 
-function TraceDetail({ response, activeTab, onTabChange, conversation, onOpenConversation, onRetry }: {
+function TraceDetail({ response, activeTab, onTabChange, title, conversation, onOpenConversation, onRetry }: {
   response?: TraceResponse
   activeTab: string
   onTabChange: (tab: string) => void
+  title: string
   conversation?: ConversationLink
   onOpenConversation?: (conversationId: string, runId?: string) => void
   onRetry: () => void
 }) {
+  const [identifiersOpen, setIdentifiersOpen] = useState(false)
+  const identifiersId = useId()
   if (!response) return <p className="workbench-empty" role="status">正在读取 Trace…</p>
   const { trace } = response
+  if (response.unavailable) return <p className="workbench-empty" role="status">这条运行记录不存在或不在运行中心的展示范围内。</p>
   if (!trace) return (
     <div><p className="workbench-empty" role="alert">暂时无法读取 Trace 详情。</p><Button size="small" onClick={onRetry}>重试</Button></div>
   )
@@ -700,26 +905,35 @@ function TraceDetail({ response, activeTab, onTabChange, conversation, onOpenCon
   const toolCount = trace.tool_calls?.length ?? 0
 
   return (
-    <div className="observability-detail-body">
-      <div className="observability-trace-heading">
+    <div className="obs-detail-body">
+      <div className="obs-trace-heading">
+        <strong>{title}</strong>
         <TraceState trace={trace} />
-        <strong>{conversation?.title ?? operationLabel(trace.operation_name)}</strong>
       </div>
-      <dl className="observability-trace-summary" aria-label="运行摘要">
+      <dl className="obs-trace-summary" aria-label="运行摘要">
         <div><dt>开始时间</dt><dd>{formatTime(trace.started_at)}</dd></div>
         <div><dt>总耗时</dt><dd>{duration(trace.duration_ms)}</dd></div>
         <div><dt>工具明细</dt><dd>{counter.format(toolCount)} 条</dd></div>
         <div><dt>模型调用</dt><dd>{counter.format(trace.model_calls?.length ?? 0)} 次</dd></div>
       </dl>
-      <div className="observability-trace-actions">
-        {conversation && onOpenConversation && <Button size="small" onClick={() => onOpenConversation(conversation.id, runId)}>返回关联会话</Button>}
-        <details className="observability-trace-identifiers">
-          <summary>运行标识</summary>
-          <dl className="observability-tool-meta">
-            <div><dt>Trace ID</dt><dd><code>{trace.id}</code></dd></div>
-            {runId && <div><dt>运行 ID</dt><dd><code>{runId}</code></dd></div>}
-          </dl>
-        </details>
+      <div className="obs-trace-actions">
+        {conversation && onOpenConversation && (
+          <button type="button" className="obs-trace-action obs-trace-action-primary" onClick={() => onOpenConversation(conversation.id, runId)}>
+            <ArrowLeftOutlined aria-hidden="true" />返回关联会话
+          </button>
+        )}
+        <button type="button" className="obs-trace-action" aria-expanded={identifiersOpen} aria-controls={identifiersId}
+          onClick={() => setIdentifiersOpen(open => !open)}>
+          运行标识<RightOutlined className="obs-action-chevron" aria-hidden="true" />
+        </button>
+      </div>
+      <div id={identifiersId} className="obs-trace-identifiers" hidden={!identifiersOpen}>
+        <dl className="obs-tool-meta">
+          <div><dt>Trace ID</dt><dd><code>{trace.id}</code></dd></div>
+          {runId && <div><dt>运行 ID</dt><dd><code>{runId}</code></dd></div>}
+          <div><dt>操作名称</dt><dd><code>{trace.operation_name}</code></dd></div>
+          {trace.error_code && <div><dt>错误代码</dt><dd><code>{trace.error_code}</code></dd></div>}
+        </dl>
       </div>
       {trace.error_message && <Alert type="error" showIcon title={trace.error_message} />}
       <Tabs size="small" tabBarGutter={12} activeKey={activeTab} onChange={onTabChange} items={[
@@ -727,9 +941,8 @@ function TraceDetail({ response, activeTab, onTabChange, conversation, onOpenCon
           key: 'tree', label: '运行链路', children: (
             <>
               {runs.map(run => (
-                <details className="observability-tree-run" key={run.id} open>
-                  <summary>
-                    <RightOutlined aria-hidden="true" />
+                <details className="obs-tree-run" key={run.id} open>
+                  <summary className="workbench-disclosure">
                     <strong>{stepLabel(run.agent_name ?? run.workflow_name ?? run.trigger_type, documentRun)}</strong>
                     <small>{duration(run.duration_ms)}</small>
                   </summary>
@@ -738,7 +951,7 @@ function TraceDetail({ response, activeTab, onTabChange, conversation, onOpenCon
               ))}
               {unlinkedCalls.length > 0 && <TraceToolCalls calls={unlinkedCalls} />}
               {toolCount === 0 && !hasToolSteps && (
-                <p className="observability-no-tools">{documentRun && trace.model_calls?.length
+                <p className="obs-no-tools">{documentRun && trace.model_calls?.length
                   ? '由模型直接生成资料答复，本次工具调用 0 次。'
                   : '暂无工具调用记录。'}</p>
               )}
@@ -754,7 +967,7 @@ function TraceDetail({ response, activeTab, onTabChange, conversation, onOpenCon
               <JsonEvidence label="Trace 输入" value={trace.input_json} />
               <JsonEvidence label="Trace 输出" value={trace.output_json} />
               {trace.model_calls?.map(call => (
-                <section className="observability-evidence" key={call.id}>
+                <section className="obs-evidence" key={call.id}>
                   <h3>{call.model} · {stepLabel(call.operation, documentRun)}</h3>
                   <JsonEvidence label="模型输入摘要" value={call.input_summary_json} />
                   <JsonEvidence label="模型输出摘要" value={call.output_summary_json} />

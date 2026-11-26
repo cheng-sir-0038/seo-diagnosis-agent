@@ -30,6 +30,10 @@
   <img src="frontend/public/workbench-trace.webp" alt="运行链路与工具回执插画" width="340">
 </p>
 
+## 运行架构
+
+[工作台团队](src/agent/workspace/team.py)通过 LangGraph 将一轮请求分派给对应专员，并从执行器保存的路由状态和工具回执恢复。课程页联查时，医药专员先核实公开考纲，再将条款交给 [SEO/GEO 专员](src/seo_agent/specialist.py)，后者读取指定页面并给出修改建议。站点级 SEO 对话直接进入专员的只读诊断，应用修改和发布由独立流程处理。
+
 ## 本地启动
 
 需要 Python 3.11+、Node.js 20.19+ 或 22.12+，以及 npm。首次启动将 [.env.example](.env.example) 复制为 `.env.local`，设置 `DEEPSEEK_API_KEY`，并让 `DATABASE_URL` 中的口令和 `POSTGRES_PASSWORD` 一致。

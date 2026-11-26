@@ -10,6 +10,7 @@ import {
   MenuUnfoldOutlined,
   MessageOutlined,
   MonitorOutlined,
+  PlusOutlined,
   ProfileOutlined,
   QuestionCircleFilled,
   RobotOutlined,
@@ -19,12 +20,11 @@ import {
   UserOutlined,
 } from '@ant-design/icons'
 import { Alert, Button, Drawer, Grid, Input, Tooltip } from 'antd'
-import { type ComponentRef, lazy, Suspense, useEffect, useEffectEvent, useLayoutEffect, useMemo, useReducer, useRef, useState } from 'react'
+import { type ComponentRef, type MouseEvent, lazy, Suspense, useEffect, useEffectEvent, useLayoutEffect, useMemo, useReducer, useRef, useState } from 'react'
 
 import { AssistantRunStatus } from '../components/AssistantRunStatus'
 import { ChatAttachmentControls, DocumentChips } from '../components/ChatAttachments'
-import { ExecutionTimeline } from '../components/ChatRunDetails'
-import { InlineToolResults } from '../components/InlineToolResults'
+import { CitedInlineToolResults, ExecutionTimeline } from '../components/ChatRunDetails'
 import { TravelReceipt } from '../components/TravelReceipt'
 import { ConversationHistory, WorkspaceActivity } from '../components/WorkspaceActivity'
 import { WorkspaceHome } from '../components/WorkspaceHome'
@@ -61,6 +61,7 @@ import type {
   ToolRun,
 } from '../types/agent'
 import type { DocumentSummary } from '../types/workspace'
+import './workspace-conversation.css'
 
 const { TextArea } = Input
 const SpecialistDirectory = lazy(() => import('../components/SpecialistDirectory'))
@@ -80,19 +81,22 @@ const replyLoading = <div className="agent-activity" role="status">正在加载�
 const mathPracticeToolName = 'tal_math_practice'
 const travelReceiptTools = new Set(['travel_weather', 'travel_compare_plans', 'travel_save_plan'])
 
-const views = {
-  '#/tasks': 'tasks',
-  '#/history': 'history',
-  '#/capabilities': 'capabilities',
-  '#/observability': 'observability',
-  '#/knowledge': 'knowledge',
-  '#/sources': 'sources',
+const workspacePages = {
+  chat: { label: '对话工作台', icon: MessageOutlined },
+  tasks: { label: '任务工作台', icon: ProfileOutlined },
+  history: { label: '历史会话', icon: HistoryOutlined },
+  capabilities: { label: 'Agent 能力', icon: ApartmentOutlined },
+  observability: { label: '运行中心', icon: MonitorOutlined },
+  knowledge: { label: '知识库', icon: BookOutlined },
+  sources: { label: '数据源管理', icon: DatabaseOutlined },
 } as const
 
-type WorkspaceView = 'chat' | (typeof views)[keyof typeof views]
+type WorkspaceView = keyof typeof workspacePages
+const workspaceViews = Object.keys(workspacePages) as WorkspaceView[]
 
-function workspaceView(): WorkspaceView {
-  return views[window.location.hash as keyof typeof views] ?? 'chat'
+function workspaceView(hash: string): WorkspaceView {
+  const path = hash.split('?', 1)[0]
+  return workspaceViews.find(view => path === `#/${view}`) ?? 'chat'
 }
 
 const timeLabel = new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit' })
@@ -143,7 +147,7 @@ function ReplyContent({ content, tools, onChooseTravel }: {
 }) {
   const results = (
     <>
-      <InlineToolResults tools={tools?.filter(tool => !travelReceiptTools.has(tool.name))} />
+      <CitedInlineToolResults tools={tools?.filter(tool => !travelReceiptTools.has(tool.name))} />
       <TravelReceipt tools={tools?.filter(tool => travelReceiptTools.has(tool.name))} onChoose={onChooseTravel} />
     </>
   )
@@ -173,7 +177,13 @@ interface ActiveRunConnection extends SavedAgentRun {
 }
 
 interface ConnectionIssue {
+  runId: string
   message: string
+}
+
+interface CreationFailure {
+  message?: string
+  messageId: string
 }
 
 const isRunInProgress = (status: RunState['status']) =>
@@ -193,16 +203,12 @@ function readTurn(detail: AgentRunDetail, saved: SavedAgentRun) {
   })
 }
 
-function storeRunReply(conversation: Conversation, turn: SavedAgentRun, state: RunState): Conversation {
-  const matchesTurn = (message: ChatMessage) => message.role === 'assistant' && message.runId === turn.runId
-    && (message.id === turn.replyId || (message.afterSequence ?? 0) === turn.afterSequence)
-  const existing = conversation.messages.filter(matchesTurn).at(-1)
-  const user = conversation.messages.filter(message => message.role === 'user').at(-1)
+function runReply(turn: SavedAgentRun, state: RunState, existing?: ChatMessage, user?: ChatMessage): ChatMessage {
   const fallback = state.tools.some(tool => tool.status === 'completed')
     ? '已保留本次取得的数据，见下方。'
     : state.status === 'cancelled' ? '本轮已停止。'
       : state.status === 'failed' || state.status === 'recovery_blocked' ? '' : '本轮没有取得可展示的结果。'
-  const message: ChatMessage = {
+  return {
     id: existing?.id ?? turn.replyId ?? (user ? `${user.id}-reply` : `${turn.runId}-reply`),
     role: 'assistant',
     content: state.assistantText || existing?.content || fallback,
@@ -219,6 +225,13 @@ function storeRunReply(conversation: Conversation, turn: SavedAgentRun, state: R
     inputRequest: state.status === 'waiting_for_input' ? state.humanInput : undefined,
     followupKey: state.agentRuns.some(item => item.agent === 'followup') ? turn.followupKey : undefined,
   }
+}
+
+function storeRunReply(conversation: Conversation, turn: SavedAgentRun, state: RunState): Conversation {
+  const existing = conversation.messages.filter(message => message.role === 'assistant' && message.runId === turn.runId
+    && (message.id === turn.replyId || (message.afterSequence ?? 0) === turn.afterSequence)).at(-1)
+  const user = conversation.messages.filter(message => message.role === 'user').at(-1)
+  const message = runReply(turn, state, existing, user)
   return {
     ...conversation,
     activeRun: !isRunInProgress(state.status) && conversation.activeRun?.runId === turn.runId
@@ -234,11 +247,15 @@ export function ChatPage() {
   const [conversations, setConversations] = useState<Conversation[]>(loadConversations)
   const [activeId, setActiveId] = useState(() => loadActiveConversationId(conversations))
   const [drafts, setDrafts] = useState<Record<string, string>>({})
-  const [view, setView] = useState(workspaceView)
+  const [starterChoice, setStarterChoice] = useState<string>()
+  const [creatingRuns, setCreatingRuns] = useState<string[]>([])
+  const [creationFailures, setCreationFailures] = useState<Partial<Record<string, CreationFailure>>>({})
+  const [routeHash, setRouteHash] = useState(() => window.location.hash)
+  const view = workspaceView(routeHash)
   const [run, dispatch] = useReducer((state: RunState, update: AgentEvent | RunState) =>
     'stage' in update ? update : reduceAgentEvent(state, update), initialRunState)
   const [cancelUrl, setCancelUrl] = useState<string>()
-  const [conversationsOpen, setConversationsOpen] = useState(false)
+  const [menuOpen, setMenuOpen] = useState(false)
   const [navCollapsed, setNavCollapsed] = useState(() => localStorage.getItem('workspace-nav-collapsed') === 'true')
   const dialogRef = useRef<HTMLDivElement>(null)
   const [dialogWidth, setDialogWidth] = useState(0)
@@ -250,11 +267,15 @@ export function ChatPage() {
   const [awayFromLatest, setAwayFromLatest] = useState(false)
   const [detailMessageId, setDetailMessageId] = useState<string>()
   const [taskTitle, setTaskTitle] = useState<string>()
+  const [historyTarget, setHistoryTarget] = useState<{ messageId: string }>()
   const [verified, setVerified] = useState<AgentRunDetail>()
+  const [lookupFailure, setLookupFailure] = useState<string>()
+  const [lookupAttempt, setLookupAttempt] = useState(0)
   const [historicDetail, setHistoricDetail] = useState<AgentRunDetail>()
+  const [selectedSnapshot, setSelectedSnapshot] = useState<ChatMessage>()
   const [inspectedRunId, setInspectedRunId] = useState<string | undefined>(() =>
     sessionStorage.getItem(`workspace-task:${activeId}`) ?? undefined)
-  const [connectionIssue, setConnectionIssue] = useState<ConnectionIssue>()
+  const [liveConnectionIssue, setConnectionIssue] = useState<ConnectionIssue>()
   const [reconnecting, setReconnecting] = useState(false)
   const [runStats, setRunStats] = useState<{ runId: string, value: WorkspaceRunStats }>()
   const abortRef = useRef<AbortController | undefined>(undefined)
@@ -265,9 +286,14 @@ export function ChatPage() {
   const inspectedReplyRef = useRef<HTMLElement>(null)
   const composerRef = useRef<ComponentRef<typeof TextArea>>(null)
   const mobileMenuRef = useRef<ComponentRef<typeof Button>>(null)
-  const newConversationRef = useRef<HTMLButtonElement>(null)
+  const navigationRef = useRef<HTMLElement>(null)
+  const mainRef = useRef<HTMLElement>(null)
+  const focusAfterNavigation = useRef<'content' | 'menu' | 'composer' | 'current-link'>(undefined)
+  const pageScroll = useRef(new Map<WorkspaceView, number>())
+  const conversationScroll = useRef<{ id: string, top: number }>(undefined)
   const runRef = useRef(initialRunState)
   const activeIdRef = useRef(activeId)
+  const mountedRef = useRef(false)
   const activeConnectionRef = useRef<ActiveRunConnection | undefined>(undefined)
   const submittingInputs = useRef(new Set<string>())
   const active = conversations.find((item) => item.id === activeId) ?? conversations[0]
@@ -276,54 +302,77 @@ export function ChatPage() {
   const input = drafts[active.id] ?? ''
   const setInput = (value: string) => setDrafts(items => ({ ...items, [active.id]: value }))
   const replies = active.messages.filter(message => message.role === 'assistant')
-  const latestAssistant = replies.at(-1)
-  const inspectedReply = inspectedRunId ? replies.filter(message => message.runId === inspectedRunId).at(-1) : undefined
-  const taskReply = inspectedRunId ? inspectedReply : latestAssistant
-  const awaitingFollowup = !!taskReply?.inputRequest && !!taskReply.followupKey
+  const lastMessage = active.messages.at(-1)
+  const latestAssistant = lastMessage?.role === 'assistant' ? lastMessage : undefined
+  const creatingHere = creatingRuns.includes(active.id)
+  const creationFailure = creationFailures[active.id]
+  const running = isRunInProgress(run.status) || creatingHere || Boolean(active.activeRun)
+  const conversationRunId = active.activeRun?.runId ?? pendingSubmission?.runId
+    ?? run.runId ?? (running ? undefined : latestAssistant?.runId)
+  const inspectingTask = Boolean(inspectedRunId)
+  const inspectingOtherRun = inspectingTask && inspectedRunId !== conversationRunId
+  const readingHistory = Boolean(historyTarget)
+  // Selecting a receipt does not transfer ownership of the conversation's live connection.
+  const readOnly = readingHistory || inspectingOtherRun && (running || !!pendingSubmission || reconnecting)
+  const actionRunId = inspectedRunId ?? conversationRunId
+  const storedTaskReply = actionRunId ? replies.filter(message => message.runId === actionRunId).at(-1)
+    : running ? undefined : latestAssistant
+  const snapshotReply = inspectedRunId && selectedSnapshot?.runId === inspectedRunId ? selectedSnapshot : undefined
+  const taskReply = snapshotReply ?? storedTaskReply
+  const historyIndex = historyTarget ? active.messages.findIndex(message => message.id === historyTarget.messageId) : -1
+  const historyMatch = historyIndex >= 0 ? active.messages[historyIndex] : undefined
+  const nextHistoryMessage = active.messages[historyIndex + 1]
+  const historyReply = historyMatch?.role === 'assistant' ? historyMatch
+    : historyMatch && nextHistoryMessage?.role === 'assistant' ? nextHistoryMessage : undefined
+  const connectionIssue = liveConnectionIssue?.runId === actionRunId ? liveConnectionIssue : undefined
+  const creationError = !running && !inspectingTask && !pendingSubmission ? creationFailure?.message : undefined
+  const currentStatus = readingHistory ? replyStatus(historyReply) ?? 'idle'
+    : running && !inspectingOtherRun ? (isRunInProgress(run.status) ? run.status : 'pending')
+      : run.status !== 'idle' && run.runId === actionRunId ? run.status : replyStatus(taskReply) ?? 'idle'
+  const waitingRequest = !readOnly && currentStatus === 'waiting_for_input' ? taskReply?.inputRequest : undefined
+  const awaitingFollowup = !!waitingRequest && !!taskReply?.followupKey
   const followupPanels = new Map<string, string>()
   for (const message of active.messages) {
     if (message.runId && message.followupKey) followupPanels.set(message.runId, message.id)
   }
-  const awaitingPractice = !!taskReply?.inputRequest
-    && taskReply.toolResults?.some(tool => tool.name === mathPracticeToolName)
-  const running = isRunInProgress(run.status)
-  const lastMessage = active.messages.at(-1)
+  const awaitingPractice = !!waitingRequest
+    && taskReply?.toolResults?.some(tool => tool.name === mathPracticeToolName)
   const lastUser = active.messages.filter(message => message.role === 'user').at(-1)
-  const currentReplyId = !running && run.runId && lastMessage?.role === 'assistant' && lastMessage.runId === run.runId
-    ? lastMessage.id
-    : undefined
-  const showLiveReply = running || Boolean(!currentReplyId && run.runId
-    && (run.assistantText || run.tools.length || run.agentRuns.length))
   const liveId = active.activeRun?.replyId ?? `${lastUser?.id}-reply`
+  const currentReplyId = !running && run.runId
+    ? replies.filter(reply => reply.runId === run.runId).at(-1)?.id : undefined
   const liveMessage: ChatMessage = { id: liveId, role: 'assistant', createdAt: '', content: run.assistantText,
     agentRuns: run.agentRuns, toolResults: run.tools, runId: run.runId }
-  const messages = !showLiveReply ? active.messages : active.messages.some(item => item.id === liveId)
-    ? active.messages.map(item => item.id === liveId ? liveMessage : item) : [...active.messages, liveMessage]
+  const storedSnapshot = snapshotReply && active.messages.find(message => message.id === snapshotReply.id)
+  const transcript = !snapshotReply ? active.messages : storedSnapshot
+    ? active.messages.map(message => message.id === snapshotReply.id ? snapshotReply : message)
+    : [...active.messages, snapshotReply]
+  const messages = !running ? transcript : transcript.some(item => item.id === liveId)
+    ? transcript.map(item => item.id === liveId ? liveMessage : item) : [...transcript, liveMessage]
   const visibleMessages = messages.filter(item => !(item.runStatus === 'recovery_blocked'
     && item.afterSequence && !item.content && !item.toolResults?.length))
-  const emptyConversation = active.messages.length === 0 && !run.assistantText && run.tools.length === 0
+  const inspectedReply = historyMatch ?? (inspectingTask && (inspectingOtherRun || !running) ? taskReply : undefined)
+  const inspectedMessageId = visibleMessages.some(item => item.id === inspectedReply?.id) ? inspectedReply?.id : undefined
+  const emptyConversation = active.messages.length === 0 && !run.assistantText && run.tools.length === 0 && !inspectingTask
   const uploadingHere = uploading.includes(active.id)
-  const canAttach = !running && !pendingSubmission && !taskReply?.inputRequest && !active.activeRun
+  const taskUnavailable = inspectingTask && !running && !taskReply
+  const canAttach = !readOnly && !running && !pendingSubmission && !waitingRequest && !taskUnavailable && !reconnecting
   const isConversation = view === 'chat' && !emptyConversation
   const { lg, xxl } = Grid.useBreakpoint()
   const showHistory = historyOpen ?? Boolean(lg)
   const dockHistory = lg && showHistory
   const dockDetails = dialogWidth >= (dockHistory ? 1310 : 1080)
   const showDetails = detailsOpen ?? Boolean(xxl && dockDetails)
-  const currentStatus = run.status === 'idle' || (inspectedRunId && inspectedRunId !== run.runId && !running)
-    ? replyStatus(taskReply) ?? 'idle'
-    : run.status
-  const partial = currentStatus === 'completed' && (run.runId === taskReply?.runId && run.status !== 'idle' ? run.partial : taskReply?.partial)
-  const [statusLabel, statusTone] = taskStatus(currentStatus, partial)
-  const pendingInput = running || pendingSubmission || awaitingFollowup || currentStatus !== 'waiting_for_input'
-    ? undefined : taskReply?.inputRequest
+  const partial = currentStatus === 'completed' && (readingHistory ? historyReply?.partial : taskReply?.partial)
+  const [statusLabel, statusTone] = taskStatus(creationError ? 'failed' : currentStatus, partial)
+  const pendingInput = pendingSubmission || awaitingFollowup ? undefined : waitingRequest
   const failed = currentStatus === 'failed' || currentStatus === 'recovery_blocked'
-  const actionRunId = inspectedRunId ?? run.runId ?? taskReply?.runId
   const firstReplyIndex = actionRunId ? active.messages.findIndex(message => message.runId === actionRunId) : -1
   const taskQuestion = firstReplyIndex >= 0
-    ? active.messages.slice(0, firstReplyIndex).reverse().find(message => message.role === 'user') : lastUser
-  const heading = taskTitle ?? (taskQuestion?.documents?.length ? '资料问答' : taskQuestion?.content.slice(0, 120)) ?? active.title
-  const canResume = failed && !pendingSubmission && verified?.id === actionRunId && !!verified?.checkpoint
+    ? active.messages.slice(0, firstReplyIndex).filter(message => message.role === 'user').at(-1) : lastUser
+  const heading = (inspectingTask ? taskTitle : undefined) ?? (readingHistory ? active.title : undefined)
+    ?? (taskQuestion?.documents?.length ? '资料问答' : taskQuestion?.content.slice(0, 120)) ?? active.title
+  const canResume = !readOnly && !running && failed && !pendingSubmission && verified?.id === actionRunId && !!verified?.checkpoint
     && ['FAILED', 'RECOVERY_BLOCKED'].includes(verified.status.toUpperCase())
   const conversationsByRun = useMemo(() => {
     const byRun = new Map<string, Conversation>()
@@ -338,26 +387,118 @@ export function ChatPage() {
     return byRun
   }, [conversations, view])
 
-  useEffect(() => {
-    const followRoute = () => {
-      setView(workspaceView())
-      setConversationsOpen(false)
+  const updateRoute = (nextHash: string) => {
+    if (workspaceView(nextHash) !== view) {
+      const page = mainRef.current?.querySelector<HTMLElement>('.workspace-scroll')
+      if (page) pageScroll.current.set(view, page.scrollTop)
+      const transcript = messagesRef.current
+      if (view === 'chat' && transcript) {
+        conversationScroll.current = followLatest.current ? undefined : { id: active.id, top: transcript.scrollTop }
+      }
+      focusAfterNavigation.current ??= 'content'
+      setMenuOpen(false)
     }
-    window.addEventListener('hashchange', followRoute)
-    return () => window.removeEventListener('hashchange', followRoute)
+    setRouteHash(nextHash)
+  }
+
+  const followRoute = useEffectEvent(() => updateRoute(window.location.hash))
+  useEffect(() => {
+    const onLocationChange = () => followRoute()
+    window.addEventListener('hashchange', onLocationChange)
+    return () => window.removeEventListener('hashchange', onLocationChange)
   }, [])
 
-  useEffect(() => {
-    if (!conversationsOpen) return
-    newConversationRef.current?.focus()
-    const onEscape = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return
-      setConversationsOpen(false)
-      mobileMenuRef.current?.focus()
+  useLayoutEffect(() => {
+    const pane = mainRef.current?.querySelector<HTMLElement>('.workspace-scroll')
+    const top = pageScroll.current.get(view) ?? 0
+    if (!pane || !top) return
+    pane.scrollTop = top
+    if (pane.scrollTop >= top) return
+
+    // A lazy page may initially render only a loading message. Wait for its content unless the user intervenes.
+    const stop = () => {
+      observer.disconnect()
+      for (const event of ['wheel', 'pointerdown', 'keydown']) pane.removeEventListener(event, stop)
     }
-    window.addEventListener('keydown', onEscape)
-    return () => window.removeEventListener('keydown', onEscape)
-  }, [conversationsOpen])
+    const observer = new MutationObserver(() => {
+      if (pane.scrollHeight - pane.clientHeight < top) return
+      pane.scrollTop = top
+      stop()
+    })
+    observer.observe(pane, { childList: true, subtree: true })
+    for (const event of ['wheel', 'pointerdown', 'keydown']) pane.addEventListener(event, stop, { passive: true })
+    return stop
+  }, [view])
+
+  const closeMenu = (focus: 'menu' | 'content' | 'composer') => {
+    focusAfterNavigation.current = focus
+    setMenuOpen(false)
+  }
+
+  const activatePage = (event: MouseEvent<HTMLAnchorElement>, page: WorkspaceView) => {
+    if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return
+    if (page === view) {
+      event.preventDefault()
+      if (menuOpen) closeMenu('content')
+    }
+  }
+
+  useLayoutEffect(() => {
+    const currentLink = navigationRef.current?.querySelector<HTMLElement>('a[aria-current="page"]')
+    if (menuOpen) {
+      currentLink?.focus()
+      // A mobile rail can still be hidden before its opening styles take effect.
+      if (document.activeElement === currentLink) return
+      const frame = requestAnimationFrame(() => currentLink?.focus())
+      return () => cancelAnimationFrame(frame)
+    }
+    const destination = focusAfterNavigation.current
+    focusAfterNavigation.current = undefined
+    if (destination === 'menu') mobileMenuRef.current?.focus({ preventScroll: true })
+    else if (destination === 'current-link') currentLink?.focus({ preventScroll: true })
+    else if (destination === 'composer' && composerRef.current) composerRef.current.focus({ preventScroll: true })
+    else if (destination) mainRef.current?.focus({ preventScroll: true })
+  }, [menuOpen, view, active.id])
+
+  useEffect(() => {
+    if (!menuOpen) return
+    const mobile = window.matchMedia('(max-width: 840px)')
+    const closeOnDesktop = (event: MediaQueryListEvent) => {
+      if (event.matches) return
+      focusAfterNavigation.current = 'current-link'
+      setMenuOpen(false)
+    }
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        focusAfterNavigation.current = 'menu'
+        setMenuOpen(false)
+        return
+      }
+      if (event.key !== 'Tab') return
+      const controls = navigationRef.current?.querySelectorAll<HTMLElement>('a[href], button:not([hidden])')
+      const first = controls?.[0]
+      const last = controls?.[controls.length - 1]
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last?.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first?.focus()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    mobile.addEventListener('change', closeOnDesktop)
+    return () => {
+      window.removeEventListener('keydown', onKey)
+      mobile.removeEventListener('change', closeOnDesktop)
+    }
+  }, [menuOpen])
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => { mountedRef.current = false }
+  }, [])
 
   useEffect(() => {
     saveConversations(conversations)
@@ -373,13 +514,28 @@ export function ChatPage() {
     const pane = messagesRef.current
     if (!isConversation || !pane) return
     const inspected = inspectedReplyRef.current
+    const saved = conversationScroll.current
+    conversationScroll.current = undefined
     messageListRef.current?.style.removeProperty('min-height')
     readingResult.current = Boolean(inspected)
-    followLatest.current = !inspected
-    pane.scrollTop = inspected
-      ? pane.scrollTop + inspected.getBoundingClientRect().bottom - pane.getBoundingClientRect().bottom
-      : pane.scrollHeight
-  }, [isConversation, active.id, inspectedReply?.id])
+    followLatest.current = !inspected && saved?.id !== active.id
+    const align = () => {
+      if (inspected && readingResult.current) {
+        pane.scrollTop += inspected.getBoundingClientRect().top - pane.getBoundingClientRect().top - 18
+      }
+    }
+    if (!inspected) {
+      pane.scrollTop = saved?.id === active.id ? saved.top : pane.scrollHeight
+      return
+    }
+    align()
+    inspected.focus({ preventScroll: true })
+    const list = messageListRef.current
+    if (!list) return
+    const observer = new ResizeObserver(align)
+    observer.observe(list)
+    return () => observer.disconnect()
+  }, [isConversation, active.id, inspectedMessageId, historyTarget])
 
   useLayoutEffect(() => {
     const dialog = dialogRef.current
@@ -534,6 +690,7 @@ export function ChatPage() {
         persistRunResult(connection)
       } else {
         setConnectionIssue({
+          runId: connection.runId,
           message: '连接已中断，任务可能仍在后台执行',
         })
       }
@@ -565,7 +722,7 @@ export function ChatPage() {
       && item.payload.request_id === submission.requestId)
     const prior = replies.filter(reply => reply.runId === submission.runId
       && reply.inputRequest?.requestId === submission.requestId).at(-1)
-    const isCurrent = activeIdRef.current === active.id
+    const isCurrent = mountedRef.current && activeIdRef.current === active.id
 
     if (detail && submitted && submitted.payload.answer === user.content
       && (submitted.payload.action ?? 'answer') === submission.action) {
@@ -611,7 +768,7 @@ export function ChatPage() {
       setInput(draft ?? (submission.action === 'answer' && !prior?.followupKey ? user.content : ''))
     }
     if (!isCurrent) return
-    setInspectedRunId(submission.runId)
+    setInspectedRunId(current => current ?? submission.runId)
     resetRun('idle')
     showDocumentError(changed ? '补充请求已更新，请查看本次任务。'
       : cause instanceof Error ? cause.message : '补充尚未保存，请重新提交。')
@@ -638,7 +795,7 @@ export function ChatPage() {
       return
     }
     const saved = active.activeRun
-    if (activeConnectionRef.current || !saved) return
+    if (creatingHere || activeConnectionRef.current || !saved) return
     resetRun('pending', saved)
     void attachRun(saved, active.id)
   })
@@ -648,6 +805,8 @@ export function ChatPage() {
     const restoreTimer = window.setTimeout(restoreActiveRun, 0)
     return () => {
       window.clearTimeout(restoreTimer)
+      // Selection already detached the previous stream. Leave a newly attached stream alone.
+      if (activeIdRef.current !== activeId) return
       abortRef.current?.abort()
       abortRef.current = undefined
       activeConnectionRef.current = undefined
@@ -655,7 +814,7 @@ export function ChatPage() {
   }, [activeId])
 
   const reconnectActiveRun = async (retry = false) => {
-    if (reconnecting || (retry && (!canResume || !actionRunId))) return
+    if (readOnly || reconnecting || (retry && (!canResume || !actionRunId))) return
     let connection = activeConnectionRef.current
     if (retry && actionRunId) {
       const reply = taskReply?.runId === actionRunId ? taskReply : undefined
@@ -663,7 +822,7 @@ export function ChatPage() {
       connection = { ...turn, conversationId: active.id, lastEventId: turn.afterSequence }
       activeConnectionRef.current = connection
     }
-    if (!connection) return
+    if (!connection || connection.conversationId !== active.id || connection.runId !== actionRunId) return
     setReconnecting(true)
     setConnectionIssue(undefined)
     try {
@@ -698,6 +857,7 @@ export function ChatPage() {
         }
       }
       setConnectionIssue({
+        runId: connection.runId,
         message: (cause as Error).message || '重新连接失败',
       })
       setReconnecting(false)
@@ -726,8 +886,8 @@ export function ChatPage() {
     const content = followupAction ?? (action === 'use_available'
       ? '请先用现有事实生成草稿，未确认的内容保留待补充，结束本轮追问。'
       : input.trim() || (documents.length ? '请概括所选资料，并给出关键事实及出处。' : ''))
-    if (!content || running || pendingSubmission || submittingInputs.current.has(active.id)
-      || reconnecting || uploadingHere || (inspectedRunId && !taskReply)) return
+    if (!content || readOnly || running || isRunInProgress(runRef.current.status) || pendingSubmission
+      || submittingInputs.current.has(active.id) || reconnecting || uploadingHere || taskUnavailable) return
 
     followLatest.current = true
     readingResult.current = false
@@ -735,6 +895,12 @@ export function ChatPage() {
     setAwayFromLatest(false)
     setDetailMessageId(undefined)
     setTaskTitle(undefined)
+    setStarterChoice(undefined)
+    if (creationFailure) setCreationFailures(failures => {
+      const remaining = { ...failures }
+      delete remaining[active.id]
+      return remaining
+    })
     setInput('')
     setInspectedRunId(undefined)
     setConnectionIssue(undefined)
@@ -747,17 +913,19 @@ export function ChatPage() {
       createdAt: new Date().toISOString(),
       ...(documents.length ? { documents } : {}),
     }
-    const history = [...active.messages, userMessage]
-    const request = currentStatus === 'waiting_for_input' ? taskReply?.inputRequest : undefined
+    // Replace a rejected create attempt when the user retries it.
+    const history = [...active.messages.filter(message => message.id !== creationFailure?.messageId), userMessage]
+    const request = waitingRequest
     const previousRunId = taskReply?.runId
     const submission = request && previousRunId
       ? { runId: previousRunId, requestId: request.requestId, messageId: userMessage.id, action }
       : undefined
     const prior = submission ? { priorAgentRuns: taskReply?.agentRuns, priorSkills: taskReply?.skills } : undefined
     if (submission) submittingInputs.current.add(active.id)
+    else setCreatingRuns(ids => [...ids, active.id])
     setActiveConversation((conversation) => ({
       ...conversation,
-      title: conversation.messages.length === 0 ? content.slice(0, 28) : conversation.title,
+      title: history.length === 1 ? content.slice(0, 28) : conversation.title,
       messages: history,
       pendingInputSubmission: submission,
       updatedAt: new Date().toISOString(),
@@ -788,43 +956,39 @@ export function ChatPage() {
         pendingInputSubmission: undefined,
         ...(documents.length ? { draftDocuments: [] } : {}),
       }))
-      if (activeIdRef.current === active.id) void attachRun(saved, active.id)
+      if (mountedRef.current && activeIdRef.current === active.id) {
+        resetRun('pending', saved)
+        void attachRun(saved, active.id)
+      }
     } catch (cause) {
       if (submission) {
         await reconcileInputSubmission(submission, userMessage, cause, input)
         return
       }
-      if (documents.length) {
-        setActiveConversation(conversation => ({
-          ...conversation, title: active.title, updatedAt: active.updatedAt,
-          messages: conversation.messages.filter(message => message.id !== userMessage.id),
-        }))
-        setInput(input)
-      }
-      if (activeIdRef.current !== active.id) return
-      applyEvent({
-        event_id: crypto.randomUUID(),
-        run_id: '',
-        type: 'run.failed',
-        sequence: runRef.current.lastSequence + 1,
-        created_at: new Date().toISOString(),
-        payload: { message: (cause as Error).message },
-      })
+      // Keep the failed attempt in history so its draft can be reopened after switching away.
+      setInput(input)
+      setCreationFailures(failures => ({ ...failures, [active.id]: {
+        messageId: userMessage.id,
+        message: cause instanceof Error ? cause.message : '创建 Agent 运行失败，请重试。',
+      } }))
+      if (mountedRef.current && activeIdRef.current === active.id) resetRun('idle')
     } finally {
       if (submission) submittingInputs.current.delete(active.id)
+      else setCreatingRuns(ids => ids.filter(id => id !== active.id))
     }
   }
 
   const stop = async () => {
     const connection = activeConnectionRef.current
-    if (!connection || !cancelUrl) return
+    if (readOnly || !running || !connection || connection.conversationId !== active.id
+      || connection.runId !== actionRunId || connection.cancelUrl !== cancelUrl) return
     try {
-      const receipt = await cancelAgentRun(cancelUrl)
+      const receipt = await cancelAgentRun(connection.cancelUrl)
       // A completion can win the race with a stop. Keep its actual terminal event.
       if (receipt.status !== 'cancelled') return
     } catch (cause) {
       if (activeConnectionRef.current === connection) {
-        setConnectionIssue({ message: (cause as Error).message })
+        setConnectionIssue({ runId: connection.runId, message: (cause as Error).message })
       }
       return
     }
@@ -843,21 +1007,25 @@ export function ChatPage() {
     persistRunResult(connection)
   }
 
-  const selectConversation = (id: string, runId?: string, title?: string) => {
-    setConversationsOpen(false)
+  const selectConversation = (id: string, runId?: string, title?: string, messageId?: string) => {
+    conversationScroll.current = undefined
     if (!lg) setHistoryOpen(false)
     setTaskTitle(title)
+    if (runId !== inspectedRunId || id !== active.id) setSelectedSnapshot(undefined)
+    setHistoryTarget(messageId ? { messageId } : undefined)
     setDetailMessageId(undefined)
     setAwayFromLatest(false)
     setLibraryOpen(false)
+    setStarterChoice(undefined)
     setInspectedRunId(runId)
     if (view !== 'chat') {
-      setView('chat')
       window.location.hash = '#/chat'
+      updateRoute('#/chat')
     }
     if (activeIdRef.current === id) return
     activeIdRef.current = id
     abortRef.current?.abort()
+    abortRef.current = undefined
     setActiveId(id)
     setCancelUrl(undefined)
     setConnectionIssue(undefined)
@@ -866,8 +1034,32 @@ export function ChatPage() {
     resetRun('idle')
   }
 
-  const composer = awaitingFollowup && !pendingSubmission && !running && !connectionIssue && !failed ? (
-    <div className="chat-composer-wrap"><small>通过上方的复诊资料区继续本次整理。</small></div>
+  const openHistoryConversation = (id: string, messageId?: string) => selectConversation(id, undefined, undefined, messageId)
+  const returnToConversation = () => selectConversation(active.id)
+  const returnToLive = (
+    <Button size="small" onClick={returnToConversation}>{running ? '返回当前任务' : '返回当前对话'}</Button>
+  )
+
+  const startNewTask = waitingRequest && !pendingSubmission && !reconnecting && (
+    <Button type="link" size="small" onClick={newConversation}>开始新任务</Button>
+  )
+  const composer = readOnly || taskUnavailable ? (
+    <div className="chat-composer-wrap">
+      <div className="workspace-receipt-notice">
+        <span role="status">{readingHistory ? '正在查看历史搜索结果。'
+          : running || pendingSubmission || reconnecting ? '正在查看所选任务。返回当前对话可操作正在处理的任务。'
+            : lookupFailure === actionRunId || verified?.id === actionRunId ? '暂时无法读取所选任务。' : '正在读取所选任务…'}</span>
+        {taskUnavailable && (lookupFailure === actionRunId || verified?.id === actionRunId) && <Button size="small" onClick={() => {
+          setLookupFailure(undefined)
+          setLookupAttempt(count => count + 1)
+        }}>重试</Button>}
+        {returnToLive}
+      </div>
+    </div>
+  ) : awaitingFollowup && !pendingSubmission && !running && !connectionIssue && !failed ? (
+    <div className="chat-composer-wrap">
+      <small>通过上方的复诊资料区继续本次整理。</small>{startNewTask}{inspectingOtherRun && returnToLive}
+    </div>
   ) : (
     <div className="chat-composer-wrap">
       {pendingSubmission && !running && (
@@ -899,18 +1091,45 @@ export function ChatPage() {
             <Button size="small" loading={reconnecting} onClick={() => void reconnectActiveRun(true)}>
               恢复任务
             </Button>
+          ) : lookupFailure === actionRunId && lookupFailure ? (
+            <Button size="small" onClick={() => { setLookupFailure(undefined); setLookupAttempt(count => count + 1) }}>
+              重查恢复状态
+            </Button>
           ) : undefined}
         />
       ) : null}
       {documentError?.conversationId === active.id && (
         <Alert type="error" showIcon title={documentError.message} closable onClose={() => setDocumentError(undefined)} />
       )}
+      {creationFailure && creationError && (
+        <Alert type="error" showIcon title={creationError} closable onClose={() => {
+          setCreationFailures(failures => ({ ...failures, [active.id]: { messageId: creationFailure.messageId } }))
+        }} />
+      )}
+      {starterChoice && (
+        <Alert type="warning" title="要用示例替换当前草稿吗？"
+          description={draftDocuments.length ? '替换会从这次草稿移除附件，知识库中的文件仍然保留。' : undefined} action={(
+          <>
+            <Button size="small" onClick={() => setStarterChoice(undefined)}>保留草稿</Button>
+            <Button size="small" onClick={() => {
+              setInput(starterChoice)
+              if (draftDocuments.length) setActiveConversation(conversation => ({ ...conversation, draftDocuments: [] }))
+              setStarterChoice(undefined)
+              composerRef.current?.focus({ cursor: 'end' })
+            }}>替换草稿</Button>
+          </>
+        )} />
+      )}
       <div className={`workspace-input-surface${pendingInput ? ' awaiting-input' : ''}`}>
         {pendingInput && (
           <div className="workspace-input-request">
             <h2><QuestionCircleFilled aria-hidden="true" />{awaitingPractice ? '等待作答' : '等待补充'}</h2>
             {pendingInput.questions.length > 0 && (
-              <ul>{pendingInput.questions.map((question, index) => <li key={index}>{question}</li>)}</ul>
+              <div id="workspace-pending-questions" className="workspace-pending-questions">
+                {pendingInput.questions.length === 1 ? <p>{pendingInput.questions[0]}</p> : (
+                  <ul>{pendingInput.questions.map((question, index) => <li key={index}>{question}</li>)}</ul>
+                )}
+              </div>
             )}
           </div>
         )}
@@ -929,6 +1148,7 @@ export function ChatPage() {
             name="message"
             autoComplete="off"
             aria-label="给业务助理发送消息"
+            aria-describedby={pendingInput?.questions.length ? 'workspace-pending-questions' : undefined}
             value={input}
             disabled={running || Boolean(pendingSubmission) || awaitingFollowup || reconnecting}
             placeholder={awaitingPractice ? '输入选项字母、跳过或结束练习'
@@ -954,7 +1174,7 @@ export function ChatPage() {
                 type="primary"
                 icon={<SendOutlined />}
                 disabled={(!input.trim() && (!canAttach || !draftDocuments.length))
-                  || Boolean(pendingSubmission) || awaitingFollowup || uploadingHere || reconnecting}
+                  || Boolean(pendingSubmission) || awaitingFollowup || uploadingHere || reconnecting || taskUnavailable}
                 onClick={() => void send()}
               />
             </Tooltip>
@@ -968,21 +1188,25 @@ export function ChatPage() {
                 先用现有信息生成
               </Button>
             )}
+            {startNewTask}
+            {inspectingOtherRun && returnToLive}
           </small>
         )}
       </div>
     </div>
   )
 
-  const detailReply = replies.find(message => message.id === detailMessageId) ?? taskReply
-  const liveDetails = !detailMessageId && (!inspectedReply || inspectedRunId === run.runId) && showLiveReply
+  const detailReply = detailMessageId ? visibleMessages.find(message => message.id === detailMessageId)
+    : readingHistory ? historyReply : taskReply
+  const liveDetails = running && (detailMessageId ? detailMessageId === liveId : !inspectingOtherRun && !readingHistory)
   const recordedTools = liveDetails || (currentReplyId && detailReply?.id === currentReplyId) ? run.tools : detailReply?.toolResults
   const detailStatus = replyStatus(detailReply)
   const statsRunId = view === 'chat' && showDetails && !liveDetails ? detailReply?.runId : undefined
-  const lookupId = isConversation && !running && !pendingSubmission
-    ? (inspectedRunId ?? (failed || run.status === 'idle' ? actionRunId : undefined) ?? statsRunId) : undefined
+  const lookupId = isConversation && !readingHistory
+    && (inspectingOtherRun || !running && !pendingSubmission && (inspectingTask || failed || run.status === 'idle'))
+    ? actionRunId : undefined
   const syncStoredReply = useEffectEvent((detail: AgentRunDetail) => {
-    if (!detail.events?.length || pendingSubmission || activeConnectionRef.current && abortRef.current) return
+    if (detail.id !== actionRunId || !detail.events?.length) return
     const submitted = detail.events.filter(item => (item.event_type ?? item.type) === 'input.submitted').at(-1)
     const afterSequence = submitted?.sequence ?? 0
     const runReplies = replies.filter(reply => reply.runId === detail.id)
@@ -1000,19 +1224,27 @@ export function ChatPage() {
     const replyId = previous?.id ?? (user ? `${user.id}-reply` : `${detail.id}-${afterSequence}-reply`)
     const saved = savedTurn(detail.id, afterSequence, replyId, question ?? previous)
     const state = readTurn(detail, saved)
+    const upToDate = previous && previous.runStatus === state.status && previous.error === state.error
+      && previous.inputRequest?.requestId === state.humanInput?.requestId && !!previous.partial === !!state.partial
+      && (previous.throughSequence ?? state.lastSequence) >= state.lastSequence
+    if (readOnly || inspectingOtherRun && !previous && !isRunInProgress(state.status)) {
+      // Keep the selected receipt separate while another turn owns the live connection.
+      setSelectedSnapshot(upToDate ? undefined : runReply(saved, state, previous))
+      return
+    }
+    setSelectedSnapshot(undefined)
+    if (pendingSubmission || running || reconnecting || isRunInProgress(runRef.current.status)) return
     const withAnswer = (conversation: Conversation) => recoveredAnswer
       && !conversation.messages.some(message => message.id === recoveredAnswer.id)
       ? { ...conversation, messages: [...conversation.messages, recoveredAnswer] } : conversation
     if (isRunInProgress(state.status)) {
-      if (active.activeRun || !inspectedRunId && runReplies.at(-1) !== latestAssistant) return
+      if (!inspectingTask && runReplies.at(-1) !== latestAssistant) return
       setActiveConversation(conversation => ({ ...withAnswer(conversation), activeRun: saved }))
       resetRun('pending', saved)
       void attachRun(saved, active.id)
       return
     }
-    if (previous && previous.runStatus === state.status && previous.error === state.error
-      && previous.inputRequest?.requestId === state.humanInput?.requestId && !!previous.partial === !!state.partial
-      && (previous.throughSequence ?? state.lastSequence) >= state.lastSequence) return
+    if (upToDate) return
     setActiveConversation(conversation => storeRunReply(withAnswer(conversation), saved, state))
     if (runRef.current.runId === detail.id && runRef.current.status !== state.status) {
       runRef.current = state
@@ -1023,12 +1255,15 @@ export function ChatPage() {
     if (!lookupId) return
     const request = new AbortController()
     void getAgentRun(lookupId, request.signal).then(detail => {
-      if (request.signal.aborted || detail?.id !== lookupId) return
+      if (request.signal.aborted || activeIdRef.current !== active.id || detail?.id !== lookupId) return
       setVerified(detail)
+      setLookupFailure(undefined)
       syncStoredReply(detail)
-    }).catch(() => undefined)
+    }).catch(() => {
+      if (!request.signal.aborted) setLookupFailure(lookupId)
+    })
     return () => request.abort()
-  }, [lookupId, currentStatus, active.id, view])
+  }, [lookupId, readOnly, active.id, view, lookupAttempt])
   useEffect(() => {
     if (!statsRunId || statsRunId === lookupId) return
     const request = new AbortController()
@@ -1057,11 +1292,12 @@ export function ChatPage() {
     return () => request.abort()
   }, [statsRunId, detailStatus])
   const detailStats = runStats?.runId === statsRunId ? runStats?.value : undefined
-  const replyIndex = detailReply ? active.messages.indexOf(detailReply) : -1
-  const relatedTurn = active.messages.slice(0, !liveDetails && replyIndex >= 0 ? replyIndex : undefined)
-    .reverse().find(message => message.role === 'user')
+  const replyIndex = detailReply ? active.messages.findIndex(message => message.id === detailReply.id) : -1
+  const relatedTurn = liveDetails ? lastUser : replyIndex >= 0
+    ? active.messages.slice(0, replyIndex).reverse().find(message => message.role === 'user') : undefined
   const timeline = (
     <ExecutionTimeline
+      key={liveDetails ? liveId : detailReply?.id}
       stage={liveDetails ? run.stage : detailStatus && taskStatus(detailStatus, detailReply?.partial)[0]}
       started={Boolean(liveDetails || detailReply?.runId)}
       agentRuns={liveDetails ? run.agentRuns : detailReply?.agentRuns}
@@ -1078,45 +1314,45 @@ export function ChatPage() {
   )
 
   return (
-    <div className={`chat-workspace${navCollapsed ? ' workspace-nav-compact' : ''}${isConversation ? ' workspace-in-conversation' : ''}${view === 'observability' ? ' workspace-observing' : ''}${conversationsOpen ? ' conversations-open' : ''}`}>
-      <a className="workspace-skip" href="#workspace-main" onClick={event => {
+    <div className={`chat-workspace${navCollapsed ? ' workspace-nav-compact' : ''}${isConversation ? ' workspace-in-conversation' : ''}${menuOpen ? ' conversations-open' : ''}`}>
+      <a className="workspace-skip" tabIndex={menuOpen ? -1 : undefined} href="#workspace-main" onClick={event => {
         event.preventDefault()
-        document.getElementById('workspace-main')?.focus()
-      }}>跳到工作区</a>
-      <button type="button" className="chat-panel-backdrop" aria-label="关闭导航" tabIndex={-1} onClick={() => {
-        setConversationsOpen(false)
-        mobileMenuRef.current?.focus()
-      }} />
-      <aside className="chat-conversations" aria-label="工作台侧栏">
+        mainRef.current?.focus({ preventScroll: true })
+      }}>跳到当前页面</a>
+      <div className="chat-panel-backdrop" aria-hidden="true" onClick={() => closeMenu('menu')} />
+      <aside ref={navigationRef} id="workspace-sidebar" className="chat-conversations" aria-label="工作台菜单"
+        role={menuOpen ? 'dialog' : undefined} aria-modal={menuOpen || undefined}>
         <div className="workspace-brand">
           <img src={`${import.meta.env.BASE_URL}workbench-mark.webp`} width={36} height={36} alt="" />
           <strong>AI Agent 工作台</strong>
+          <button type="button" className="workspace-menu-close" aria-label="关闭工作台菜单" hidden={!menuOpen}
+            onClick={() => closeMenu('menu')}><CloseOutlined aria-hidden="true" /></button>
         </div>
         <nav id="workspace-global-nav" className="workspace-actions" aria-label="工作台导航">
-          <button ref={newConversationRef} type="button" className="new-conversation" aria-label="新建对话" title="新建对话" onClick={newConversation}>
-            <MessageOutlined aria-hidden="true" /><span>新建对话</span>
+          <button type="button" className="new-conversation" aria-label="新建对话" title="新建对话" onClick={() => {
+            if (view !== 'chat') {
+              focusAfterNavigation.current = 'composer'
+            } else if (menuOpen) {
+              closeMenu('composer')
+            } else {
+              requestAnimationFrame(() => composerRef.current?.focus({ preventScroll: true }))
+            }
+            newConversation()
+          }}>
+            <PlusOutlined aria-hidden="true" /><span>新建对话</span>
           </button>
-          <a href="#/tasks" aria-label="任务工作台" title="任务工作台" aria-current={view === 'tasks' ? 'page' : undefined}>
-            <ProfileOutlined aria-hidden="true" /><span>任务工作台</span>
-          </a>
-          <a href="#/history" aria-label="历史会话" title="历史会话" aria-current={view === 'history' ? 'page' : undefined}>
-            <HistoryOutlined aria-hidden="true" /><span>历史会话</span>
-          </a>
-          <a href="#/capabilities" aria-label="Agent 能力" title="Agent 能力" aria-current={view === 'capabilities' ? 'page' : undefined}
-            onClick={() => setConversationsOpen(false)}>
-            <ApartmentOutlined aria-hidden="true" /><span>Agent 能力</span>
-          </a>
-          <a href="#/observability" aria-label="运行中心" title="运行中心" aria-current={view === 'observability' ? 'page' : undefined}>
-            <MonitorOutlined aria-hidden="true" /><span>运行中心</span>
-          </a>
-          <a href="#/knowledge" aria-label="知识库" title="知识库" aria-current={view === 'knowledge' ? 'page' : undefined}>
-            <BookOutlined aria-hidden="true" /><span>知识库</span>
-          </a>
-          <a href="#/sources" aria-label="数据源管理" title="数据源管理" aria-current={view === 'sources' ? 'page' : undefined}>
-            <DatabaseOutlined aria-hidden="true" /><span>数据源管理</span>
-          </a>
+          {workspaceViews.map(page => {
+            const { label, icon: Icon } = workspacePages[page]
+            const href = page === view && routeHash.split('?', 1)[0] === `#/${page}` ? routeHash : `#/${page}`
+            return (
+              <a key={page} href={href} aria-label={label} title={label} aria-current={view === page ? 'page' : undefined}
+                onClick={event => activatePage(event, page)}>
+                <Icon aria-hidden="true" /><span>{label}</span>
+              </a>
+            )
+          })}
         </nav>
-        <button type="button" className="workspace-nav-toggle" aria-controls="workspace-global-nav"
+        <button type="button" className="workspace-nav-toggle" aria-controls="workspace-global-nav" hidden={menuOpen}
           aria-expanded={!navCollapsed} aria-label={navCollapsed ? '展开工作台导航' : '收起工作台导航'}
           title={navCollapsed ? '展开工作台导航' : '收起工作台导航'}
           onClick={() => {
@@ -1124,25 +1360,27 @@ export function ChatPage() {
             setNavCollapsed(!navCollapsed)
           }}>
           {navCollapsed ? <MenuUnfoldOutlined aria-hidden="true" /> : <MenuFoldOutlined aria-hidden="true" />}
-          <span>收起导航</span>
+          <span>{navCollapsed ? '展开导航' : '收起导航'}</span>
         </button>
       </aside>
 
-      <section className="workspace-main" id="workspace-main" tabIndex={-1}>
+      <section ref={mainRef} className="workspace-main" id="workspace-main" aria-label={workspacePages[view].label} tabIndex={-1} inert={menuOpen}>
         <header className="workspace-topbar">
           <div className="workspace-topbar-left">
             <Button
               ref={mobileMenuRef}
               className="conversation-toggle"
-              aria-label="打开工作台导航"
-              aria-expanded={conversationsOpen}
+              aria-label="打开工作台菜单"
+              aria-controls="workspace-sidebar"
+              aria-expanded={menuOpen}
+              aria-haspopup="dialog"
               type="text"
-              icon={<MenuOutlined />}
-              onClick={() => setConversationsOpen(value => !value)}
+              icon={<MenuOutlined aria-hidden="true" />}
+              onClick={() => setMenuOpen(true)}
             />
-            <span className="workspace-topbar-title">{isConversation ? '对话工作台' : 'AI Agent 工作台'}</span>
+            <span className="workspace-topbar-title">{workspacePages[view].label}</span>
           </div>
-          <span className="workspace-profile"><UserOutlined aria-hidden="true" />本地工作区</span>
+          <span className="workspace-profile">本地工作区</span>
         </header>
 
         {view === 'tasks' && (
@@ -1153,7 +1391,7 @@ export function ChatPage() {
         {view === 'history' && (
           <div className="workspace-scroll">
             <div className="workspace-history-page">
-              <ConversationHistory conversations={conversations} activeId={active.id} onOpen={selectConversation} />
+              <ConversationHistory conversations={conversations} activeId={active.id} onOpen={openHistoryConversation} />
             </div>
           </div>
         )}
@@ -1176,7 +1414,11 @@ export function ChatPage() {
         )}
         {view === 'knowledge' && (
           <div className="workspace-scroll">
-            <Suspense fallback={replyLoading}><KnowledgePage onSelect={startWithDocument} /></Suspense>
+            <Suspense fallback={replyLoading}><KnowledgePage onSelect={startWithDocument} onDelete={document => {
+              setConversations(items => items.map(conversation => conversation.draftDocuments?.some(item => item.id === document.id)
+                ? { ...conversation, draftDocuments: conversation.draftDocuments.filter(item => item.id !== document.id) }
+                : conversation))
+            }} /></Suspense>
           </div>
         )}
         {view === 'sources' && (
@@ -1190,7 +1432,12 @@ export function ChatPage() {
               composer={composer}
               recent={<WorkspaceActivity recent conversations={conversations} onOpen={selectConversation} />}
               onChoose={prompt => {
+                if (draftDocuments.length || (input.trim() && input !== prompt)) {
+                  setStarterChoice(prompt)
+                  return
+                }
                 setInput(prompt)
+                setStarterChoice(undefined)
                 composerRef.current?.focus({ cursor: 'end' })
               }}
             />
@@ -1198,9 +1445,9 @@ export function ChatPage() {
         )}
         {isConversation && (
           <div ref={dialogRef} className={`workspace-dialog-layout${dockHistory ? ' with-history' : ''}${dockDetails && showDetails ? ' with-execution' : ''}`}>
-            {dockHistory && <ConversationHistory compact conversations={conversations} activeId={active.id} onOpen={selectConversation} />}
+            {dockHistory && <ConversationHistory compact conversations={conversations} activeId={active.id} onOpen={openHistoryConversation} />}
             {!lg && showHistory && <Drawer title="历史会话" placement="left" open onClose={() => setHistoryOpen(false)}>
-              <ConversationHistory compact conversations={conversations} activeId={active.id} onOpen={selectConversation} />
+              <ConversationHistory compact conversations={conversations} activeId={active.id} onOpen={openHistoryConversation} />
             </Drawer>}
             <section className="chat-main" aria-label="主 Agent 对话工作台">
               <header className="chat-title-bar">
@@ -1209,12 +1456,13 @@ export function ChatPage() {
                     <Button type="text" icon={<HistoryOutlined />} aria-label={showHistory ? '收起历史会话' : '展开历史会话'}
                       aria-expanded={showHistory} onClick={() => setHistoryOpen(!showHistory)} />
                   </Tooltip>
-                  <div>
+                  <div className="conversation-heading">
+                    <p>主 Agent 对话工作台</p>
                     <h1 title={heading}>{heading}</h1>
                   </div>
                 </div>
                 <div className="chat-title-actions">
-                  {currentStatus !== 'idle' && <span className={`workspace-state workspace-state-${statusTone}`}>{statusLabel}</span>}
+                  {(currentStatus !== 'idle' || creationError) && <span className={`workspace-state workspace-state-${statusTone}`}>{statusLabel}</span>}
                   {!showDetails && (
                     <Button
                       size="small"
@@ -1248,7 +1496,9 @@ export function ChatPage() {
                     <article
                       className={`chat-message ${item.role}${item === liveMessage ? ' streaming' : ''}`}
                       key={item.id}
-                      ref={item.id === inspectedReply?.id ? inspectedReplyRef : undefined}
+                      ref={item.id === inspectedMessageId ? inspectedReplyRef : undefined}
+                      aria-current={item.id === inspectedMessageId ? 'true' : undefined}
+                      tabIndex={item.id === inspectedMessageId ? -1 : undefined}
                     >
                       <div className={`avatar${item.role === 'assistant' ? ' agent-avatar' : ''}`} aria-hidden="true">
                         {item.role === 'user' ? <UserOutlined /> : <RobotOutlined />}
@@ -1263,7 +1513,7 @@ export function ChatPage() {
                               onInspect={item.runId && (!showDetails || item.id !== detailReply?.id)
                                 ? () => { setDetailMessageId(item.id); setDetailsOpen(true) } : undefined}
                             />
-                            {item.error && (item !== taskReply || !failed) && <p className="chat-run-tool-error">{item.error}</p>}
+                            {item.error && (readOnly || item !== taskReply || !failed) && <p className="chat-run-tool-error">{item.error}</p>}
                             <ReplyContent
                               content={withoutRepeatedQuestions(item.content, item.id === taskReply?.id ? pendingInput : undefined)}
                               tools={item.toolResults}
@@ -1274,11 +1524,16 @@ export function ChatPage() {
                                 }
                                 : undefined}
                             />
+                            {readOnly && item.id === inspectedMessageId && !!item.inputRequest?.questions.length
+                              && withoutRepeatedQuestions(item.content, item.inputRequest) === item.content && (
+                                <ul>{item.inputRequest.questions.filter(question => !item.content.includes(question))
+                                  .map((question, index) => <li key={index}>{question}</li>)}</ul>
+                              )}
                             {item.runId && item.followupKey && followupPanels.get(item.runId) === item.id && (
                               <Suspense fallback={replyLoading}>
                                 <FollowupPanel
                                   runId={item.runId} access={item.followupKey}
-                                  canContinue={item.id === taskReply?.id && !!item.inputRequest && !pendingSubmission && !running}
+                                  canContinue={item.id === taskReply?.id && awaitingFollowup && !pendingSubmission && !running && !readOnly}
                                   onContinue={choice => void send('answer', choice)}
                                 />
                               </Suspense>
@@ -1301,7 +1556,7 @@ export function ChatPage() {
 
                 </div>
               </div>
-              {awayFromLatest && <Button className="chat-return-latest" aria-label="返回最新消息" size="small" icon={<ArrowDownOutlined />}
+              {awayFromLatest && !readOnly && <Button className="chat-return-latest" aria-label="返回最新消息" size="small" icon={<ArrowDownOutlined />}
                 onClick={() => {
                   followLatest.current = true
                   readingResult.current = false

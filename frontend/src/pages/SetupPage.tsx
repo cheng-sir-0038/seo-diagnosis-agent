@@ -53,7 +53,7 @@ const languageOptions = [
 ]
 
 export function SetupPage() {
-  return <ProductProvider><SiteRegistrationForm /></ProductProvider>
+  return <ProductProvider loadExistingSite={false}><SiteRegistrationForm /></ProductProvider>
 }
 
 function SiteRegistrationForm() {
@@ -72,7 +72,7 @@ function SiteRegistrationForm() {
   }
 
   const handleFinishFailed: FormProps<SetupValues>['onFinishFailed'] = ({ errorFields }) => {
-    setValidationError('请先完成所有必填项')
+    setValidationError('请检查标记的字段后重新提交。')
     const firstError = errorFields[0]?.name
     if (!firstError) return
     form.scrollToField(firstError, { behavior: 'smooth', block: 'center' })
@@ -107,7 +107,7 @@ function SiteRegistrationForm() {
             <h2>登记站点与协作角色</h2>
           </header>
 
-          {error ? <Alert type="error" showIcon message={error} /> : null}
+          {error ? <Alert type="error" showIcon title={error} /> : null}
 
           <Form<SetupValues>
             form={form}
@@ -124,7 +124,7 @@ function SiteRegistrationForm() {
             }}
             onFinish={handleFinish}
             onFinishFailed={handleFinishFailed}
-            onFieldsChange={() => validationError && setValidationError(null)}
+            onValuesChange={() => validationError && setValidationError(null)}
           >
             <div className="setup-form-scroll">
               <section className="form-section">
@@ -133,11 +133,11 @@ function SiteRegistrationForm() {
                   <div><h3>站点信息</h3><p>用于标识此站点的机会、审批和交付记录。</p></div>
                 </div>
                 <div className="form-grid two-columns">
-                  <Form.Item label="站点名称" name="siteName" rules={[{ required: true, message: '请输入站点名称' }]}>
+                  <Form.Item label="站点名称" name="siteName" rules={[{ required: true, whitespace: true, message: '请输入站点名称' }]}>
                     <Input placeholder="例如：Waterjet Growth Lab" autoComplete="organization" />
                   </Form.Item>
-                  <Form.Item label="站点域名" name="domain" rules={[{ required: true, message: '请输入站点域名' }]}>
-                    <Input placeholder="example.com" autoComplete="url" />
+                  <Form.Item label="站点域名" name="domain" rules={[{ required: true, whitespace: true, message: '请输入站点域名' }]}>
+                    <Input placeholder="example.com 或 https://example.com" autoComplete="url" />
                   </Form.Item>
                   <Form.Item label="目标国家" name="country" rules={[{ required: true, message: '请选择目标国家' }]}>
                     <Select
@@ -174,13 +174,13 @@ function SiteRegistrationForm() {
                   <div><h3>协作角色</h3><p>负责人接收决策，执行者负责实际内容交付。</p></div>
                 </div>
                 <div className="form-grid two-columns">
-                  <Form.Item label="负责人名称" name="ownerName" rules={[{ required: true, message: '请输入负责人名称' }]}>
+                  <Form.Item label="负责人名称" name="ownerName" rules={[{ required: true, whitespace: true, message: '请输入负责人名称' }]}>
                     <Input autoComplete="name" />
                   </Form.Item>
                   <Form.Item label="负责人邮箱" name="ownerEmail" rules={[{ required: true, message: '请输入负责人邮箱' }, { type: 'email', message: '请输入有效邮箱' }]}>
                     <Input placeholder="owner@qq.com" autoComplete="email" />
                   </Form.Item>
-                  <Form.Item label="执行者名称" name="executorName" rules={[{ required: true, message: '请输入执行者名称' }]}>
+                  <Form.Item label="执行者名称" name="executorName" rules={[{ required: true, whitespace: true, message: '请输入执行者名称' }]}>
                     <Input autoComplete="name" />
                   </Form.Item>
                   <Form.Item label="执行者邮箱" name="executorEmail" rules={[{ required: true, message: '请输入执行者邮箱' }, { type: 'email', message: '请输入有效邮箱' }]}>

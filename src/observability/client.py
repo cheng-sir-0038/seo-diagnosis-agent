@@ -9,11 +9,13 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
-from sqlalchemy import cast, func, insert, select, update
+from sqlalchemy import case, cast, false, func, insert, or_, select, true, update
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.orm import InstrumentedAttribute
+from sqlalchemy.sql.elements import ColumnElement
 
 from src.observability.context import reset_current_context, set_current_context
 from src.observability.exporters import ObservationExporter
@@ -52,6 +54,22 @@ def _id(prefix: str) -> str:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+ObservationWindow = tuple[datetime, datetime]
+TraceListScope = Literal["all", "business", "system", "product"]
+_INTERNAL_MAINTENANCE = ("scheduler.automation_sync", "scheduler.notification_outbox")
+
+
+def _product_trace() -> ColumnElement[bool]:
+    """Keep customer-facing scheduled work and exclude internal maintenance."""
+    return TraceRow.operation_name.not_in(_INTERNAL_MAINTENANCE)
+
+
+def _time_window(column: InstrumentedAttribute[str] | ColumnElement[str], window: ObservationWindow) -> tuple[ColumnElement[bool], ColumnElement[bool]]:
+    # Observations store canonical UTC ISO strings, so comparisons can use the timestamp indexes.
+    start_at, end_at = window
+    return column >= start_at.astimezone(UTC).isoformat(), column < end_at.astimezone(UTC).isoformat()
 
 
 def _duration_ms(started: float) -> float:
@@ -471,10 +489,11 @@ class ObservabilityClient:
         await self._export("trace_link", row)
         return row
 
-    async def get_trace(self, trace_id: str) -> dict[str, Any]:
-        trace = await self.database.fetch_one(
-            select(TraceRow.__table__).where(TraceRow.id == trace_id)
-        )
+    async def get_trace(self, trace_id: str, *, hide_maintenance: bool = False) -> dict[str, Any]:
+        query = select(TraceRow.__table__).where(TraceRow.id == trace_id)
+        if hide_maintenance:
+            query = query.where(TraceRow.project_id == await self._ensure_project(), _product_trace())
+        trace = await self.database.fetch_one(query)
         if trace is None:
             raise KeyError(f"Trace 不存在: {trace_id}")
         trace["runs"] = await self.database.fetch_all(
@@ -514,15 +533,69 @@ class ObservabilityClient:
         return trace
 
     async def list_traces(
-        self, *, status: str | None = None, limit: int = 100
+        self, *, status: str | None = None, limit: int = 100,
+        window: ObservationWindow | None = None, identifier: str | None = None, scope: TraceListScope = "all",
     ) -> list[dict[str, Any]]:
         project_id = await self._ensure_project()
         query = select(TraceRow.__table__).where(TraceRow.project_id == project_id)
         if status:
             query = query.where(TraceRow.status == status)
-        return await self.database.fetch_all(query.order_by(TraceRow.started_at.desc()).limit(
+        if scope == "product":
+            query = query.where(_product_trace())
+        if identifier:
+            query = query.where(or_(
+                TraceRow.id == identifier,
+                cast(TraceRow.metadata_json, JSONB)["application_run_id"].astext == identifier,
+            ))
+        elif scope in {"business", "system"}:
+            system_task = TraceRow.operation_name.startswith("scheduler.")
+            query = query.where(system_task if scope == "system" else ~system_task)
+        if window:
+            query = query.where(*_time_window(TraceRow.started_at, window))
+        return await self.database.fetch_all(query.order_by(TraceRow.started_at.desc(), TraceRow.id).limit(
             max(1, min(limit, 500))
         ))
+
+    async def overview(self, *, window: ObservationWindow | None = None, hide_maintenance: bool = False) -> dict[str, Any]:
+        project_id = await self._ensure_project()
+        failed = TraceRow.status == Status.FAILED.value
+        waiting = cast(TraceRow.metadata_json, JSONB)["application_status"].astext == "waiting_for_input"
+        traces = select(
+            func.count().label("trace_count"),
+            func.count().filter(failed).label("failed_trace_count"),
+            func.count().filter(waiting).label("waiting_trace_count"),
+        ).where(TraceRow.project_id == project_id)
+        tools = (
+            select(func.count().label("tool_call_count"))
+            .select_from(ToolCallRow).join(TraceRow, TraceRow.id == ToolCallRow.trace_id)
+            .where(TraceRow.project_id == project_id)
+        )
+
+        if hide_maintenance:
+            visible = _product_trace()
+            traces = traces.where(visible)
+            tools = tools.where(visible)
+
+        def totals(interval: ObservationWindow | None):
+            trace_totals = traces.where(*_time_window(TraceRow.started_at, interval)).subquery() if interval else traces.subquery()
+            tool_totals = tools.where(*_time_window(ToolCallRow.started_at, interval)).subquery() if interval else tools.subquery()
+            return select(*trace_totals.c, *tool_totals.c).select_from(trace_totals.join(tool_totals, true()))
+
+        current = totals(window)
+        if not window:
+            return {**(await self.database.fetch_all(current))[0], "previous": None}
+
+        start_at, end_at = window
+        previous = totals((start_at - (end_at - start_at), start_at))
+        # Read both cohorts from one database snapshot, ordered previous then current.
+        current = current.add_columns(true().label("is_current"))
+        previous = previous.add_columns(false().label("is_current"))
+        rows = await self.database.fetch_all(current.union_all(previous).order_by("is_current"))
+        baseline, summary = rows
+        baseline.pop("is_current")
+        baseline.pop("waiting_trace_count")  # Waiting reflects current state, so it has no historical comparison.
+        summary.pop("is_current")
+        return {**summary, "previous": baseline}
 
     async def application_run_stats(self, run_id: str) -> dict[str, Any]:
         filters = (
@@ -543,19 +616,73 @@ class ObservabilityClient:
         return rows[0]
 
     async def list_issues(
-        self, *, status: str | None = None, limit: int = 100
+        self, *, status: str | None = None, limit: int = 100,
+        pending: bool = False, window: ObservationWindow | None = None,
+        hide_maintenance: bool = False,
     ) -> list[dict[str, Any]]:
+        """List issue groups using the selected scope's most recent occurrence."""
         project_id = await self._ensure_project()
-        query = select(IssueRow.__table__).where(IssueRow.project_id == project_id)
+        issue = IssueRow
+        most_recent = issue.last_seen_at
+        query = select(issue.__table__).where(issue.project_id == project_id)
+        if hide_maintenance:
+            occurrence = IssueOccurrenceRow
+            product = (
+                select(occurrence.issue_id, occurrence.trace_id, occurrence.occurred_at,
+                       occurrence.id, occurrence.context_json, occurrence.message)
+                .join(TraceRow, TraceRow.id == occurrence.trace_id)
+                .where(TraceRow.project_id == project_id, _product_trace())
+                .cte("product_issue_occurrences")
+            )
+            totals = (
+                select(
+                    product.c.issue_id,
+                    func.count().label("occurrence_count"),
+                    func.count(product.c.trace_id.distinct()).label("affected_trace_count"),
+                    func.min(product.c.occurred_at).label("first_seen_at"),
+                    func.max(product.c.occurred_at).label("last_seen_at"),
+                ).group_by(product.c.issue_id).subquery()
+            )
+            recent = select(
+                product.c.issue_id, product.c.context_json, product.c.message,
+                func.row_number().over(
+                    partition_by=product.c.issue_id,
+                    order_by=(product.c.occurred_at.desc(), product.c.id),
+                ).label("position"),
+            ).subquery()
+            projected = {
+                "occurrence_count": totals.c.occurrence_count,
+                "affected_trace_count": totals.c.affected_trace_count,
+                "first_seen_at": totals.c.first_seen_at,
+                "last_seen_at": totals.c.last_seen_at,
+                "latest_context_json": recent.c.context_json,
+                # A shared fingerprint may have been created by a maintenance run.
+                "title": case((totals.c.occurrence_count == issue.occurrence_count, issue.title), else_=recent.c.message),
+            }
+            query = (
+                select(*(projected.get(column.key, column).label(column.key) for column in issue.__table__.c))
+                .select_from(issue).join(totals, totals.c.issue_id == issue.id)
+                .join(recent, (recent.c.issue_id == issue.id) & (recent.c.position == 1))
+                .where(issue.project_id == project_id)
+            )
+            most_recent = totals.c.last_seen_at
         if status:
-            query = query.where(IssueRow.status == status)
-        return await self.database.fetch_all(query.order_by(IssueRow.last_seen_at.desc()).limit(
+            query = query.where(issue.status == status)
+        if pending:
+            query = query.where(issue.status.in_((
+                IssueStatus.OPEN.value, IssueStatus.REOPENED.value, IssueStatus.INVESTIGATING.value,
+            )))
+        if window:
+            query = query.where(*_time_window(most_recent, window))
+        return await self.database.fetch_all(query.order_by(most_recent.desc(), issue.id).limit(
             max(1, min(limit, 500))
         ))
 
     async def metric_summary(
-        self, *, metric_name: str | None = None, limit: int = 100
+        self, *, metric_name: str | None = None, limit: int = 100,
+        window: ObservationWindow | None = None, hide_maintenance: bool = False,
     ) -> list[dict[str, Any]]:
+        """Aggregate metric samples after applying the trace scope."""
         metric = MetricPointRow
         latest = func.max(metric.recorded_at).label("last_recorded_at")
         query = select(
@@ -564,8 +691,12 @@ class ObservabilityClient:
             func.min(metric.value).label("minimum_value"),
             func.max(metric.value).label("maximum_value"), latest,
         ).where(metric.project_id == await self._ensure_project())
+        if hide_maintenance:
+            query = query.join(TraceRow, TraceRow.id == metric.trace_id).where(_product_trace())
         if metric_name:
             query = query.where(metric.metric_name == metric_name)
+        if window:
+            query = query.where(*_time_window(metric.recorded_at, window))
         return await self.database.fetch_all(
             query.group_by(metric.metric_name, metric.unit).order_by(latest.desc())
             .limit(max(1, min(limit, 500)))

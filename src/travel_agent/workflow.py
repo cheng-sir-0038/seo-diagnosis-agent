@@ -43,38 +43,56 @@ def _key(arguments: dict) -> str:
 def _questions(request: TripRequest) -> list[str]:
     today = china_today()
     questions = []
-    if not request.origin or not request.destination:
-        cities = (
-            "出发城市和目的城市"
-            if not request.origin and not request.destination
-            else ("出发城市" if not request.origin else "目的城市")
-        )
-        questions.append(f"{cities}是什么？")
-    elif request.origin.removesuffix("市") == request.destination.removesuffix("市"):
+    if not request.destination or (request.wants_outbound and not request.origin):
+        cities = []
+        if request.wants_outbound and not request.origin:
+            cities.append("出发城市")
+        if not request.destination:
+            cities.append("目的城市" if request.wants_outbound else "住宿城市")
+        questions.append(f"{'和'.join(cities)}是哪里？")
+    elif request.wants_outbound and request.origin and request.origin.removesuffix("市") == request.destination.removesuffix("市"):
         questions.append("请分别确认出发城市与目的城市。")
-    if not request.depart_on or not request.return_on:
-        missing_date = (
-            "出发和返程日期"
-            if not request.depart_on and not request.return_on
-            else ("出发日期" if not request.depart_on else "返程日期")
-        )
-        questions.append(f"{missing_date}是哪一天？")
-    elif request.depart_on < today or request.return_on < request.depart_on:
-        questions.append("请核对出发和返程日期，出发不得早于今天，返程不得早于出发。")
-    if request.arrive_by and request.depart_on and request.return_on:
-        meeting_day = request.arrive_by.astimezone(ZoneInfo(TRAVEL_TIMEZONE)).date()
-        if not request.depart_on <= meeting_day <= request.return_on:
-            questions.append("最晚到场日期和行程日期有冲突，请确认日期和到场时间。")
-    details = []
-    if not request.venue:
-        details.append("会场的名称或地址")
-    if not request.travelers:
-        details.append("出行人数")
-    if not request.rooms and request.depart_on != request.return_on:
-        details.append("需要几间房")
-    if details:
-        questions.append(f"还请补充{'、'.join(details)}。")
+    if not request.depart_on:
+        questions.append("哪天出发？" if request.wants_outbound else "哪天入住？")
+    elif request.depart_on < today:
+        questions.append("请核对日期，出发或入住不能早于今天。")
+    if (request.wants_return or request.wants_lodging) and not request.return_on:
+        if not request.wants_return:
+            questions.append("哪天退房？")
+        elif request.transport == "round_trip" or request.wants_lodging:
+            questions.append("哪天返程？")
+        else:
+            questions.append("只查去程，还是也要查返程？需要返程的话，请告诉我日期。")
+    elif (request.wants_return or request.wants_lodging) and request.depart_on and request.return_on:
+        if request.return_on < request.depart_on:
+            questions.append("请核对日期，返程或退房不能早于出发或入住。")
+        elif request.wants_lodging and request.return_on == request.depart_on:
+            questions.append("需要住宿的话请确认退房日期，退房应晚于入住。")
+    if request.wants_outbound and request.arrive_by and request.depart_on:
+        arrival_day = request.arrive_by.astimezone(ZoneInfo(TRAVEL_TIMEZONE)).date()
+        if arrival_day < request.depart_on or (request.wants_return and request.return_on and arrival_day > request.return_on):
+            questions.append("最晚抵达时间和出行日期有冲突，请确认日期和时间。")
+    if request.wants_lodging:
+        details = []
+        if not request.travelers:
+            details.append("入住人数")
+        if not request.rooms:
+            details.append("房间数")
+        if details:
+            questions.append(f"请补充{'和'.join(details)}。")
     return questions[:3]
+
+
+
+def _confirmed_summary(request: TripRequest) -> str | None:
+    """Repeat known trip conditions so the reply can focus on missing ones."""
+    route = " → ".join(city for city in (request.origin if request.wants_outbound else None, request.destination) if city)
+    details = [route] if route else []
+    if request.depart_on:
+        details.append(f"{request.depart_on:%m月%d日}{'出发' if request.wants_outbound else '入住'}")
+    if request.return_on and (request.wants_return or request.wants_lodging):
+        details.append(f"{request.return_on:%m月%d日}{'返程' if request.wants_return else '退房'}")
+    return f"已记下：{'、'.join(details)}。" if details else None
 
 
 def _bind_conditions(request: TripRequest, direction: str) -> dict:
@@ -195,6 +213,7 @@ async def _transport(
     request: dict,
 ) -> dict:
     legs = data.setdefault("legs", {})
+    directions = _DIRECTIONS if request.get("transport") != "one_way" else ("outbound",)
     keys = {
         direction: _key(
             {
@@ -203,16 +222,16 @@ async def _transport(
                 "date": request["depart_on"] if direction == "outbound" else request["return_on"],
             }
         )
-        for direction in _DIRECTIONS
+        for direction in directions
     }
     changed = [
         direction
-        for direction in _DIRECTIONS
+        for direction in directions
         if legs.get(direction, {}).get("key") != keys[direction]
     ]
     if changed:
         criteria = {
-            key: request[key] for key in ("origin", "destination", "depart_on", "return_on")
+            key: request[key] for key in ("origin", "destination", "depart_on", "return_on") if key in request
         }
         results = await _call(
             executor,
@@ -227,17 +246,26 @@ async def _transport(
                 for direction in changed
             }
         )
-    return {direction: legs[direction]["receipt"] for direction in _DIRECTIONS}
+    return {direction: legs[direction]["receipt"] for direction in directions}
 
 
 async def _gather(executor: AgentExecutor, run: AgentRun, data: dict) -> dict:
     request = data["request"]
+    trip = TripRequest.model_validate(request)
     destination = request["destination"]
-    depart_on, return_on = request["depart_on"], request["return_on"]
-    candidates = await _transport(executor, run, data, request)
-    offers = [item["offer"] for item in data["manual"]]
+    depart_on = request["depart_on"]
+    return_on = request.get("return_on") if trip.wants_return or trip.wants_lodging else None
+    requested = {
+        direction for direction, enabled in (
+            ("outbound", trip.wants_outbound), ("return", trip.wants_return), ("hotel", trip.wants_lodging),
+        ) if enabled
+    }
+    candidates = await _transport(executor, run, data, request) if trip.wants_outbound else {}
+    offers = [item["offer"] for item in data["manual"] if item["offer"]["direction"] in requested]
     providers = []
     for direction, label in (("outbound", "飞猪去程"), ("return", "飞猪返程")):
+        if direction not in candidates:
+            continue
         receipt = candidates[direction]
         offers.extend(_fly_candidates(receipt, direction, "transport"))
         if modes := receipt.get("modes"):
@@ -248,35 +276,24 @@ async def _gather(executor: AgentExecutor, run: AgentRun, data: dict) -> dict:
             )
         else:
             providers.append(_source(receipt, label, "flyai"))
-    if depart_on != return_on:
+    if trip.wants_lodging:
         hotels = await _call(
-            executor,
-            run,
-            HOTELS,
-            {
-                "destination": destination,
-                "check_in": depart_on,
-                "check_out": return_on,
-                "travelers": request["travelers"],
-                "rooms": request["rooms"],
-            },
+            executor, run, HOTELS,
+            {"destination": destination, "check_in": depart_on, "check_out": return_on,
+             "travelers": trip.travelers, "rooms": trip.rooms},
         )
         offers.extend(_fly_candidates(hotels, "hotel", "hotel"))
         providers.append(_source(hotels, "飞猪酒店", "flyai"))
     addresses = _route_origins(offers)
-    commute = await _call(
-        executor,
-        run,
-        COMMUTE,
-        {
-            "city": destination,
-            "destination": request["venue"],
-            "origins": list(dict.fromkeys(addresses.values())),
-        },
-    )
-    providers.append(_source(commute, "百度地图驾车", "baidu"))
+    commute = {}
+    if trip.venue and addresses:
+        commute = await _call(
+            executor, run, COMMUTE,
+            {"city": destination, "destination": trip.venue, "origins": list(dict.fromkeys(addresses.values()))},
+        )
+        providers.append(_source(commute, "百度地图驾车", "baidu"))
     weather = await _call(
-        executor, run, WEATHER, {"city": destination, "start": depart_on, "end": return_on}
+        executor, run, WEATHER, {"city": destination, "start": depart_on, "end": return_on or depart_on}
     )
     return {
         "request": request,
@@ -412,7 +429,8 @@ async def run_travel(
             if pending.answer in _FINISH:
                 await _finish(executor, run, "本次行程规划已结束。")
                 return
-            if match := _SELECT.fullmatch(pending.answer):
+            match = _SELECT.fullmatch(pending.answer)
+            if match and (match[1] or (data.get("snapshot") or {}).get("request") == data["request"]):
                 await _save(executor, run, data, int(match[1] or match[2]))
                 return
             needs_extraction = data.get("processed_input") != pending.request_id
@@ -446,7 +464,23 @@ async def run_travel(
         questions = _questions(request)
         if questions:
             await _forecast_while_waiting(executor, run, request)
-            await _wait(executor, run, questions)
+            summary = _confirmed_summary(request)
+            notices = []
+            for tool_name, requested in (
+                (TRANSPORT, request.wants_outbound),
+                (HOTELS, request.wants_lodging),
+                (COMMUTE, bool(request.venue)),
+            ):
+                if requested and tool_name in executor.tools.names():
+                    note = getattr(executor.tools.get(tool_name), "availability_note", None)
+                    if note and note not in notices:
+                        notices.append(note)
+            if notices:
+                summary = "".join(notices) + (
+                    "可贴已有班次、报价或链接，我可以按现有资料整理。"
+                    + (f"\n\n{summary}" if summary else "")
+                )
+            await _wait(executor, run, questions, summary)
             return
         await executor.checkpoint(run, stage="travel_conditions_confirmed")
         evidence = await _gather(executor, run, data)
@@ -481,7 +515,7 @@ async def run_travel(
             run,
             ["选择方案，或补充报价与行程条件。"],
             f"已经整理出 {len(snapshot['plans'])} 个候选方案。"
-            "卡片里可以核对各段交通、酒店、已知费用和接驳估算。"
+            "卡片列出了已查到的选项、报价来源和还待核对的条件。"
             "\n\n可回复「保存方案 1」保存草稿，也可以直接补充报价或更新出差条件。"
             f"{note}",
         )

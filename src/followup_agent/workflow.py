@@ -59,7 +59,7 @@ class FollowupTool(AgentTool):
 
 class ReadFollowup(FollowupTool):
     name = "followup_read_materials"
-    description = "统计本次资料里已读取的记录、报告日期与无法读取的文件。"
+    description = "统计已读取的记录、报告日期、可对照的项目与无法读取的文件。"
 
     async def apply(self, store: FollowupCaseStore, run_id: str, arguments: dict) -> dict:
         return await store.read_receipt(run_id)
@@ -91,9 +91,13 @@ FOLLOWUP_SKILL = Skill(
     name="followup-preparation", domain=DOMAIN, description="随访与复诊资料整理",
     tools=[ReadFollowup.name, PrepareFollowup.name, SaveFollowup.name],
     prompt_fragment=(
-        "followup 处理用户提供的检查报告、已有安排与日常记录，"
-        "可准备复诊带齐清单、回访提纲、做同条件报告数值对照。"
-        "医保目录和公开文献继续走 healthcare。涉及诊断或用药决定时明确业务范围。"
+        "用户要整理随访、复诊材料、报告变化或回访提纲时选 followup。"
+        "用本次资料区提交的检查报告、已有安排或日常记录；没有文件也可先分派，由工作流收集资料。"
+        "提交至少一份记录可按现有资料整理；计算变化需要不同日期且项目、单位、标本和方法可比。"
+        "数值、日期和来源按实际记录核对，缺项、不一致或不可读的内容留作待核实，不估算差值。"
+        "结果是带来源的资料包、待补项和用户已有安排生成的待办。确认当前版本后才保存。"
+        "不通过外部工具发送报告或联系机构，不把记录变化解释为诊断或用药决定。"
+        "公开医保目录与文献走 healthcare，复诊网页的 SEO 走 seo。"
     ),
 )
 
@@ -148,12 +152,13 @@ async def run_followup(
             return
 
     read = await _tool(executor, run, ReadFollowup.name, step)
-    needs_report = read["report_dates"] < 2 and command != FollowupCommand.USE_AVAILABLE
+    needs_report = not read["comparable_pairs"] and command != FollowupCommand.USE_AVAILABLE
     if not read["records"] or needs_report:
         message = (
-            "还需要另一份带检查日期的报告。可在资料区补充，也可选择用现有记录继续。"
+            "目前没有可直接对照的报告。若要计算差值，请在资料区查看待核对的项目和来源行，再修订或补充。"
+            "若本次只需准备复诊，可选择「按现有资料整理」。"
             if read["records"]
-            else "请在资料区导入这次要整理的记录，核对后点击「整理并核对资料」。"
+            else "请在资料区导入本次要核对的报告、已有安排或日常记录，再选择整理方式。"
         )
         await _wait(executor, run, ReadFollowup.name, message, {})
         return

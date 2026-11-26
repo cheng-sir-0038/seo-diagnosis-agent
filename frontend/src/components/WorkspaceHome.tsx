@@ -1,21 +1,23 @@
 import {
-  BarChartOutlined, BookOutlined, BulbOutlined, ExperimentOutlined, MedicineBoxFilled,
-  ReadOutlined, RightOutlined, SendOutlined, ShoppingCartOutlined,
+  BookOutlined, BulbOutlined, EnvironmentOutlined, HeartOutlined, MedicineBoxFilled,
+  ReadFilled, RightOutlined, SendOutlined, ShoppingCartOutlined, ShoppingOutlined, SignalFilled,
 } from '@ant-design/icons'
 import { type ReactNode, useState } from 'react'
 
+import './workspace-home.css'
+
 const domains = [
   {
-    id: 'seo', title: 'SEO / GEO', icon: BarChartOutlined,
-    description: '搜索优化、页面诊断、关键词与 AI 引用核查',
+    id: 'seo', title: 'SEO / GEO', icon: SignalFilled,
+    description: '页面诊断、关键词与 AI 引用核查',
     examples: [
       { title: '页面检查', detail: '核对标题和正文，定位优先改进项', prompt: '帮我检查 https://breadtopia.com/how-to-make-a-sourdough-starter/ 的标题和正文是否匹配，给我最优先的修改建议和依据。' },
       { title: '网页与考纲联查', detail: '对照原始公告与报名页', prompt: '请按医学人文修订通知核对 https://www.hbwsrc.cn/news/show-1830.html 中的适用考试类别。' },
     ],
   },
   {
-    id: 'health', title: '医疗健康', icon: MedicineBoxFilled, sceneIcon: ExperimentOutlined,
-    description: '医保目录、医学文献、随访与复诊准备',
+    id: 'health', title: '医疗健康', icon: MedicineBoxFilled, sceneIcon: HeartOutlined,
+    description: '医保目录、医学文献与复诊准备',
     examples: [
       { title: '随访与复诊准备', detail: '核对两次报告，整理复诊资料', prompt: '用合成资料演示一次复诊准备。帮我核对两次报告，整理下次要带的资料和已有安排。' },
       { title: '医保药品目录', detail: '核查通用名、剂型和分类', prompt: '帮我核对国家医保药品目录当前生效版，二甲双胍有哪些常规剂型，分别是甲类还是乙类？' },
@@ -25,7 +27,7 @@ const domains = [
     ],
   },
   {
-    id: 'learning', title: '学习教育', icon: ReadOutlined, sceneIcon: BookOutlined,
+    id: 'learning', title: '学习教育', icon: ReadFilled, sceneIcon: BookOutlined,
     description: '数学陪练、学习资源与报考备考',
     examples: [
       { title: '数学陪练', detail: '逐题练习方程，做完看解析', prompt: '我想练 3 道一元一次方程题，请一次出一道，做完给我看解析。' },
@@ -34,16 +36,16 @@ const domains = [
     ],
   },
   {
-    id: 'travel', title: '商旅行程', icon: SendOutlined,
-    description: '交通住宿、会场接驳、天气与出差方案',
+    id: 'travel', title: '商旅行程', icon: SendOutlined, sceneIcon: EnvironmentOutlined,
+    description: '交通住宿、会场接驳与天气查询',
     examples: [
       { title: '比较出差方案', detail: '比较交通、住宿和会场通勤', prompt: '下周二从上海到武汉出差，周四返回。两人住一间房，预算 3500 元，周二下午 3 点前到武汉国际博览中心，预留 30 分钟。帮我比较高铁、飞机和酒店。' },
       { title: '查询出差天气', detail: '先看目的地天气和出行建议', prompt: '我去杭州出差。' },
     ],
   },
   {
-    id: 'procurement', title: '购物采购', icon: ShoppingCartOutlined,
-    description: '商品查询、报价对比、采购清单与费用核对',
+    id: 'procurement', title: '购物采购', icon: ShoppingCartOutlined, sceneIcon: ShoppingOutlined,
+    description: '商品查询、报价对比与采购清单',
     examples: [
       { title: '列活动采购清单', detail: '按人数和预算列出用品', prompt: '我给 20 人的活动准备纸杯、礼袋和桌牌，预算 800 元，帮我列采购清单和需要向商家确认的问题。' },
       {
@@ -93,7 +95,9 @@ export function WorkspaceHome({ composer, recent, onChoose }: {
             onClick={() => setDomainId(selected?.id === id ? undefined : id)}
           >
             <span className="workbench-domain-title"><Icon aria-hidden="true" /><strong>{title}</strong></span>
-            <span className="workbench-domain-description">{description}<RightOutlined aria-hidden="true" /></span>
+            <span className="workbench-domain-description">
+              <span>{description}</span><RightOutlined aria-hidden="true" />
+            </span>
           </button>
         ))}
       </div>
@@ -116,7 +120,7 @@ export function WorkspaceHome({ composer, recent, onChoose }: {
             const Icon = 'sceneIcon' in domain ? domain.sceneIcon : domain.icon
             const example = domain.examples[0]
             return (
-              <button type="button" className={`workbench-scene workbench-tone-${domain.id}`} key={domain.id} onClick={() => onChoose(example.prompt)}>
+              <button type="button" className={`workbench-scene workbench-tone-${domain.id}`} key={domain.id} onClick={() => { setDomainId(undefined); onChoose(example.prompt) }}>
                 <span><Icon aria-hidden="true" /><strong>{example.title}</strong></span>
                 <small>{example.detail}</small>
               </button>

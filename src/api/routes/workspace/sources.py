@@ -51,7 +51,7 @@ def _describe(source: SourceDefinition, saved: Settings, modes: dict[str, str]) 
             _value(saved, field.name) != _value(settings, field.name) for field in source.fields
         ),
         "fields": [{
-            "id": field.name, "label": field.label, "kind": field.kind,
+            "id": field.name, "label": field.label, "kind": field.kind, "required": field.required,
             "editable": _editable(field.name), "configured": bool(_value(saved, field.name)),
         } for field in source.fields],
     }

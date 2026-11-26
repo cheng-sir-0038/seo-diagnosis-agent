@@ -15,6 +15,14 @@
 .procurement-table .procurement-value:has(+ .procurement-value) { margin-bottom: 3px; }
 .procurement-result .procurement-heading h3 { margin: 0; color: var(--color-text); font-size: 15px; }
 .procurement-result .procurement-heading p { margin: 3px 0 0; color: var(--color-text-muted); font-size: 12px; }
+.procurement-limitations {
+  margin: 0;
+  padding-inline-start: 20px;
+  color: var(--color-text-muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
 
 .procurement-table {
   width: 100%;

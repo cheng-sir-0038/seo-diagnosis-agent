@@ -698,7 +698,7 @@ async def test_available_facts_choice_stops_questions_but_keeps_validation():
     from src.agent.tools.base import ToolRuntimeContext
 
     source, model = PageSource(), Model()
-    model.output["questions"] = ["请提供分享图片地址。"]
+    model.output["questions"] = ["这个页面主要提供什么内容？"]
     first = await workflow(source, model).execute({})
     assert first.metadata["human_input"]["allow_use_available"] is True
     context = ToolRuntimeContext(
@@ -720,6 +720,237 @@ async def test_available_facts_choice_stops_questions_but_keeps_validation():
     model.output["citations"][0]["quote"] = "invented"
     invalid = await workflow(source, model).execute({}, context)
     assert invalid.data["proposal"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reply", "earlier", "action", "expected_image"),
+    [
+        ("营销数字化，没有图地址，你生成一个", "", "generate", None),
+        ("营销数字化，没图地址，不用你生成图片", "请生成一张分享图", "omit", None),
+        ("营销数字化，没有图片地址", "请生成一张分享图", "generate", None),
+        ("生成一张分享图，不要 Logo", "", "generate", None),
+        ("不用原来的 Logo。", "", "omit", None),
+        ("不要生成图片，直接用 https://cdn.example/cover.png?v=2", "", "provided",
+         "https://cdn.example/cover.png?v=2"),
+        ("分享图用 https://example.com/api/v1/seo-agent/chat/images/demo", "", None, None),
+    ],
+)
+async def test_suggestion_image_preferences_control_public_og(reply, earlier, action, expected_image):
+    source = PageSource()
+    logo = "https://example.com/brand/logo.png"
+    preview = "https://example.com/api/v1/seo-agent/chat/images/demo"
+    original = preview if preview in reply else logo
+    source.html = source.html.replace("<title>", f'<meta property="og:image" content="{original}"><title>')
+    output = draft()
+    output.update(
+        schema_type=None, json_ld=None,
+        image_url=original, image_citation={"source_path": "/og_image", "quote": original},
+        questions=["请补充作者、日期。", "企业联系电话是多少？", "请确认结构化数据类型。"],
+        missing_information=["请填公司地址", "缺作者日期", "请给分享图地址"],
+    )
+    result = await workflow(source, Model(output), user_messages=[earlier, reply]).execute({})
+    assert result.data["share_image_action"] == action
+    assert result.data["suggestion_status"] == "draft"
+    assert not result.data["questions"] and not result.metadata.get("human_input")
+    proposal = result.data["proposal"]
+    assert proposal["open_graph"].get("og:image") == expected_image
+    assert proposal["json_ld"] is None
+    assert original not in proposal["html_snippet"]
+    if expected_image:
+        assert expected_image in proposal["html_snippet"]
+    assert not any(word in str(proposal["missing_information"]) for word in ("作者", "电话", "公司地址"))
+    assert result.data["evidence"]["page"]["raw"]["data"]["og_image"] == original
+
+
+@pytest.mark.asyncio
+async def test_image_only_reply_does_not_substitute_for_missing_body():
+    from src.agent.tools.base import ToolRuntimeContext
+
+    source, model = PageSource(), Model()
+    source.html = "<title>Field notes</title><body></body>"
+    first = await workflow(source, model).execute({})
+    reply = "没有图地址，你生成一个"
+    result = await workflow(source, model, user_messages=[reply]).execute({}, ToolRuntimeContext(
+        metadata={"human_input_resume": {
+            "request_id": "missing-body", "tool_arguments": {},
+            "tool_result": first.model_dump(mode="json"), "answer": reply,
+        }},
+    ))
+    assert result.data["questions"] == first.data["questions"]
+    assert not model.contexts and len(source.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "legacy_waiting"),
+    [("ready", False), ("not_configured", False), ("failed", False),
+     ("needs_subject", False), ("interrupted", False), ("ready", True)],
+)
+async def test_compound_followup_queues_one_recoverable_share_image_and_delivers_tdk(
+    outcome, legacy_waiting,
+):
+    from copy import deepcopy
+    from dataclasses import replace
+
+    from src.agent.models import AgentRun, RunStatus
+    from src.agent.providers.base import ModelChunk, ToolCall
+    from src.agent.providers.fake import FakeModelProvider
+    from src.agent.runtime.executor import AgentExecutor
+    from src.core.exceptions import InternalAdapterError
+    from src.seo_agent.workflows.page_suggestions import PLANNED_SHARE_IMAGE_ID
+
+    target = "https://example.com/services/digital-marketing"
+    logo = "https://example.com/assets/Logo.png"
+    preview = "/api/v1/seo-agent/chat/images/715a6276-9b75-4b4f-9ba2-842ebde50f3d"
+    request = "请根据页面内容拟定 TDK、OG 和结构化数据建议。"
+    reply = "营销数字化，没有图地址" if legacy_waiting else "营销数字化，没有图地址，你生成一个"
+    source = PageSource()
+    source.html = (
+        f'<head><title>企业服务</title><meta property="og:image" content="{logo}"></head>'
+        '<body><h1>企业服务</h1><p>我们提供渠道管理和营销数据分析服务。</p></body>'
+    )
+    contexts, generated, checkpoints = [], [], []
+
+    class StructuredModel:
+        def with_structured_output(self, schema, **kwargs):
+            async def ainvoke(messages):
+                context = json.loads(messages[-1].content)
+                contexts.append(context)
+                if schema.__name__ == "ShareImageBrief":
+                    return schema.model_validate({"visual": None if outcome == "needs_subject" else {
+                        "subject": "营销数据看板", "scene": "会议室的营销数据看板",
+                        "tone": "自然光", "composition": "留出适合裁剪的边缘", "avoid": "品牌标识",
+                        "evidence_quote": "营销数字化",
+                    }})
+                resumed = reply in context["page"]["user_supplied"]
+                return schema.model_validate({
+                    **draft(), "title": "营销数字化服务" if resumed else "企业服务",
+                    "description": "查看渠道管理和营销数据分析服务。",
+                    "schema_type": None, "json_ld": None,
+                    "citations": [{"source_path": "/h1s/0", "quote": "企业服务"}] + ([{
+                        "source_path": "/user_supplied/1", "quote": "营销数字化",
+                    }] if resumed else []),
+                    "image_url": logo, "image_citation": {"source_path": "/og_image", "quote": logo},
+                    "questions": ["这个页面主要提供什么内容？", "请给分享图片地址。", "企业地址是什么？"],
+                    "missing_information": ["请补作者或发布日期。", "企业联系地址缺失。"],
+                })
+            return SimpleNamespace(ainvoke=ainvoke)
+
+    class Images:
+        configured = True
+
+        async def generate(self, prompt, **dimensions):
+            generated.append((prompt, dimensions))
+            if outcome == "failed":
+                raise InternalAdapterError("fixture image failure")
+            if outcome == "interrupted":
+                raise asyncio.CancelledError
+            return {"image_url": preview, "content_type": "image/png", "size_bytes": 200}
+
+    class Persistence:
+        async def persist_event(self, run, event):
+            pass
+
+        async def finalize(self, run):
+            pass
+
+        async def save_checkpoint(self, run, *, stage, **kwargs):
+            if any(call.get("planned") for call in run.pending_tool_calls):
+                checkpoints.append(replace(
+                    run, messages=deepcopy(run.messages), events=list(run.events),
+                    pending_tool_calls=deepcopy(run.pending_tool_calls),
+                ))
+            return {}
+
+    runner = StructuredModelRunner(model_factory=StructuredModel)
+
+    async def configure(url, messages):
+        from src.seo_agent.specialist import build_seo_system_prompt
+
+        site = {**SITE, "target_url": url}
+        registry = build_seo_agent_registry(
+            source, site, model_runner=runner, user_messages=messages,
+            image_generator=None if outcome == "not_configured" else Images(),
+        )
+        return build_seo_system_prompt(site, registry.schemas()), registry
+
+    from src.seo_agent.specialist import run_seo_specialist
+
+    async def execute(executor, current):
+        dialog = [m for m in current.messages if m["role"] == "user"]
+        await executor.run(current, workflow=lambda run: run_seo_specialist(
+            executor, run, configure=configure, dialog=dialog,
+        ))
+
+    _, registry = await configure(target, [request])
+    provider = FakeModelProvider([[ModelChunk(
+        tool_calls=[ToolCall("suggest", "seo_page_suggestions", {"url": target})],
+    )]])
+    executor = AgentExecutor(provider, registry)
+    run = AgentRun("seo-compound", [{"role": "user", "content": request}],
+                   dispatch_state={"target_url": target})
+    await execute(executor, run)
+    assert run.status == RunStatus.WAITING_FOR_INPUT
+    assert run.human_input.questions == ["这个页面主要提供什么内容？"]
+    waiting = run.human_input.tool_result["data"]
+    assert "questions" not in {item["key"] for item in waiting["items"]}
+    if legacy_waiting:
+        # Simulate an older checkpoint that asked for an image URL despite the earlier request.
+        request += "分享图请你生成一张。"
+        run.messages[1]["content"] = request
+        run.human_input.questions.append("请给分享图片地址。")
+    run.status = RunStatus.RECOVERING
+    run.human_input.answer = reply
+    run.messages.append({"role": "user", "content": reply})
+    run.emit("input.submitted", {"request_id": run.human_input.request_id, "answer": reply})
+    provider = FakeModelProvider([])  # Continuing this run requires no new planner decision.
+    executor = AgentExecutor(provider, registry, persistence=Persistence())
+    if outcome == "interrupted":
+        run.pause_requested = True
+        with pytest.raises(asyncio.CancelledError):
+            await execute(executor, run)
+        run.pause_requested = False
+        await execute(executor, run)
+    else:
+        await execute(executor, run)
+    assert run.status == RunStatus.COMPLETED and run.human_input is None
+    assert provider.calls == 0 and len(source.calls) == 1
+    assert len(generated) == (1 if outcome in {"ready", "failed", "interrupted"} else 0)
+    suggestions = [e.payload["result"]["data"] for e in run.events if e.type == "tool.completed"
+                   and e.payload.get("name") == "seo_page_suggestions"]
+    continued = suggestions[-1]
+    assert continued["coverage"]["page"]["reused_from_checkpoint"]
+    assert continued["evidence"]["page"] == waiting["evidence"]["page"]
+    assert not continued["questions"]
+    proposal = continued["proposal"]
+    assert proposal["user_supplied"] == [request, reply]
+    assert proposal["title"] == "营销数字化服务"
+    assert "og:image" not in proposal["open_graph"] and proposal["json_ld"] is None
+    image_events = [e for e in run.events if e.payload.get("tool_call_id") == PLANNED_SHARE_IMAGE_ID]
+    assert [e.type for e in image_events] == [
+        "tool.started", "tool.failed" if outcome == "interrupted" else "tool.completed",
+    ]
+    image_result = image_events[-1].payload["result"]["data"]
+    if outcome == "ready":
+        assert image_result["evidence"]["image"]["asset"]["image_url"] == preview
+        assert image_result["evidence"]["page"] == continued["evidence"]["page"]
+        assert reply in contexts[-1]["user_request"]
+        assert "预览" in run.messages[-1]["content"]
+    else:
+        assert "未取得可用的分享图" in run.messages[-1]["content"]
+    assert "TDK" in run.messages[-1]["content"]
+
+    # Recreate the crash window between persisting the image receipt and updating the checkpoint.
+    restored = checkpoints[0]
+    restored.events.extend(image_events)
+    restored.sequence = image_events[-1].sequence
+    restored.status = RunStatus.RECOVERING
+    generated_count = len(generated)
+    await execute(AgentExecutor(provider, registry), restored)
+    assert restored.status == RunStatus.COMPLETED and not restored.pending_tool_calls
+    assert len(generated) == generated_count and len(source.calls) == 1
+    assert len([e for e in restored.events if e.payload.get("tool_call_id") == PLANNED_SHARE_IMAGE_ID]) == 2
 
 
 def test_observation_preserves_nested_tool_schema_and_still_redacts_credentials():

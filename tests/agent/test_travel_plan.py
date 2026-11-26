@@ -175,7 +175,7 @@ def test_unknown_basis_or_incomplete_quote_never_becomes_a_full_cost():
 
 
 def test_unknown_room_count_is_not_used_as_one_room():
-    (plan,) = _plan(request=_request(rooms=None))["plans"]
+    (plan,) = _plan(request=_request(lodging=True, rooms=None))["plans"]
     assert plan["known_cost"] == "602.00"
     assert not plan["complete_price"]
     assert any("房间" in item for item in plan["missing"])
@@ -251,6 +251,29 @@ def test_unpriced_mode_is_retained_and_ids_are_stable():
     assert _plan(outbound=outbound[::-1])["plans"] == plans
 
 
+@pytest.mark.parametrize("blocked_by", ["deadline", "budget"])
+def test_known_conflicts_rank_below_unpriced_candidates(blocked_by):
+    late = blocked_by == "deadline"
+    request = (
+        _request(arrive_by="2027-01-01T09:30:00+08:00", venue="会场", buffer_minutes=0)
+        if late
+        else _request(budget_cny="1300")
+    )
+    complete = _transport(
+        "complete", arrives_at=f"2027-01-01T{'10' if late else '09'}:00:00+08:00",
+    )
+    partial = [_transport(f"partial-{i}", amount=None) for i in range(3)]
+    routes = {offer["id"]: _route(15) for offer in partial}
+    plans = _plan(request=request, outbound=[complete, partial[0]], commute_by_offer=routes)["plans"]
+    assert [plan["transport"] for plan in plans] == ["partial-0", "complete"]
+    if late:
+        assert plans[1]["arrival_status"] == "late"
+    else:
+        assert plans[1]["budget_status"] == "exceeded"
+    plans = _plan(request=request, outbound=[complete, *partial], commute_by_offer=routes)["plans"]
+    assert len(plans) == 3 and all(not plan["complete_price"] for plan in plans)
+
+
 def test_no_offer_and_invalid_return_dates_have_no_artificial_zero():
     report = _plan(outbound=[], inbound=[], hotels=[])
     assert report["plans"] == []
@@ -297,3 +320,20 @@ def test_outbound_day_item_with_an_earlier_arrival_is_not_used():
     )["plans"]
     assert plan["transport"] is None
     assert not plan["complete_price"]
+
+
+
+def test_one_way_transport_does_not_include_return_hotel_or_ground():
+    (plan,) = _plan(request=_request(transport="one_way", lodging=False, return_on=None,
+                                     arrive_by="2027-01-01T10:00:00+08:00"))["plans"]
+    assert set(plan["cost_items"]) == {"outbound"}
+    assert plan["return_transport"] is None and plan["hotel"] is None
+    assert plan["arrival_status"] == "met"
+    assert plan["complete_price"]
+
+
+def test_hotel_only_does_not_require_transport():
+    (plan,) = _plan(request=_request(transport="none", lodging=True, origin=None))["plans"]
+    assert set(plan["cost_items"]) == {"hotel"}
+    assert plan["known_cost"] == "795.20"
+    assert plan["complete_price"]

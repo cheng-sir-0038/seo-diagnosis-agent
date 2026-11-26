@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import func, insert, select
+from sqlalchemy import func, insert, select, update
 
 from src.observability.client import ObservabilityClient
 from src.observability.schema import SpanRow
@@ -20,8 +20,10 @@ from src.seo_agent.db.models import (
     NotificationAttemptRow,
     NotificationDeliveryRow,
     OpportunityRow,
+    ScheduleRunRow,
     TaskPrdArtifactRow,
     WorkRecordRow,
+    WorkScheduleRow,
 )
 from src.seo_agent.notifications.email import EmailMessage, SmtpEmailProvider, SmtpSettings
 from src.seo_agent.notifications.service import NotificationService
@@ -273,9 +275,17 @@ async def test_schedule_coordinator_syncs_and_triggers_real_scan_run(context, pg
         )
         synced = await coordinator.sync()
         assert synced == 1
-        assert provider.scheduler.get_job(f"opportunity-scan:{schedule['id']}") is not None
-        run = await coordinator.run_scan(schedule["id"], slot_key="2026-07-23T06:30")
-        assert run["status"] == "RUNNING"
+        job_id = f"opportunity-scan:{schedule['id']}"
+        job = provider.scheduler.get_job(job_id)
+        assert job is not None
+        assert await coordinator.sync() == 1
+        assert provider.scheduler.get_job(job_id) is job
+        run, replay = await asyncio.gather(*(
+            coordinator.run_scan(schedule["id"], slot_key="2026-07-23T06:30") for _ in range(2)
+        ))
+        assert run == replay and run["status"] == "RUNNING"
+        assert run["scheduled_at"] == "2026-07-23T06:30:00+00:00"
+        assert await db.fetch_value(select(func.count()).select_from(ScheduleRunRow)) == 1
         assert (
             await db.fetch_value(
                 select(func.count())
@@ -292,6 +302,50 @@ async def test_schedule_coordinator_syncs_and_triggers_real_scan_run(context, pg
     finally:
         await provider.shutdown()
         await observability_db.shutdown()
+
+
+async def test_stale_scheduler_job_does_not_dispatch_disabled_or_archived_scan(context):
+    db, system, site, *_ = context
+    schedules = WorkScheduleService(db)
+    schedule = await schedules.create_schedule(
+        site_id=site["id"], schedule_type="OPPORTUNITY_SCAN", name="Daily", frequency="DAILY",
+        timezone="UTC", execution_time="06:30",
+    )
+    schedule_id = schedule["id"]
+    provider = LocalScheduleProvider()
+    coordinator = ScheduleAutomationCoordinator(db, provider, ScanRunService(db), system)
+    assert await coordinator.sync() == 1
+    job = provider.scheduler.get_job(f"opportunity-scan:{schedule_id}")
+    assert job is not None
+    await schedules.set_enabled(schedule_id, False)
+    assert await job.func(**job.kwargs) is None
+    await schedules.set_enabled(schedule_id, True)
+    await db.execute(update(WorkScheduleRow).where(WorkScheduleRow.id == schedule_id).values(
+        archived_at="2026-11-25T06:31:00+00:00",
+    ))
+    assert await job.func(**job.kwargs) is None
+    assert await db.fetch_value(select(func.count()).select_from(ScheduleRunRow)) == 0
+    assert await system.list_work_records(site["id"]) == []
+    assert await coordinator.sync() == 0
+    assert provider.scheduler.get_job(job.id) is None
+
+
+async def test_scheduler_reuses_previous_rows_with_seconds_in_timestamp(context):
+    db, system, site, *_ = context
+    schedule = await WorkScheduleService(db).create_schedule(
+        site_id=site["id"], schedule_type="OPPORTUNITY_SCAN", name="Daily", frequency="DAILY",
+        timezone="UTC", execution_time="06:30",
+    )
+    schedule_id = schedule["id"]
+    scans = ScanRunService(db)
+    previous = await scans.start(
+        schedule_id=schedule_id, trigger_type="SCHEDULED",
+        idempotency_key=f"scheduled-scan:{schedule_id}:2026-07-23T06:30",
+        scheduled_at="2026-07-23T06:30:01.003000+00:00",
+    )
+    coordinator = ScheduleAutomationCoordinator(db, LocalScheduleProvider(), scans, system)
+    assert await coordinator.run_scan(schedule_id, slot_key="2026-07-23T06:30") == previous
+    assert await db.fetch_value(select(func.count()).select_from(ScheduleRunRow)) == 1
 
 
 @pytest.mark.asyncio

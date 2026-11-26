@@ -1,0 +1,35 @@
+/* One trailing affordance for read-only evidence, without replacing native disclosure semantics. */
+summary.workbench-disclosure.workbench-disclosure {
+  position: relative;
+  list-style: none;
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  min-height: 36px;
+  margin: 0;
+  padding-inline-end: 34px;
+  border-radius: 7px;
+  cursor: pointer;
+}
+summary.workbench-disclosure::-webkit-details-marker { display: none; }
+summary.workbench-disclosure::marker { content: ''; }
+summary.workbench-disclosure::after {
+  position: absolute;
+  inset-inline-end: 13px;
+  top: 50%;
+  width: 7px;
+  height: 7px;
+  border: solid #605877;
+  border-width: 0 1.5px 1.5px 0;
+  content: '';
+  transform: translateY(-65%) rotate(45deg);
+  pointer-events: none;
+}
+details[open] > summary.workbench-disclosure::after { transform: translateY(-25%) rotate(225deg); }
+summary.workbench-disclosure.workbench-disclosure:hover {
+  background-color: var(--workbench-disclosure-hover, #f0eff8);
+}
+details[open] > summary.workbench-disclosure.workbench-disclosure {
+  background-color: var(--workbench-disclosure-open, #eeedf8);
+}
+summary.workbench-disclosure.workbench-disclosure:focus-visible { outline: 2px solid #6450d2; outline-offset: -2px; }

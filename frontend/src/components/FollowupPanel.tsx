@@ -10,6 +10,7 @@ import {
   type FollowupCase,
   type MedicalRecord,
   type RecordFields,
+  type ReviewIssue,
 } from '../services/followupApi'
 import './followup-panel.css'
 
@@ -45,14 +46,46 @@ interface Props {
   onContinue: (action: FollowupAction) => void
 }
 
+function ReviewIssues({ issues }: { issues: ReviewIssue[] }) {
+  return (
+    <ul className="followup-list">
+      {issues.map(({ item, text, source }, index) => (
+        <li key={`${source ?? item}:${index}`}>
+          <strong>{item}</strong> {text}{source && <small>{source}</small>}
+        </li>
+      ))}
+    </ul>
+  )
+}
+
+function ComparisonSource({ entry, label }: { entry: Evidence, label: string }) {
+  const { record, original, source } = entry
+  const fieldNames = Object.keys(editFields) as (keyof RecordFields)[]
+  const correctedFields = original ? fieldNames.filter(field => original[field] !== record[field]) : []
+  return (
+    <div className="followup-comparison-source">
+      <p><strong>{label}</strong> {record.record_date ?? '日期待核对'} {readValue(record)}</p>
+      <small>{source}</small>
+      <small>标本 {record.specimen ?? '待核对'} / 方法 {record.method ?? '待核对'}</small>
+      {record.reference_range && <small>原报告参考范围 {record.reference_range}</small>}
+      {record.flag && <small>原报告标记 {record.flag}</small>}
+      {original && correctedFields.length > 0 && (
+        <small>含人工修订。修订前 {correctedFields.map(field => `${editFields[field]} ${original[field] ?? '未填写'}`).join(' / ')}</small>
+      )}
+    </div>
+  )
+}
+
 function FollowupResults({ data }: { data: FollowupCase }) {
   if (!data.draft) return null
   const evidence = new Map(data.records.map(entry => [entry.id, entry]))
+  const context = data.records.filter(({ record }) => record.kind !== 'visit_plan' && record.kind !== 'report')
   return (
     <div className="followup-results">
       <section aria-label="报告对照">
         <h4>报告对照</h4>
-        {data.draft.comparisons.length === 0 && <p>目前没有具备两次记录的同名项目。</p>}
+        <p>差值只反映两条记录的数值变化。参考范围与标记按各自原报告展示。</p>
+        {data.draft.comparisons.length === 0 && <p>目前没有可逐项对照的两份记录。</p>}
         <ul className="followup-findings">
           {data.draft.comparisons.map(({ item, earlier, later, delta, unit, reasons }) => {
             const before = evidence.get(earlier)
@@ -61,19 +94,22 @@ function FollowupResults({ data }: { data: FollowupCase }) {
             return (
               <li key={later}>
                 <strong>{item}</strong>
-                <p>{before.record.record_date ?? '日期待核对'} {readValue(before.record)} → {after.record.record_date ?? '日期待核对'} {readValue(after.record)}</p>
-                <p>{delta !== null ? `后次 − 前次 = ${delta} ${unit}` : `待核对 · ${reasons.join('、')}`}</p>
-                <small>{before.source} · {after.source}{(before.original || after.original) && ' · 含人工修订'}</small>
+                <p>{delta !== null ? `后次 − 前次 = ${delta} ${unit}` : `未计算差值（${reasons.join('、')}）`}</p>
+                <ComparisonSource entry={before} label={delta !== null ? '前次' : '记录 1'} />
+                <ComparisonSource entry={after} label={delta !== null ? '后次' : '记录 2'} />
               </li>
             )
           })}
         </ul>
-        {data.draft.issues.map(({ item, text, source }, index) => (
-          <p key={`${source ?? item}:${index}`} className="followup-fact">{item} · {text}{source && <small>{source}</small>}</p>
-        ))}
       </section>
       <section aria-label="复诊准备清单">
         <h4>复诊准备清单</h4>
+        {data.draft.issues.length > 0 && (
+          <>
+            <h5>复诊时可核对的问题</h5>
+            <ReviewIssues issues={data.draft.issues} />
+          </>
+        )}
         <ul className="followup-list">
           {data.files.filter(file => file.rows > 0).map(file => <li key={file.digest}>携带 {file.name}</li>)}
           {data.draft.plans.map(id => {
@@ -88,6 +124,22 @@ function FollowupResults({ data }: { data: FollowupCase }) {
             )
           })}
         </ul>
+        {context.length > 0 && (
+          <details className="followup-review">
+            <summary className="workbench-disclosure">供复诊核对的日常与用药资料（{context.length} 条）</summary>
+            {context.some(({ record }) => record.kind === 'purchase') && <p>购药记录仅用于核对购买情况。当前使用情况需另行确认。</p>}
+            <ul className="followup-list">
+              {context.map(({ id, record, source }) => (
+                <li key={id}>
+                  <strong>{record.item}</strong> {recordLabels[record.kind]}，{record.record_date ?? '日期待核对'}
+                  {record.value && <small>记录值 {readValue(record)}</small>}
+                  {record.note && <small>资料备注：{record.note}</small>}
+                  <small>{source}</small>
+                </li>
+              ))}
+            </ul>
+          </details>
+        )}
         {data.saved && (
           <div className="followup-saved">
             <strong>已保存 {data.saved.tasks.length} 条待办</strong>
@@ -142,8 +194,8 @@ export default function FollowupPanel({ runId, access, canContinue, onContinue }
 
   const subjectId = data.subject_id ?? subject.trim()
   const writable = canContinue && !data.saved
-  const reportDates = new Set(data.records.filter(entry => entry.record.kind === 'report' && entry.record.record_date)
-    .map(entry => entry.record.record_date)).size
+  const canCompare = (data.report_review?.comparable_pairs ?? 0) > 0
+  const reportIssues = data.report_review?.issues ?? []
 
   return (
     <section className="followup-panel" aria-label="复诊资料区">
@@ -188,7 +240,7 @@ export default function FollowupPanel({ runId, access, canContinue, onContinue }
       </ul>
       {data.records.length > 0 && (
         <details className="followup-timeline" open={data.draft === null}>
-          <summary>记录时间线 <span>{data.records.length} 条</span></summary>
+          <summary className="workbench-disclosure">记录时间线 <span>{data.records.length} 条</span></summary>
           <div className="followup-table-scroll">
             <table aria-label="资料与记录摘要">
               <thead><tr><th>记录日期</th><th>项目与原值</th><th>资料来源</th>{writable && <th>核对</th>}</tr></thead>
@@ -228,13 +280,26 @@ export default function FollowupPanel({ runId, access, canContinue, onContinue }
           )}
         </details>
       )}
+      {writable && !data.draft && data.records.length > 0 && (
+        <div className="followup-review">
+          <p role="status">{canCompare
+            ? `有 ${data.report_review.comparable_pairs} 个项目可计算差值。`
+            : '目前没有可直接计算差值的报告，可先整理现有记录和已有安排。'}</p>
+          {reportIssues.length > 0 && (
+            <details open={!canCompare}>
+              <summary className="workbench-disclosure">报告待核对事项（{reportIssues.length} 条）</summary>
+              <ReviewIssues issues={reportIssues} />
+            </details>
+          )}
+        </div>
+      )}
       <FollowupResults data={data} />
       {writable && (
         <footer className="followup-buttons">
           {data.draft
             ? <Button type="primary" disabled={loading || !!editing} onClick={() => onContinue(followupActions.confirm)}>保存资料包与 {data.draft.pending_plans.length} 条待办</Button>
-            : <Button type="primary" disabled={loading || !!editing || reportDates < 2} onClick={() => onContinue(followupActions.prepare)}>整理并核对资料</Button>}
-          {!data.draft && data.records.length > 0 && reportDates < 2 && <Button disabled={loading || !!editing} onClick={() => onContinue(followupActions.available)}>按现有资料整理</Button>}
+            : canCompare && <Button type="primary" disabled={loading || !!editing} onClick={() => onContinue(followupActions.prepare)}>整理并核对资料</Button>}
+          {!data.draft && !canCompare && data.records.length > 0 && <Button type="primary" disabled={loading || !!editing} onClick={() => onContinue(followupActions.available)}>按现有资料整理</Button>}
           <Button type="text" disabled={loading} onClick={() => onContinue(followupActions.finish)}>结束本次整理</Button>
         </footer>
       )}

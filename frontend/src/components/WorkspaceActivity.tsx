@@ -8,16 +8,29 @@ import { lazy, Suspense, useEffect, useMemo, useState } from 'react'
 import { listWorkspaceTasks } from '../services/agentApi'
 import { specialists } from '../specialists'
 import { conversationStatus, taskStatus } from '../state/taskStatus'
-import type { ChatMessage, Conversation, WorkspaceTaskRow } from '../types/agent'
+import type { ChatMessage, Conversation, ToolRun, WorkspaceTaskRow } from '../types/agent'
+import { sanitizeAssistantContent } from './assistantContentSanitizer'
+import {
+  isCardResultData, isChartResultData, isPageMetadataData, isPagePerformanceData, isPresentationBase,
+  isSeoSearchOverviewResultData, isTableResultData, isTreeResultData, resolveLocalizedText, unwrapToolResult,
+} from './renderers/contracts'
 
 const timeFormat = new Intl.DateTimeFormat('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
 const dayFormat = new Intl.DateTimeFormat('zh-CN', { month: 'numeric', day: 'numeric' })
 const WorkspaceTrend = lazy(() => import('./WorkspaceTrend'))
 
-function TaskStatus({ status }: { status?: string }) {
+const statusIcons: Partial<Record<string, typeof SyncOutlined>> = {
+  running: SyncOutlined,
+  waiting: ClockCircleOutlined,
+  success: CheckCircleOutlined,
+  error: ExclamationCircleOutlined,
+}
+
+function TaskStatus({ status, showIcon = false }: { status?: string; showIcon?: boolean }) {
   if (!status) return null
   const [label, tone] = taskStatus(status)
-  return <span className={`workspace-state workspace-state-${tone}`}>{label}</span>
+  const Icon = showIcon ? statusIcons[tone] : undefined
+  return <span className={`workspace-state workspace-state-${tone}`}>{Icon && <Icon aria-hidden="true" />}{label}</span>
 }
 
 function formatActivityTime(value: string) {
@@ -25,10 +38,83 @@ function formatActivityTime(value: string) {
   return Number.isNaN(time.getTime()) ? '' : timeFormat.format(time)
 }
 
+const compactText = (value: string) => value.replace(/\s+/g, ' ').trim()
+
+function* visibleResultText(tool: ToolRun): Generator<string> {
+  if (tool.status !== 'completed' || !tool.render_hint) return
+  const data = unwrapToolResult(tool.result)
+  if (isPresentationBase(data)) {
+    yield resolveLocalizedText(data.title)
+    yield resolveLocalizedText(data.description)
+  }
+  // Index only known display fields. Never flatten the tool receipt or any nested payload.
+  if (tool.render_hint === 'cards' && isCardResultData(data)) {
+    for (const item of data.items) {
+      yield item.title
+      if (item.summary) yield item.summary
+      for (const entry of item.metadata ?? []) yield `${entry.label} ${entry.value}`
+    }
+  } else if (tool.render_hint === 'table' && isTableResultData(data)) {
+    for (const row of data.rows) {
+      const cells = data.columns.flatMap(column => {
+        const value = row[column.key]
+        if (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'boolean') return []
+        if (column.data_type === 'url' || column.formatter === 'compact_url') return []
+        return column.value_map?.[String(value)] ?? String(value)
+      })
+      yield cells.join(' ')
+    }
+  } else if (tool.render_hint === 'tree' && isTreeResultData(data)) {
+    const nodes = [...data.nodes]
+    while (nodes.length) {
+      const node = nodes.pop()!
+      yield node.title
+      nodes.push(...(node.children ?? []))
+    }
+  } else if (tool.render_hint === 'chart') {
+    if (isPageMetadataData(data)) {
+      for (const check of data.checks) yield [check.label, check.value].filter(Boolean).join(' ')
+      yield* data.headings
+    } else if (isPagePerformanceData(data) || isSeoSearchOverviewResultData(data)) {
+      for (const metric of data.metrics) yield `${metric.label} ${'display_value' in metric ? metric.display_value : metric.value}`
+    } else if (isChartResultData(data)) {
+      yield* data.labels
+      for (const series of data.datasets) yield series.label
+    }
+  }
+}
+
+function* messageSearchText(message: ChatMessage): Generator<string> {
+  yield message.role === 'assistant'
+    ? sanitizeAssistantContent(message.content).content.replace(/!?\[([^\]]*)\]\([^\n]*?\)/g, '$1')
+    : message.content
+  if (message.role === 'assistant') {
+    for (const tool of message.toolResults ?? []) yield* visibleResultText(tool)
+  }
+}
+
+function historyMatch(conversation: Conversation, query: string) {
+  if (!query) return { conversation }
+  for (let index = conversation.messages.length - 1; index >= 0; index--) {
+    const message = conversation.messages[index]
+    if (message.role === 'assistant' && message.runStatus === 'recovery_blocked'
+      && message.afterSequence && !message.content && !message.toolResults?.length) continue
+    for (const field of messageSearchText(message)) {
+      const text = compactText(field)
+      const match = text.toLocaleLowerCase().indexOf(query)
+      if (match < 0) continue
+      const start = Math.max(0, match - 18)
+      const end = Math.min(text.length, match + query.length + 55)
+      return { conversation, messageId: message.id, snippet: `${start ? '…' : ''}${text.slice(start, end)}${end < text.length ? '…' : ''}` }
+    }
+  }
+  return conversation.title.toLocaleLowerCase().includes(query) ? { conversation } : undefined
+}
+
 export function ConversationHistory({ conversations, activeId, onOpen, compact = false }: {
   conversations: Conversation[]
   activeId: string
-  onOpen: (id: string) => void
+  onOpen: (id: string, messageId?: string) => void
   compact?: boolean
 }) {
   const [query, setQuery] = useState('')
@@ -42,18 +128,21 @@ export function ConversationHistory({ conversations, activeId, onOpen, compact =
     }).catch(() => undefined)
     return () => request.abort()
   }, [conversations])
-  const matching = conversations.filter(({ title, messages }) => (
-    messages.length > 0 && title.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase())
-  )).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+  const matching = useMemo(() => {
+    const search = compactText(query).toLocaleLowerCase()
+    return conversations.filter(item => item.messages.length).map(item => historyMatch(item, search))
+      .filter(match => match !== undefined)
+      .sort((a, b) => b.conversation.updatedAt.localeCompare(a.conversation.updatedAt))
+  }, [conversations, query])
 
   return (
     <section className={`workbench-panel workspace-history${compact ? ' workspace-history-compact' : ''}`} aria-label="历史会话">
       <div className="workspace-history-header">
-        {compact ? <h2>历史会话</h2> : <><h1>历史会话</h1><p>搜索并继续此浏览器中保存的对话。</p></>}
+        {compact ? <h2>历史会话</h2> : <><h1>历史会话</h1><p>搜索此浏览器保存的会话标题、消息和结果。</p></>}
         <Input
           prefix={<SearchOutlined aria-hidden="true" />}
           aria-label="搜索会话"
-          placeholder="搜索会话标题…"
+          placeholder="搜索标题、消息或结果…"
           value={query}
           allowClear
           onChange={event => setQuery(event.target.value)}
@@ -61,7 +150,7 @@ export function ConversationHistory({ conversations, activeId, onOpen, compact =
       </div>
       {matching.length ? (
         <ul className="workspace-history-list">
-          {matching.map(conversation => {
+          {matching.map(({ conversation, messageId, snippet }) => {
             const { id, title, updatedAt } = conversation
             const latestRun = conversation.activeRun?.runId ?? conversation.messages.at(-1)?.runId
             const task = serverTasks.find(row => row.conversation_id === id && row.current_run_id === latestRun)
@@ -69,10 +158,11 @@ export function ConversationHistory({ conversations, activeId, onOpen, compact =
               : conversationStatus(conversation)
             return (
               <li key={id}>
-                <button type="button" aria-current={id === activeId ? 'true' : undefined} onClick={() => onOpen(id)}>
+                <button type="button" aria-current={id === activeId ? 'true' : undefined} onClick={() => onOpen(id, messageId)}>
                   <span className="workspace-row-icon"><MessageOutlined aria-hidden="true" /></span>
                   <span className="workspace-history-copy">
                     <strong title={title}>{title}</strong>
+                    {snippet && <span className="workspace-history-snippet">{snippet}</span>}
                     <time dateTime={updatedAt}>{formatActivityTime(updatedAt)}</time>
                   </span>
                   <TaskStatus status={status} />
@@ -182,7 +272,7 @@ export function WorkspaceActivity({ conversations, onOpen, recent = false }: {
   const visibleRows = recent ? scopedRows.slice(0, 3) : scopedRows.filter(row => matchesTaskFilter(row, filter))
 
   const panel = (
-    <section className="workbench-panel workbench-tasks" aria-label={recent ? '最近任务' : '任务列表'} aria-busy={loading}>
+    <section className={`workbench-panel workbench-tasks${recent ? ' workbench-recent' : ''}`} aria-label={recent ? '最近任务' : '任务列表'} aria-busy={loading}>
       <div className="workbench-panel-header">
         <h2><ProfileOutlined aria-hidden="true" />{recent ? '最近任务' : '任务列表'}</h2>
         {recent && <a href="#/tasks">查看全部任务 <RightOutlined aria-hidden="true" /></a>}
@@ -198,7 +288,7 @@ export function WorkspaceActivity({ conversations, onOpen, recent = false }: {
                   <span className="workspace-row-icon"><Icon aria-hidden="true" /></span>
                   <strong title={row.title}>{row.title}</strong>
                   <time dateTime={row.updated_at}>{formatActivityTime(row.updated_at)}</time>
-                  <TaskStatus status={row.status} />
+                  <TaskStatus status={row.status} showIcon={recent} />
                   <RightOutlined aria-hidden="true" />
                 </button>
               </li>

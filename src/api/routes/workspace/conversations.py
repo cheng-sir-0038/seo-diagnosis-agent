@@ -32,26 +32,24 @@ from src.agent.workspace.documents import (
     workspace_owner,
 )
 from src.agent.workspace.routing import ROUTING_PROMPT, Route, Specialist
-from src.agent.workspace.supervisor import WorkspaceSupervisor, conversation_context
+from src.agent.workspace.team import WorkspaceTeam, conversation_context
+from src.api.routes.workspace.directory import ToolDirectory, describe_specialist
 from src.api.routes.workspace.documents import DocumentId, OptionalWorkspaceKey, document_store
 from src.api.routes.workspace.followup import router as followup_router
 from src.core.cache import cache_manager
 from src.core.config import settings
-from src.education_agent.skills import EDUCATION_SKILLS, education_tools
+from src.education_agent.skills import education_tools
 from src.facade.data_facade import facade
 from src.followup_agent.store import FollowupCaseStore, access_hash
 from src.followup_agent.workflow import (
-    FOLLOWUP_SKILL,
     SAFE_INTENT,
     FollowupCommand,
     explicit_followup,
     followup_tools,
 )
 from src.healthcare_agent import build_healthcare_registry
-from src.healthcare_agent.skills import available_healthcare_skills
 from src.observability.runtime import observability_client, observability_database
-from src.procurement_agent.tools import PROCUREMENT_SKILL, procurement_tools
-from src.seo_agent.chat.runtime import build_seo_system_prompt
+from src.procurement_agent.tools import procurement_tools
 from src.seo_agent.chat.tools import build_seo_agent_registry
 from src.seo_agent.geo_a2a import configured_citation_client
 from src.seo_agent.runtime import (
@@ -60,8 +58,9 @@ from src.seo_agent.runtime import (
     seo_chat_recovery_service,
     structured_model_automation,
 )
+from src.seo_agent.specialist import build_seo_system_prompt
 from src.seo_agent.workflows.cloudflare_images import cloudflare_share_images
-from src.travel_agent.tools import TRAVEL_SKILL, travel_tools
+from src.travel_agent.tools import travel_tools
 
 site_chat_router = APIRouter(prefix="/seo-agent/chat", tags=["SEO Agent Chat"])
 router = APIRouter(prefix="/chat", tags=["Conversations"])
@@ -124,28 +123,6 @@ class WorkspaceRunStats(BaseModel):
     total_tokens: int | None = None
 
 
-class DirectoryTool(BaseModel):
-    name: str
-    description: str
-
-
-class DirectorySkill(BaseModel):
-    name: str
-    label: str
-    tools: list[str]
-
-
-class SpecialistTools(BaseModel):
-    agent: Specialist
-    tools: list[DirectoryTool]
-    skills: list[DirectorySkill] = Field(default_factory=list)
-    note: str | None = None
-
-
-class ToolDirectory(BaseModel):
-    specialists: list[SpecialistTools]
-
-
 def build_conversation_model() -> ModelProvider:
     return DeepSeekProvider(
         api_key=settings.deepseek_api_key,
@@ -184,6 +161,7 @@ async def _execute(
     conversation_id: str | None,
     document_context: str | None = None,
 ) -> None:
+    """Execute a workspace team, standalone SEO chat or document-only run."""
     run = run_manager.get(run_id)
     if run is None:
         return
@@ -240,7 +218,7 @@ async def _execute(
     elif registry is not None:
         await executor.run(run)
     else:
-        supervisor = WorkspaceSupervisor(
+        team = WorkspaceTeam(
             executor, structured_model_automation.model_runner, _workspace_seo,
             lambda: build_healthcare_registry(database=seo_chat_harness_store.database),
             seo_chat_harness_store.completed_dialog,
@@ -249,7 +227,7 @@ async def _execute(
             travel_registry=_travel_registry,
             procurement_registry=_procurement_registry,
         )
-        await executor.run(run, workflow=supervisor.execute)
+        await executor.run(run, workflow=team.execute)
 
 
 def _seo_registry(site: dict[str, Any], user_messages: list[str]) -> ToolRegistry:
@@ -296,7 +274,7 @@ async def _workspace_seo(
 async def list_workspace_tools(
     conversation_id: str | None = Query(default=None, min_length=1, max_length=256),
 ) -> ToolDirectory:
-    """按当前会话已确认的目标列出专员的工具，仅查看注册表。"""
+    """列出专员已登记的能力与公开的静态提示词。"""
     previous = {}
     if conversation_id and _durable_enabled():
         previous = await seo_chat_harness_store.latest_dispatch_state(
@@ -306,8 +284,8 @@ async def list_workspace_tools(
     note = None if target else "指定网页后会载入该页可用的检查工具。"
     try:
         site = await _workspace_site(target)
-    except ValueError as exc:
-        seo, note = ToolRegistry(), str(exc)
+    except ValueError:
+        seo, note = ToolRegistry(), "当前目标不可用于 SEO 调查。"
     else:
         seo = _seo_registry(site, [])
     healthcare = build_healthcare_registry(database=seo_chat_harness_store.database)
@@ -315,25 +293,8 @@ async def list_workspace_tools(
         (agent, education_tools(agent), None)
         for agent in (Specialist.LEARNING, Specialist.EXAM_PREP)
     ]
-    skills_by_agent = {Specialist.HEALTHCARE: available_healthcare_skills(healthcare)}
-    for name in EDUCATION_SKILLS.names():
-        skill = EDUCATION_SKILLS.get(name)
-        skills_by_agent.setdefault(Specialist(skill.domain), []).append(skill)
-    skills_by_agent[Specialist.FOLLOWUP] = [FOLLOWUP_SKILL]
-    skills_by_agent[Specialist.TRAVEL] = [TRAVEL_SKILL]
-    skills_by_agent[Specialist.PROCUREMENT] = [PROCUREMENT_SKILL]
     return ToolDirectory(specialists=[
-        SpecialistTools(
-            agent=agent, note=description,
-            skills=[
-                DirectorySkill(name=skill.name, label=skill.description, tools=skill.tools)
-                for skill in skills_by_agent.get(agent, [])
-            ],
-            tools=[
-                DirectoryTool(name=tool.name, description=tool.description)
-                for tool in registry.values()
-            ],
-        )
+        describe_specialist(agent, registry, description)
         for agent, registry, description in (
             (Specialist.HEALTHCARE, healthcare, None), (Specialist.SEO, seo, note), *education,
             (Specialist.FOLLOWUP, followup_tools(), "使用本次提供的资料整理随访与复诊准备清单。"),
@@ -344,6 +305,7 @@ async def list_workspace_tools(
 
 
 async def _schedule_restored_run(run: AgentRun) -> None:
+    """Rebuild the live dependencies for a restored run before re-entering it."""
     if run.site_id is None:
         provider = build_conversation_model()
         run.task = asyncio.create_task(

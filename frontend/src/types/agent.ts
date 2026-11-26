@@ -57,11 +57,26 @@ export interface AppliedSkill {
   label: string
 }
 
+export interface DirectorySkillUsage {
+  scenario: string
+  inputs: string
+  rules: string
+  output: string
+}
+
 export interface SpecialistDirectoryData {
   specialists: {
     agent: Specialist
-    tools: { name: string, description: string }[]
-    skills?: { name: string, label: string, tools: string[] }[]
+    tools: {
+      name: string
+      description: string
+      guidance?: string | null
+      availability_note?: string | null
+      skill_usage?: DirectorySkillUsage | null
+    }[]
+    skills?: { name: string, label: string, summary?: string, tools: string[] }[]
+    default_prompts?: { id: string, label: string, text: string }[]
+    deterministic_path?: string | null
     note?: string | null
   }[]
 }

@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from src.agent.models import HumanInputRequest
+from src.agent.models import AgentRun, HumanInputRequest
 from src.agent.tools.base import AgentTool, RenderHint, ToolProtocol, ToolResult, ToolRuntimeContext
 from src.core.exceptions import ErrorCode, InternalAdapterError
 from src.models.common import DataSource
@@ -18,6 +18,7 @@ from src.observability.instrumentation import observed_operation
 from src.observability.models import SpanKind, Status
 from src.seo_agent.workflows.cloudflare_images import MODEL, CloudflareShareImages, ShareImageAsset
 from src.seo_agent.workflows.execution import WorkflowSteps
+from src.seo_agent.workflows.page_suggestions import share_image_handoff
 from src.seo_agent.workflows.structured_model import StructuredModelRunner
 
 
@@ -70,6 +71,9 @@ class ShareImageWorkflow(AgentTool):
     def resolve_render_hint(self, result_payload: dict[str, Any]) -> RenderHint | None:
         return "cards" if result_payload["data"].get("image_status") == "ready" else None
 
+    def planned_runtime_metadata(self, run: AgentRun) -> dict[str, Any]:
+        return {"page_suggestion": share_image_handoff(run)}
+
     async def execute(
         self, arguments: dict[str, Any], runtime: ToolRuntimeContext | None = None
     ) -> ToolResult:
@@ -78,10 +82,22 @@ class ShareImageWorkflow(AgentTool):
             {self.page.name: self.page}, self.timeout, self.observability, runtime
         )
         resume = runtime.metadata.get("human_input_resume") if runtime else None
+        handoff = runtime.metadata.get("page_suggestion") if runtime else None
+        proposal = (handoff or {}).get("proposal") or {}
+        suggested_page = (handoff or {}).get("evidence", {}).get("page")
+        handoff_users = proposal.get("user_supplied") or (handoff or {}).get("user_supplied") or []
         prior = (
             (resume or {}).get("tool_result", {}).get("data", {}).get("evidence", {}).get("page")
         )
-        if prior and resume["tool_arguments"] == arguments:
+        if handoff is not None:
+            payload = suggested_page
+            if payload is not None:
+                steps.evidence["page"] = payload
+            steps.coverage["page"] = {
+                **handoff.get("coverage", {}).get("page", {}), "reused_from_checkpoint": True,
+            }
+            user_title = None
+        elif prior and resume["tool_arguments"] == arguments:
             payload = steps.evidence["page"] = prior
             steps.coverage["page"] = {"status": "complete", "reused_from_checkpoint": True}
             user_title = resume["answer"]
@@ -104,14 +120,18 @@ class ShareImageWorkflow(AgentTool):
             or not page.content_length_bytes or url.scheme not in {"http", "https"}
             or not url.hostname
         ):
-            if payload is not None:
+            if payload is not None or handoff is not None:
                 steps.coverage["page"].update(status="partial", error_code="INCOMPLETE_PAGE_HTML")
             return steps.finish("share_image", "页面分享图", [{
                 "key": "page", "title": "未取得完整页面",
-                "summary": "请提供当前站点内可公开访问的页面地址。",
+                "summary": (
+                    "没有足够的页面证据生成分享图。" if handoff is not None
+                    else "请提供当前站点内可公开访问的页面地址。"
+                ),
             }], limitations, image_status="not_generated")
 
         title_source, title = _first_text(
+            ("已校验文案草稿", proposal.get("title")),
             ("og:title", page.og_title), ("Title", page.title),
             ("H1", next(iter(page.h1s), None)), ("用户补充", user_title), limit=160,
         )
@@ -122,12 +142,14 @@ class ShareImageWorkflow(AgentTool):
                 "key": "title", "title": "页面缺少图片标题", "url": page.final_url,
                 "summary": question,
             }], limitations, image_status="not_generated")
-            result.metadata["human_input"] = HumanInputRequest(
-                questions=[question],
-            ).model_dump(mode="json")
+            if handoff is None:
+                result.metadata["human_input"] = HumanInputRequest(
+                    questions=[question],
+                ).model_dump(mode="json")
             return result
 
         description_source, description = _first_text(
+            ("已校验文案草稿", proposal.get("description")),
             ("og:description", page.og_description),
             ("Meta Description", page.meta_description), limit=240,
         )
@@ -138,6 +160,7 @@ class ShareImageWorkflow(AgentTool):
                 "description": description or "",
                 "excerpt": page.content_excerpt[:1000],
             },
+            user_request="\n".join(handoff_users)[-3000:] if handoff_users else self.user_request,
         )
         async with observed_operation(
             self.observability, "compose_share_image", kind=SpanKind.INTERNAL,
@@ -164,13 +187,14 @@ class ShareImageWorkflow(AgentTool):
         }
         if asset is not None:
             card["image_url"] = asset["image_url"]
+            steps.evidence["image"] = {"asset": asset, "usage": "preview_only"}
         return steps.finish(
             "share_image", "页面分享图", [card], limitations, variant="share-image",
             visual_status=visual_status, image_status=image_status,
         )
 
     async def _visual_brief(
-        self, steps: WorkflowSteps, url: str, evidence: dict[str, str],
+        self, steps: WorkflowSteps, url: str, evidence: dict[str, str], *, user_request: str,
     ) -> tuple[str, str | None]:
         if self.model_runner is None:
             return "not_configured", None
@@ -181,14 +205,14 @@ class ShareImageWorkflow(AgentTool):
                     prompt_key="seo.share_image.visual",
                     method="json_mode",
                     schema=ShareImageBrief,
-                    context={**evidence, "user_request": self.user_request},
+                    context={**evidence, "user_request": user_request},
                     operation="share_image_visual_brief",
                     business_object={"url": url},
                 )
         except Exception:
             return "unavailable", None
         visual = result.output.visual
-        sources = [*evidence.values(), self.user_request]
+        sources = [*evidence.values(), user_request]
         if visual is None or not any(visual.evidence_quote in source for source in sources):
             step["status"] = "needs_subject"
             return "needs_subject", None

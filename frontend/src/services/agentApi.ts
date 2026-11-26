@@ -13,9 +13,11 @@ export function agentApiUrl(path: string): string {
 
 export async function listWorkspaceTools(conversationId: string, signal?: AbortSignal): Promise<SpecialistDirectoryData> {
   const query = new URLSearchParams({ conversation_id: conversationId })
-  const response = await fetch(agentApiUrl(`/api/v1/chat/tools?${query}`), { signal })
+  const response = await fetch(agentApiUrl(`/api/v1/chat/tools?${query}`), { signal, cache: 'no-store' })
   if (!response.ok) throw new Error(`读取工具目录失败（${response.status}）`)
-  return response.json()
+  const directory: SpecialistDirectoryData = await response.json()
+  if (!Array.isArray(directory?.specialists)) throw new Error('工具目录格式不受支持')
+  return directory
 }
 
 export async function listWorkspaceTasks(conversationIds: string[], signal?: AbortSignal): Promise<WorkspaceTaskRow[]> {
@@ -118,7 +120,7 @@ export async function createAgentRun(messages: ChatMessage[], conversationId?: s
   let includeTurn = true
   const context = messages.flatMap(({ role, content, documents }, index) => {
     if (role === 'user') includeTurn = !documents?.length || index === messages.length - 1
-    return includeTurn ? [{ role, content }] : []
+    return includeTurn && (role === 'user' || content.trim()) ? [{ role, content }] : []
   })
   const response = await fetch(agentApiUrl(CHAT_RUNS), {
     method: 'POST',

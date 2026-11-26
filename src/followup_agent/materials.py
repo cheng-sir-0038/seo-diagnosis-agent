@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
@@ -177,14 +177,14 @@ def _decimal(text: str | None) -> Decimal | None:
     return value
 
 
-def _comparison(reports: list[Evidence]) -> dict:
-    earlier, later = reports[-2:]
+def _comparison(earlier: Evidence, later: Evidence, date_counts: Counter[date]) -> dict:
     a, b = earlier.record, later.record
     reasons = []
+    if a.subject_id != b.subject_id:
+        reasons.append("对象编号不一致")
     if not a.record_date or not b.record_date or a.record_date == b.record_date:
         reasons.append("缺少两个明确且不同的检查日期")
-    elif any(sum(entry.record.record_date == day for entry in reports) > 1
-             for day in (a.record_date, b.record_date)):
+    elif any(date_counts[day] > 1 for day in (a.record_date, b.record_date)):
         reasons.append("同一天有多条不同记录，需要确认对应报告")
     for field, name in (("unit", "单位"), ("specimen", "标本"), ("method", "方法")):
         x, y = getattr(a, field), getattr(b, field)
@@ -204,25 +204,90 @@ def _comparison(reports: list[Evidence]) -> dict:
     }
 
 
-def prepare_case(evidence: list[Evidence]) -> dict:
+def _select_comparison(reports: list[Evidence]) -> tuple[dict, list[dict]]:
+    dated = sorted(
+        (entry for entry in reports if entry.record.record_date is not None),
+        key=lambda entry: entry.record.record_date,
+    )
+    date_counts = Counter(entry.record.record_date for entry in dated)
+    previous_by_conditions: dict[tuple[str, str, str, str], Evidence] = {}
+    comparable = None
+    for later in dated:
+        row = later.record
+        if (
+            date_counts[row.record_date] != 1
+            or not (row.unit and row.specimen and row.method)
+            or _decimal(row.value) is None
+        ):
+            continue
+        conditions = (row.subject_id, row.unit, row.specimen, row.method)
+        if earlier := previous_by_conditions.get(conditions):
+            comparable = (earlier, later)
+        previous_by_conditions[conditions] = later
+    if comparable:
+        earlier, later = comparable
+        issues = []
+        for entry in dated:
+            if entry.record.record_date <= later.record.record_date:
+                continue
+            reasons = "、".join(_comparison(later, entry, date_counts)["reasons"])
+            issues.append({
+                "item": entry.record.item, "source": entry.source,
+                "text": f"更新的记录未纳入这组对照，请核对：{reasons}",
+            })
+        return _comparison(earlier, later, date_counts), issues
+
+    # Keep source rows visible for verification even when no delta can be calculated.
+    distinct_dates = list({entry.record.record_date: entry for entry in dated}.values())
+    if len(distinct_dates) >= 2:
+        earlier, later = distinct_dates[-2:]
+    elif dated and len(dated) < len(reports):
+        earlier = dated[-1]
+        later = next(entry for entry in reports if entry.record.record_date is None)
+    else:
+        earlier, later = reports[-2:]
+    comparison = _comparison(earlier, later, date_counts)
+    return comparison, [{
+        "item": later.record.item, "source": f"{earlier.source} / {later.source}",
+        "text": f"请核对两条原记录：{'、'.join(comparison['reasons'])}",
+    }]
+
+
+def review_reports(evidence: list[Evidence]) -> tuple[list[dict], list[dict]]:
     reports = defaultdict(list)
-    dates = set()
     issues = []
+    for entry in evidence:
+        if entry.record.kind != RecordKind.REPORT:
+            continue
+        reports[entry.record.item].append(entry)
+        if entry.record.record_date is None:
+            issues.append({"item": entry.record.item, "source": entry.source, "text": "记录日期待核对"})
+
+    comparisons = []
+    for item, group in reports.items():
+        if len(group) == 1:
+            issues.append({
+                "item": item, "source": group[0].source,
+                "text": "仅有一条报告记录。如需数值对照，请补充同一项目、日期不同且单位、标本、方法一致的报告",
+            })
+            continue
+        comparison, comparison_issues = _select_comparison(group)
+        comparisons.append(comparison)
+        issues.extend(comparison_issues)
+    return comparisons, issues
+
+
+def prepare_case(evidence: list[Evidence]) -> dict:
+    comparisons, issues = review_reports(evidence)
     plans = []
     for entry in evidence:
         row = entry.record
-        if row.record_date is None:
+        if row.kind != RecordKind.REPORT and row.record_date is None:
             issues.append({"item": row.item, "source": entry.source, "text": "记录日期待核对"})
-        if row.kind == RecordKind.REPORT:
-            reports[row.item].append(entry)
-            if row.record_date:
-                dates.add(row.record_date)
         if row.kind == RecordKind.VISIT_PLAN:
             plans.append(entry)
-    if len(dates) < 2:
-        issues.append({"item": "报告", "source": None, "text": "待补充另一份带检查日期的报告"})
     return {
-        "comparisons": [_comparison(group) for group in reports.values() if len(group) >= 2],
+        "comparisons": comparisons,
         "issues": issues,
         "plans": [plan.id for plan in plans],
         "pending_plans": [

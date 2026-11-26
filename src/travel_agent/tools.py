@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 from collections.abc import Awaitable, Callable
 from datetime import date
 from enum import StrEnum
@@ -33,8 +34,8 @@ TRAVEL_SKILL = Skill(
     description="商旅行程规划与核对",
     tools=[TRANSPORT, HOTELS, WEATHER, COMMUTE, COMPARE, SAVE],
     prompt_fragment=(
-        "travel 处理国内单目的地的出差去返程、住宿与会场安排，核对时间预算并保存用户选择。"
-        "即使缺日期或会场，也先派给 travel，保留明确的条件。用户贴的报价和链接是行程资料。"
+        "travel 处理国内单目的地的单程或往返交通、住宿与到访地点安排，核对时间预算并保存用户选择。"
+        "即使缺日期或城市，也先派给 travel，保留明确的条件。用户贴的报价和链接是行程资料。"
         "想做旅游站点的 SEO 仍归 seo。"
     ),
 )
@@ -47,12 +48,14 @@ class _Tool(AgentTool):
         description: str,
         schema: type[BaseModel],
         handler: Callable[..., Awaitable[dict]],
+        availability_note: str | None = None,
     ) -> None:
         self.name = name
         self.description = description
         self.schema = schema
         self.parameters_schema = schema.model_json_schema()
         self.handler = handler
+        self.availability_note = availability_note
 
     async def execute(
         self, arguments: dict, runtime: ToolRuntimeContext | None = None
@@ -68,7 +71,7 @@ class _TransportQuery(BaseModel):
     origin: str
     destination: str
     depart_on: date
-    return_on: date
+    return_on: date | None = None
     directions: list[Literal["outbound", "return"]] = Field(min_length=1, max_length=2)
 
 
@@ -167,18 +170,25 @@ def travel_tools(
     baidu_maps_ak: str = "",
 ) -> ToolRegistry:
     flyai_options = {"api_key": flyai_api_key, "executable": flyai_executable}
+    flyai_note = None
+    if not flyai_api_key.strip():
+        flyai_note = "飞猪实时查询未配置。"
+    elif not shutil.which(flyai_executable):
+        flyai_note = "服务器缺少 FlyAI 客户端，无法实时查询。"
+    commute_note = None if baidu_maps_ak.strip() else "百度地图未配置，无法查询接驳估算。"
 
     async def transport(
         origin: str,
         destination: str,
         depart_on: date,
-        return_on: date,
+        return_on: date | None,
         directions: list[str],
     ) -> dict:
-        legs = {
-            "outbound": (origin, destination, depart_on),
-            "return": (destination, origin, return_on),
-        }
+        legs = {"outbound": (origin, destination, depart_on)}
+        if return_on is not None:
+            legs["return"] = (destination, origin, return_on)
+        if "return" in directions and return_on is None:
+            raise ValueError("查询返程需要返程日期。")
         results = await asyncio.gather(
             *(flyai.search_transport(*legs[direction], **flyai_options) for direction in directions)
         )
@@ -238,10 +248,10 @@ def travel_tools(
 
     return ToolRegistry(
         [
-            _Tool(TRANSPORT, "查询去返程的飞猪火车和航班候选。", _TransportQuery, transport),
-            _Tool(HOTELS, "查询飞猪酒店和参考价。", _HotelQuery, hotels),
+            _Tool(TRANSPORT, "查询去返程的飞猪火车和航班候选。", _TransportQuery, transport, flyai_note),
+            _Tool(HOTELS, "查询飞猪酒店和参考价。", _HotelQuery, hotels, flyai_note),
             _Tool(WEATHER, "查询目的地逐日预报与出行建议。", _WeatherQuery, _forecast),
-            _Tool(COMMUTE, "查询车站或酒店到会场的百度地图驾车估算。", _CommuteQuery, commute),
+            _Tool(COMMUTE, "查询车站或酒店到指定地点的百度地图驾车估算。", _CommuteQuery, commute, commute_note),
             _Tool(
                 COMPARE, "按已核对的班次、报价、路线和预算生成行程方案。", _CompareQuery, _compare
             ),

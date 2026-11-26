@@ -99,7 +99,11 @@
   overflow-wrap: anywhere;
 }
 
-.followup-fact, .followup-saved { padding: 7px 8px; background: #f6f5ff; border-radius: 7px; }
+.followup-comparison-source { margin-top: 7px; padding-top: 6px; border-top: 1px solid var(--desk-line); }
+.followup-review { margin-top: 10px; overflow-wrap: anywhere; }
+.followup-review summary { cursor: pointer; font-weight: 600; }
+.followup-results h5 { margin: 8px 0 0; font-size: 13px; }
+.followup-saved { padding: 7px 8px; background: #f6f5ff; border-radius: 7px; }
 .followup-panel footer { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--desk-line); }
 
 @media (max-width: 700px) {

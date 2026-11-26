@@ -1,0 +1,61 @@
+.conversation-heading p {
+  overflow: hidden;
+  margin: 0 0 2px;
+  color: var(--desk-muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.workspace-in-conversation .chat-title-left .conversation-heading { display: grid; }
+.workspace-in-conversation .workspace-execution-step { min-height: 49px; }
+.workspace-in-conversation .workspace-execution-list li:has([data-status="completed"])::before { background: #279b64; }
+.workspace-in-conversation .workspace-execution-list li:has([data-status="waiting_for_input"])::before {
+  border: 2px solid #6a54e8;
+  background: #fff;
+}
+.workspace-in-conversation .workspace-input-surface.awaiting-input { border-color: #edaf62; }
+
+.workspace-history-snippet {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--desk-muted);
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+.workspace-history-compact .workspace-history-snippet { grid-column: 2 / -1; }
+.workspace-dialog-layout .chat-message[aria-current="true"] .chat-message-content {
+  outline: 2px solid #6a54e8;
+  outline-offset: 4px;
+  border-radius: 10px;
+}
+.workspace-receipt-notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 9px 12px;
+  border: 1px solid #e0dcfd;
+  border-radius: 10px;
+  background: #f6f5ff;
+  color: var(--desk-ink);
+  font-size: 13px;
+}
+
+@media (min-width: 1200px) {
+  .workspace-in-conversation .workspace-dialog-layout {
+    --history-width: clamp(250px, 21.7vw, 363px);
+    --execution-width: clamp(320px, 25.1vw, 420px);
+    gap: 9px;
+    padding: 14px 12px 12px 8px;
+  }
+  .workspace-in-conversation .workspace-history-compact { padding: 19px 15px; }
+  .workspace-in-conversation .workspace-history-compact .workspace-history-list button {
+    min-height: 72px;
+    align-content: center;
+    padding: 10px;
+  }
+}

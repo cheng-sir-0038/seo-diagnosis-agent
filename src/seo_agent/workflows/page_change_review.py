@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from typing import Any, Literal
 
@@ -15,6 +16,51 @@ from src.providers.page_metadata.client import normalize_site_url, normalized_ho
 from src.seo_agent.workflows.execution import WorkflowSteps
 
 FIELDS = ("title", "meta_description", "h1s", "canonical_url")
+
+
+def _display_value(value: Any) -> str:
+    if value is None:
+        return "未设置"
+    if isinstance(value, list) or value == "":
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def _evidence_metadata(label: str, snapshot_id: str | None, raw: dict | None) -> list[dict]:
+    metadata = [{"label": f"{label}快照 ID", "value": snapshot_id or "未取得"}]
+    if raw and isinstance(captured_at := raw["meta"].get("captured_at"), str):
+        metadata.append({"label": f"{label}采集时间", "value": captured_at})
+    return metadata
+
+
+def _review_cards(
+    *, url: str, status: str, action: str, baseline_id: str | None, current_id: str | None,
+    baseline: dict | None, current: dict | None, expected: dict, checks: list[dict],
+) -> list[dict]:
+    metadata = _evidence_metadata("基线", baseline_id, baseline)
+    if action == "compare":
+        metadata.extend(_evidence_metadata("当前", current_id, current))
+    cards = [{"key": "review", "title": status, "summary": url, "metadata": metadata}]
+    if baseline is None:
+        return cards
+
+    check_status = {row["field"]: row["status"] for row in checks}
+    for field in FIELDS:
+        before = baseline["data"][field]
+        values = {"基线值": _display_value(before)}
+        if action == "compare":
+            values["当前值"] = "未取得"
+            if current is not None:
+                after = current["data"][field]
+                values["当前值"] = _display_value(after)
+                values["页面变化"] = "有变化" if before != after else "未变化"
+        if field in expected:
+            values["期望值"] = _display_value(expected[field])
+        cards.append({
+            "key": field, "title": field, "summary": check_status.get(field),
+            "metadata": [{"label": label, "value": value} for label, value in values.items()],
+        })
+    return cards
 
 
 class PageExpectedValues(BaseModel):
@@ -120,6 +166,7 @@ class PageChangeReviewWorkflow(AgentTool):
         )
         raw = (current or {}).get("raw", {})
         snapshot_id = None
+        frozen = None
         valid = self._valid_page(raw) and normalize_site_url(raw["data"]["requested_url"]) == url
         if valid:
             async with observed_operation(
@@ -128,20 +175,22 @@ class PageChangeReviewWorkflow(AgentTool):
                 kind=SpanKind.INTERNAL,
                 input_data={"action": options.action, "url": url},
             ) as freeze:
+                frozen = {
+                    **raw,
+                    "meta": {
+                        **raw["meta"],
+                        "business_site_id": self.site["id"],
+                        "captured_at": datetime.now(UTC).isoformat(),
+                    },
+                }
                 snapshot_id = await self.snapshots.save_snapshot(
                     task_id=((runtime.task_id or runtime.run_id) if runtime else None)
                     or f"page-review:{self.site['id']}",
                     capability="page_metadata",
                     provider="page_html",
-                    data={
-                        **raw,
-                        "meta": {
-                            **raw["meta"],
-                            "business_site_id": self.site["id"],
-                            "captured_at": datetime.now(UTC).isoformat(),
-                        },
-                    },
+                    data=frozen,
                 )
+                current["raw"] = frozen
                 current["snapshot_id"] = snapshot_id
                 if freeze is not None:
                     freeze.output_data = {"snapshot_id": snapshot_id, "url": url}
@@ -149,6 +198,7 @@ class PageChangeReviewWorkflow(AgentTool):
             steps.coverage["current_page"].update(
                 status="partial", error_code="INVALID_PAGE_EVIDENCE"
             )
+        expected = options.expected.model_dump(exclude_unset=True) if options.expected else {}
         differences, checks = [], []
         status = "insufficient_evidence"
         if valid and options.action == "capture_baseline":
@@ -161,9 +211,7 @@ class PageChangeReviewWorkflow(AgentTool):
                 input_data={
                     "baseline_snapshot_id": options.baseline_snapshot_id,
                     "current_snapshot_id": snapshot_id,
-                    "expected": options.expected.model_dump(exclude_unset=True)
-                    if options.expected
-                    else {},
+                    "expected": expected,
                 },
             ) as comparison:
                 differences = [
@@ -175,9 +223,6 @@ class PageChangeReviewWorkflow(AgentTool):
                     }
                     for key in FIELDS
                 ]
-                expected = (
-                    options.expected.model_dump(exclude_unset=True) if options.expected else {}
-                )
                 checks = [
                     {
                         "field": key,
@@ -204,37 +249,24 @@ class PageChangeReviewWorkflow(AgentTool):
         ]
         if options.action == "compare" and not checks:
             limitations.append("缺少有效页面证据或目标验收值，本次不能判定通过。")
+        captured_baseline = options.action == "capture_baseline"
+        baseline_id = snapshot_id if captured_baseline else options.baseline_snapshot_id
+        current_id = None if captured_baseline else snapshot_id
+        cards = _review_cards(
+            url=url, status=status, action=options.action, baseline_id=baseline_id,
+            current_id=current_id, baseline=frozen if captured_baseline else baseline,
+            current=frozen, expected=expected, checks=checks,
+        )
         return steps.finish(
             "page_change_review",
             "页面变更复检",
-            [
-                {
-                    "key": row["field"],
-                    "title": row["field"],
-                    "summary": row["status"],
-                    "metadata": [
-                        {"label": "期望", "value": str(row["expected"])},
-                        {"label": "实际", "value": str(row["actual"])},
-                    ],
-                }
-                for row in checks
-            ]
-            or [
-                {
-                    "key": "review",
-                    "title": status,
-                    "summary": url,
-                    "metadata": [{"label": "快照 ID", "value": snapshot_id or "未取得"}],
-                }
-            ],
+            cards,
             limitations,
             action=options.action,
             review_status=status,
             url=url,
-            baseline_snapshot_id=snapshot_id
-            if options.action == "capture_baseline"
-            else options.baseline_snapshot_id,
-            current_snapshot_id=snapshot_id if options.action == "compare" else None,
+            baseline_snapshot_id=baseline_id,
+            current_snapshot_id=current_id,
             differences=differences,
             checks=checks,
         )

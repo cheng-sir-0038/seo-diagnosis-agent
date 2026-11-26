@@ -34,15 +34,22 @@ export interface Evidence {
   original: MedicalRecord | null
 }
 
+export interface ReviewIssue {
+  item: string
+  text: string
+  source: string | null
+}
+
 export interface FollowupCase {
   subject_id: string | null
   demo: boolean
   revision: number
   files: { name: string, digest: string, uploaded_at: string, rows: number, error: string | null }[]
   records: Evidence[]
+  report_review: { comparable_pairs: number, issues: ReviewIssue[] }
   draft: {
     comparisons: { item: string, earlier: string, later: string, delta: string | null, unit: string | null, reasons: string[] }[]
-    issues: { item: string, text: string, source: string | null }[]
+    issues: ReviewIssue[]
     plans: string[]
     pending_plans: string[]
   } | null

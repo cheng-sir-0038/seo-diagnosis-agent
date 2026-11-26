@@ -9,7 +9,7 @@ from src.seo_agent.runtime import (
     seo_agent_database,
     seo_agent_system_service,
 )
-from src.seo_agent.services.system import SiteDomainConflictError
+from src.seo_agent.services.system import InvalidSiteDomainError, SiteDomainConflictError
 
 router = APIRouter(prefix="/seo-agent/system", tags=["SEO Agent System"])
 
@@ -18,10 +18,17 @@ class CreateSiteRequest(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     name: str = Field(min_length=1, max_length=120)
-    domain: str = Field(min_length=3, max_length=255)
+    domain: str = Field(min_length=1, max_length=2048)
     default_country: str = Field(default="US", min_length=2, max_length=8)
     default_language: str = Field(default="en", min_length=2, max_length=16)
     timezone: str = Field(default="UTC", min_length=1, max_length=64)
+
+
+class RegisterSiteRequest(CreateSiteRequest):
+    owner_name: str = Field(min_length=1, max_length=120)
+    owner_email: str = Field(max_length=254, pattern=r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+    executor_name: str = Field(min_length=1, max_length=120)
+    executor_email: str = Field(max_length=254, pattern=r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
 
 class CreateActorRequest(BaseModel):
@@ -59,6 +66,18 @@ async def create_site(body: CreateSiteRequest) -> dict:
         return await seo_agent_system_service.create_site(**body.model_dump())
     except SiteDomainConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except InvalidSiteDomainError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/site-registrations", status_code=201)
+async def register_site(body: RegisterSiteRequest) -> dict:
+    try:
+        return await seo_agent_system_service.register_site(**body.model_dump())
+    except SiteDomainConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except InvalidSiteDomainError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.get("/sites")

@@ -5,7 +5,6 @@ import {
   FileSearchOutlined,
   InfoCircleOutlined,
   LinkOutlined,
-  RightOutlined,
   WarningOutlined,
 } from '@ant-design/icons'
 import type { ReactNode } from 'react'
@@ -93,13 +92,12 @@ export function PageMetadataResult({ data }: { data: PageMetadataData }) {
         </dl>
 
         <details className={`metadata-detail-panel status-${indexingStatus}`}>
-          <summary>
+          <summary className="workbench-disclosure">
             <span className="metadata-indexing-icon" aria-hidden="true">{statusIcons[indexingStatus]}</span>
             <span className="metadata-indexing-label">
               <strong>{data.indexing.declared_noindex ? '页面声明了 noindex' : '未发现 noindex 声明'}</strong>
               <span>索引控制与页面结构</span>
             </span>
-            <RightOutlined className="metadata-detail-chevron" aria-hidden="true" />
           </summary>
           <div className="metadata-detail-body">
             <p>{data.indexing.declared_noindex

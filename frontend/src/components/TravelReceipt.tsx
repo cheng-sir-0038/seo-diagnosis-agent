@@ -98,6 +98,8 @@ interface TravelRoute extends Provider {
 
 interface TravelData {
   request: {
+    transport?: 'round_trip' | 'one_way' | 'none'
+    lodging?: boolean
     origin?: string | null
     destination?: string | null
     depart_on?: string | null
@@ -276,12 +278,12 @@ function PlanCard({ plan, number, offers, selected, sameDay, hasGround, onChoose
   const arrival = textFor(arrivalLabels, plan.arrival_status)
   const budget = textFor(budgetLabels, plan.budget_status)
   const notes = [...new Set([...(plan.missing ?? []), ...(plan.warnings ?? [])])]
-  const legs = [['去程', plan.transport], ['返程', plan.return_transport], ['住宿', plan.hotel]] as const
-  const hotelRequired = plan.cost_items ? Object.hasOwn(plan.cost_items, 'hotel') : !sameDay
+  const legs = ([['去程', 'outbound', plan.transport], ['返程', 'return', plan.return_transport], ['住宿', 'hotel', plan.hotel]] as const)
+    .filter(([, kind, reference]) => reference || (plan.cost_items ? Object.hasOwn(plan.cost_items, kind) : kind !== 'hotel' || !sameDay))
   const numberedLabel = `方案 ${number}`
   const travelMode = outbound?.mode === 'flight' ? '航班出行' : outbound?.mode === 'rail' ? '铁路出行' : undefined
   const complete = !!cost && plan.complete_price && !hasGround
-  const hasQuote = legs.some(([, ref]) => !!offerQuote(resolveOffer(ref, offers)))
+  const hasQuote = legs.some(([, , ref]) => !!offerQuote(resolveOffer(ref, offers)))
   const feeLabel = complete ? '可核算总费用' : cost ? '已知费用小计' : hasQuote ? '仅有平台参考价' : '费用待报价'
   const departure = outbound?.departs_at ?? outbound?.departs_local
   const arrivalTime = outbound?.arrives_at ?? outbound?.arrives_local
@@ -302,7 +304,7 @@ function PlanCard({ plan, number, offers, selected, sameDay, hasGround, onChoose
         {budget && <ResultTag icon="¥" tone={plan.budget_status === 'within' ? 'positive' : 'warning'}>{budget}</ResultTag>}
       </div>
       <div className="travel-plan-route">
-        <strong>{[outbound?.from_stop, outbound?.to_stop].filter(Boolean).join(' → ') || outbound?.name || '去程待确认'}</strong>
+        <strong>{[outbound?.from_stop, outbound?.to_stop].filter(Boolean).join(' → ') || outbound?.name || hotel?.name || inbound?.name || '班次待确认'}</strong>
         {outbound && <span>去程 · {outbound.name}</span>}
         {departure && <small>出发 {displayTime(departure, '+08:00')}</small>}
         {arrivalTime && <small>抵达 {displayTime(arrivalTime, '+08:00')}</small>}
@@ -317,21 +319,20 @@ function PlanCard({ plan, number, offers, selected, sameDay, hasGround, onChoose
         </button>}
         {selected && <ResultTag tone="positive" icon={<CheckCircleOutlined />}>已保存为行程草稿</ResultTag>}
       </div>
-      <details className="travel-plan-breakdown"><summary>交通与住宿</summary><dl className="travel-legs">
-        {legs.map(([label, reference]) => {
+      <details className="travel-plan-breakdown"><summary className="workbench-disclosure">方案明细</summary><dl className="travel-legs">
+        {legs.map(([label, , reference]) => {
           const offer = resolveOffer(reference, offers)
           const LegIcon = label === '住宿' ? BankOutlined : offer?.mode === 'flight' ? SendOutlined : CarOutlined
-          const placeholder = label === '住宿' && !hotelRequired ? '无需住宿' : '待确认'
-          return <div key={label}><dt><LegIcon aria-hidden="true" />{label}</dt><dd>{offer ? <OfferDetails offer={offer} /> : placeholder}</dd></div>
+          return <div key={label}><dt><LegIcon aria-hidden="true" />{label}</dt><dd>{offer ? <OfferDetails offer={offer} /> : '待确认'}</dd></div>
         })}
       </dl>
       <div className="travel-plan-tags">
-        {plan.arrival_commute_minutes != null && <ResultTag icon={<CompassOutlined />}>抵达后到会场约 {plan.arrival_commute_minutes} 分钟</ResultTag>}
-        {plan.hotel_commute_minutes != null && <ResultTag icon={<CompassOutlined />}>酒店到会场约 {plan.hotel_commute_minutes} 分钟</ResultTag>}
+        {plan.arrival_commute_minutes != null && <ResultTag icon={<CompassOutlined />}>抵达后接驳约 {plan.arrival_commute_minutes} 分钟</ResultTag>}
+        {plan.hotel_commute_minutes != null && <ResultTag icon={<CompassOutlined />}>从酒店出发约 {plan.hotel_commute_minutes} 分钟</ResultTag>}
       </div>
       </details>
       {notes.length > 0 && <details className="travel-plan-checks">
-        <summary>待核对事项（{notes.length}）</summary>
+        <summary className="workbench-disclosure">待核对事项（{notes.length}）</summary>
         <ul className="travel-issues">{notes.map(note => <li key={note}>{note}</li>)}</ul>
       </details>}
     </li>
@@ -353,7 +354,7 @@ function TravelCosts({ plans, offers, request, selectedId, onSelect }: {
     { kind: 'outbound', label: '去程交通', offer: resolveOffer(plan.transport, offers) },
     { kind: 'return', label: '返程交通', offer: resolveOffer(plan.return_transport, offers) },
     { kind: 'hotel', label: '住宿', offer: resolveOffer(plan.hotel, offers) },
-    { kind: 'ground', label: '会场接驳', offer: undefined },
+    { kind: 'ground', label: '地面接驳', offer: undefined },
   ] as const
   const visibleRows = rows.filter(({ kind, offer }) => {
     if (plan.cost_items) return Object.hasOwn(plan.cost_items, kind)
@@ -557,15 +558,15 @@ function TravelRoutes({ routes, offers, venue }: {
     ?? choices[0]
   const route = selected?.[1]
   const href = supplierLink(route?.source_url)
-  if (!selected || !route) return <p className="travel-empty">补齐会场和到达地点后，可查看接驳路线。</p>
+  if (!selected || !route) return <p className="travel-empty">补齐起点和到访地点后，可查看接驳路线。</p>
 
   const origin = route.origin ?? offers.get(selected[0])?.name
   const destination = route.destination ?? venue
   const path = route.items?.[0]
-  const title = [origin, destination].filter(Boolean).join(' → ') || '会场接驳'
+  const title = [origin, destination].filter(Boolean).join(' → ') || '地面接驳'
   const options = choices.map(([id, choice]) => ({
     value: id,
-    label: choice.origin ?? offers.get(id)?.name ?? '会场接驳',
+    label: choice.origin ?? offers.get(id)?.name ?? '地面接驳',
     note: choice.status === 'needs_selection' ? '地址待确认'
       : choice.status !== 'ok' ? '暂无路线' : undefined,
   }))
@@ -626,8 +627,8 @@ export function TravelReceipt({ tools, onChoose }: { tools?: ToolRun[], onChoose
     .map(offer => typeof offer === 'string' ? offer : offer?.id)))
   const otherOffers = offers.filter(offer => !plannedOffers.has(offer.id))
   const budget = formatPrice(request.budget_cny, 'CNY')
-  const route = [request.origin, request.destination].filter(Boolean).join(' → ')
-  const dates = [request.depart_on, request.return_on].filter(Boolean).join(' 至 ')
+  const route = [request.transport === 'none' ? undefined : request.origin, request.destination].filter(Boolean).join(' → ')
+  const dates = [request.depart_on, request.transport === 'one_way' && !request.lodging ? undefined : request.return_on].filter(Boolean).join(' 至 ')
   const constraints = [
     request.venue,
     request.arrive_by && `${displayTime(request.arrive_by)} 前到场`,
@@ -642,14 +643,14 @@ export function TravelReceipt({ tools, onChoose }: { tools?: ToolRun[], onChoose
   const inbound = resolveOffer(viewedPlan?.return_transport, offersById)
   const lodging = resolveOffer(viewedPlan?.hotel, offersById)
   const schedule = [
-    { name: '去程出发', time: outbound?.departs_at || outbound?.departs_local || request.depart_on,
+    { name: '去程出发', time: request.transport === 'none' ? undefined : outbound?.departs_at || outbound?.departs_local || request.depart_on,
       place: outbound ? [outbound.name, outbound.from_stop].filter(Boolean).join(' · ') : route, icon: CalendarOutlined },
     { name: '抵达目的地', time: outbound?.arrives_at || outbound?.arrives_local, place: outbound?.to_stop, icon: EnvironmentOutlined },
-    { name: '入住', time: lodging?.check_in, place: lodging?.name, icon: BankOutlined },
+    { name: '入住', time: lodging?.check_in || (request.transport === 'none' ? request.depart_on : undefined), place: lodging?.name, icon: BankOutlined },
     { name: '预计到场', time: viewedPlan?.arrival_at_venue, place: request.venue, icon: EnvironmentOutlined },
     { name: '最晚到场', time: request.arrive_by, place: request.venue, icon: EnvironmentOutlined },
-    { name: '退房', time: lodging?.check_out, place: lodging?.name, icon: BankOutlined },
-    { name: '返程出发', time: inbound?.departs_at || inbound?.departs_local || request.return_on,
+    { name: '退房', time: lodging?.check_out || (request.transport === 'none' ? request.return_on : undefined), place: lodging?.name, icon: BankOutlined },
+    { name: '返程出发', time: request.transport === 'none' || request.transport === 'one_way' ? undefined : inbound?.departs_at || inbound?.departs_local || request.return_on,
       place: inbound ? [inbound.name, inbound.from_stop].filter(Boolean).join(' · ') : request.destination, icon: CalendarOutlined },
     { name: '返程抵达', time: inbound?.arrives_at || inbound?.arrives_local, place: inbound?.to_stop, icon: EnvironmentOutlined },
   ].filter(item => item.time)
@@ -680,7 +681,7 @@ export function TravelReceipt({ tools, onChoose }: { tools?: ToolRun[], onChoose
             ))}</ul>}
             {!!(otherOffers.length || data.providers?.length) && (
               <details className="travel-sources" open={plans.length === 0 || undefined}>
-                <summary>候选与来源</summary>
+                <summary className="workbench-disclosure">候选与来源</summary>
                 {otherOffers.length > 0 && <TravelCandidates offers={otherOffers} />}
                 {!!data.providers?.length && <ul className="travel-providers">{data.providers.map((provider, index) => (
                   <li key={`${provider.source}-${index}`}>
@@ -691,7 +692,7 @@ export function TravelReceipt({ tools, onChoose }: { tools?: ToolRun[], onChoose
                 ))}</ul>}
               </details>
             )}
-            {plans.length > 0 && onChoose && !chosen && <p className="travel-next-step">可以回复方案序号，也可以补充或修改会议时间。发送确认后会保存行程草稿。</p>}
+            {plans.length > 0 && onChoose && !chosen && <p className="travel-next-step">可以回复方案序号，也可以补充或修改行程条件。发送确认后会保存行程草稿。</p>}
           </div>
         ) },
         { key: 'schedule', label: '行程安排', children: (
@@ -704,7 +705,7 @@ export function TravelReceipt({ tools, onChoose }: { tools?: ToolRun[], onChoose
             ))}</ol> : <p className="travel-empty">等待补充出发、到场或返程时间。</p>}
           </div>
         ) },
-        { key: 'routes', label: '地图与路线', children: <TravelRoutes routes={data.routes} offers={offersById} venue={request.venue} /> },
+        ...(request.venue ? [{ key: 'routes', label: '地图与路线', children: <TravelRoutes routes={data.routes} offers={offersById} venue={request.venue} /> }] : []),
         ...(weather ? [{ key: 'weather', label: '天气参考', children: <WeatherReceipt weather={weather} /> }] : []),
         { key: 'costs', label: '费用明细', children: <TravelCosts plans={plans} offers={offersById}
           request={request} selectedId={viewedPlan?.id} onSelect={setViewedPlanId} /> },

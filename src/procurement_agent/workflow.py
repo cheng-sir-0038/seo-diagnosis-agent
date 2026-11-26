@@ -209,6 +209,83 @@ async def _catalog(
     ]
 
 
+def _intake_question(procedure: Procedure, force_refresh: bool) -> str:
+    if procedure == Procedure.RECONCILE:
+        return "请贴订单号和手头已有的凭证原文，例如订单、收货、付款或退款记录。"
+    if force_refresh:
+        return "想刷新哪个商品？请发商品名称或规格。"
+    if procedure == Procedure.SEARCH:
+        return "想查什么商品？请发名称、型号或淘宝商品链接。"
+    if procedure == Procedure.LIST:
+        return "这次要准备哪些物品？请列出名称，已知的数量或活动人数也可以一并告诉我。"
+    return "想比较什么商品的报价？请发商品名称，已有的规格、数量或商家报价也可以一起贴。"
+
+
+def _comparison_question(report: dict) -> str:
+    lines, quotes = report["lines"], report["quotes"]
+    for line in lines:
+        missing = [
+            label for field, label in (
+                ("specification", "目标规格（如型号、容量或尺寸）"),
+                ("quantity", "所需数量"),
+                ("unit", "计量单位"),
+            ) if line[field] is None
+        ]
+        if missing:
+            return f"请补充「{line['item']}」的{'、'.join(missing)}。"
+    for line in lines:
+        if line["quantity_estimated"]:
+            estimated = f"{line['quantity']} {line['unit']}"
+            return f"「{line['item']}」暂按 {estimated}估算，请回复最终需要的数量。"
+    for line in lines:
+        if not any(row["item"] == line["item"] for row in quotes):
+            return f"可贴「{line['item']}」的商家报价原文，最好包含每包数量、起订量、含税价和运费。"
+    for row in quotes:
+        if row["issues"]:
+            subject = f"「{row['supplier']}」的「{row['item']}」"
+            return f"可补充{subject}报价原文。{row['issues'][0]}。"
+    if not lines:
+        return "请补充该商品的目标规格、数量和计量单位，已有的商家报价也可以一并贴过来。"
+    return "可贴其他商家的报价，或告诉我你想调整的规格、数量或到货条件。"
+
+
+def _comparison_summary(report: dict, procedure: Procedure) -> str:
+    lines, quotes = report["lines"], report["quotes"]
+    if not quotes:
+        return "已整理采购需求。需要商家报价才能核算实买数量与费用。"
+    if any(line["quantity_estimated"] for line in lines):
+        return "清单含按人数估算的用量。请先确认实际需求数量，费用可作为询价参考。"
+
+    is_list = procedure == Procedure.LIST
+    if not is_list and len(lines) > 1:
+        return "已按物品拆开比价。各项报价的费用和交付条件可在表中逐项核对。"
+    options = report["plans"] if is_list else quotes
+    if not any(option["total_cny"] is not None for option in options):
+        if is_list and not options:
+            return "目前还没有覆盖全部物品的可核算采购组合，请逐项核对报价和交付条件。"
+        return "现有报价还算不出完整总费用，卡片已列出各项已知费用和待确认条款。"
+
+    budget_requested = report["budget_cny"] is not None
+    deadline_requested = bool(report["needed_by"])
+    for index, option in enumerate(options, start=1):
+        if option["total_cny"] is None:
+            continue
+        if budget_requested and option["budget_status"] != "within":
+            continue
+        if option.get("delivery") in {"unconfirmed", "late"} or option.get("delivery_gaps"):
+            continue
+        total = f"总费用 {option['total_cny']} 元"
+        if budget_requested:
+            total += "，在预算内"
+        if deadline_requested:
+            total += "，到货承诺符合期限"
+        if is_list:
+            return f"可优先核对采购组合 {index}，{total}。"
+        quantity = f"实买 {option['actual_quantity']} {option['unit']}"
+        return f"可优先核对「{option['supplier']}」的报价，{quantity}，{total}。"
+    return "已有可核算总费用，目前没有完整方案满足已给出的预算或到货要求。"
+
+
 async def run_procurement(
     executor: AgentExecutor,
     run: AgentRun,
@@ -273,7 +350,11 @@ async def run_procurement(
                     business_object={"run_id": run.id},
                 )
             except ValueError:
-                await _wait(executor, run, "请把规格、数量或报价金额和原文一起贴过来。")
+                await _wait(
+                    executor, run, pending.questions[0],
+                    "这次没有识别出可用于更新的采购信息，请再补充一次。",
+                    force_refresh=force_refresh,
+                )
                 return
             for key, count in result.usage.items():
                 run.token_usage[key] = run.token_usage.get(key, 0) + count
@@ -282,15 +363,14 @@ async def run_procurement(
             saved["procurement_input_id"] = pending.request_id
 
     procedure = intake.procedure or Procedure.COMPARE
-    if procedure == Procedure.RECONCILE and not intake.records:
-        await _wait(executor, run, "请贴订单号、应到和实到数量，以及已有的付款或退款资料。")
-        return
-    if procedure != Procedure.RECONCILE and not (intake.needs or intake.lookup):
-        question = (
-            "想刷新哪个商品？请发商品名称或规格。"
-            if force_refresh else "想买什么、要多少？有型号或报价也可以一起发来。"
+    has_input = (
+        bool(intake.records) if procedure == Procedure.RECONCILE
+        else bool(intake.needs or intake.lookup)
+    )
+    if not has_input:
+        await _wait(
+            executor, run, _intake_question(procedure, force_refresh), force_refresh=force_refresh,
         )
-        await _wait(executor, run, question, force_refresh=force_refresh)
         return
 
     await executor.checkpoint(run, stage="procurement_conditions")
@@ -345,7 +425,6 @@ async def run_procurement(
     await _wait(
         executor,
         run,
-        "可补规格、报价或改数量，也可以回复「结束本次整理」。",
-        "采购结果已整理。卡片保留了来源、能核算的费用以及需要向商家确认的条件。"
-        "\n\n你可以贴新的报价、调整数量，或回复「结束本次整理」。",
+        _comparison_question(report.data),
+        f"{_comparison_summary(report.data, procedure)}\n\n整理完毕可回复「结束本次整理」。",
     )

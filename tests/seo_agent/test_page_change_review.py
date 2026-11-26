@@ -113,6 +113,17 @@ async def test_capture_then_compare_uses_real_html_parser_and_keeps_baseline_imm
     assert all(call["force_refresh"] is True for call in source.calls)
     current = await snapshots.get_snapshot(result.data["current_snapshot_id"])
     assert current["meta"]["business_site_id"] == SITE["id"]
+    cards = {
+        item["key"]: {field["label"]: field["value"] for field in item["metadata"]}
+        for item in result.data["items"]
+    }
+    assert cards["review"]["基线快照 ID"] == baseline_id
+    assert cards["review"]["基线采集时间"] == baseline["meta"]["captured_at"]
+    assert cards["review"]["当前快照 ID"] == result.data["current_snapshot_id"]
+    assert cards["review"]["当前采集时间"] == current["meta"]["captured_at"]
+    assert cards["title"] == {"基线值": "Before", "当前值": "After", "页面变化": "有变化", "期望值": "After"}
+    assert cards["canonical_url"]["基线值"] == "未设置"
+    assert cards["meta_description"]["页面变化"] == "未变化"
 
 
 @pytest.mark.asyncio
@@ -125,6 +136,10 @@ async def test_unchanged_or_changed_html_does_not_pass_without_matching_expected
     assert failed.data["checks"][0]["actual"] == "Before"
     unknown = await tool.execute({"baseline_snapshot_id": key})
     assert unknown.data["review_status"] == "insufficient_evidence"
+    title = next(item for item in unknown.data["items"] if item["key"] == "title")
+    assert title["summary"] is None and [field["label"] for field in title["metadata"]] == [
+        "基线值", "当前值", "页面变化",
+    ]
 
 
 @pytest.mark.asyncio
@@ -145,6 +160,10 @@ async def test_failed_current_read_is_insufficient_evidence_not_a_pass(review, p
     assert result.data["review_status"] == "insufficient_evidence"
     assert result.data["workflow_status"] == "partial"
     assert result.data["current_snapshot_id"] is None
+    title = next(item for item in result.data["items"] if item["key"] == "title")
+    assert {field["label"]: field["value"] for field in title["metadata"]} == {
+        "基线值": "Before", "当前值": "未取得", "期望值": "Before",
+    }
     assert "private upstream failure" not in str(result.model_dump())
 
 

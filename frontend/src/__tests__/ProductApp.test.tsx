@@ -3,9 +3,37 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import App from '../App'
 import { loadProductConfig, saveProductConfig } from '../services/productApi'
+import type { SpecialistDirectoryData } from '../types/agent'
 
 const json = (data: unknown, status = 200) =>
   Promise.resolve(new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } }))
+
+const seoDirectory = {
+  agent: 'seo', note: '指定网页后会载入该页可用的检查工具。',
+  tools: [
+    {
+      name: 'seo_keyword_overview', description: '批量查询关键词搜索量、难度、点击和商业价值等指标。',
+    },
+    {
+      name: 'seo_autocomplete', description: '查询 Google 搜索联想词，用于发现长尾词、问题词和用户真实表达。本工具不提供搜索量、难度、CPC 或排名。',
+    },
+    {
+      name: 'seo_page_metadata', description: '直接读取当前站点页面源 HTML 中的 Title、Meta Description、Meta Keywords、Canonical、Robots、H1 和语言等元信息。用户询问当前页面 TDK 或标签内容时必须使用本工具；SERP 结果和 PageSpeed 不能替代本工具。',
+    },
+  ],
+  skills: [
+    { name: 'seo-keyword-overview', label: '关键词指标核对', summary: '提供 1–50 个关键词即可，无需网址。可指定查询市场和语言。', tools: ['seo_keyword_overview'] },
+    { name: 'seo-autocomplete', label: '搜索联想词发现', summary: '提供一个种子词，可指定市场和语言。适合收集长尾词、问题词和搜索表达。', tools: ['seo_autocomplete'] },
+    { name: 'seo-page-metadata', label: '网页内容与标签核对', summary: '提供具体网页，读取 HTML 中的标题、描述、正文证据及分享标签。', tools: ['seo_page_metadata'] },
+  ],
+  default_prompts: [
+    { id: 'seo-diagnosis', label: 'SEO / GEO 诊断（静态节选）', text: '你是 SEO/GEO 专员。' },
+    { id: 'seo-course-editor', label: '课程页与考纲核对', text: '将页面内容与考纲条款逐项比对。' },
+    { id: 'seo-keyword-overview', label: '关键词指标核对（技能指令）', text: '在用户指定的市场和语言下批量核对搜索量、难度、点击和商业价值。保留词、市场和来源的对应关系；缺项标为无数据，不能按零计算或据此排序。' },
+    { id: 'seo-autocomplete', label: '搜索联想词发现（技能指令）', text: '按用户给的种子词和语言查询搜索联想，保留有用的原始表达并去重。联想词只表示提议的搜索表达，不代表搜索量、难度、CPC 或真实排名。' },
+    { id: 'seo-page-metadata', label: '网页内容与标签核对（技能指令）', text: '核对页面现状时读取指定 URL 的 HTML，沿用完整路径。只描述 HTML 中能验证的内容，不用 Lighthouse 或搜索结果代替标签事实。' },
+  ],
+} satisfies SpecialistDirectoryData['specialists'][number]
 
 describe('business chat workspace', () => {
   beforeEach(() => {
@@ -32,6 +60,77 @@ describe('business chat workspace', () => {
     expect(await screen.findByRole('heading', { name: '任务工作台' })).toBeVisible()
     fireEvent.click(screen.getByRole('button', { name: '展开工作台导航' }))
     expect(screen.getByRole('button', { name: '收起工作台导航' })).toHaveAttribute('aria-expanded', 'true')
+  })
+
+  it('restores the current page, reading position, and chat draft through browser history', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => json([])))
+    render(<App />)
+    const chat = screen.getByRole('link', { name: '对话工作台' })
+    const tasks = screen.getByRole('link', { name: '任务工作台' })
+    const history = screen.getByRole('link', { name: '历史会话' })
+    const draft = screen.getByRole('textbox', { name: '给业务助理发送消息' })
+    expect(chat).toHaveAttribute('aria-current', 'page')
+    fireEvent.change(draft, { target: { value: '保留这段草稿' } })
+
+    fireEvent.click(tasks)
+    await screen.findByRole('heading', { name: '任务工作台' })
+    const page = screen.getByRole('region', { name: '任务工作台' })
+    expect(page).toHaveFocus()
+    expect(tasks).toHaveAttribute('aria-current', 'page')
+    page.querySelector('.workspace-scroll')!.scrollTop = 180
+    fireEvent.click(history)
+    await screen.findByRole('heading', { name: '历史会话' })
+
+    window.history.back()
+    await screen.findByRole('heading', { name: '任务工作台' })
+    expect(tasks).toHaveAttribute('aria-current', 'page')
+    expect(page.querySelector('.workspace-scroll')!.scrollTop).toBe(180)
+    window.history.back()
+    expect(await screen.findByRole('textbox', { name: '给业务助理发送消息' })).toHaveValue('保留这段草稿')
+    window.history.forward()
+    await screen.findByRole('heading', { name: '任务工作台' })
+    expect(chat).not.toHaveAttribute('aria-current')
+  })
+
+  it('recognizes the running center with fragment query parameters and preserves existing deep links', async () => {
+    window.history.replaceState(null, '', '/#/observability?view=issues')
+    vi.stubGlobal('fetch', vi.fn(() => json([])))
+    render(<App />)
+    const link = screen.getByRole('link', { name: '运行中心' })
+    const pane = screen.getByRole('region', { name: '运行中心' }).querySelector('.workspace-scroll')
+    expect(link).toHaveAttribute('aria-current', 'page')
+    expect(link).toHaveAttribute('href', '#/observability?view=issues')
+    fireEvent.click(link)
+    expect(window.location.hash).toBe('#/observability?view=issues')
+
+    window.location.hash = '#/observability?view=traces&trace=example'
+    await waitFor(() => expect(link).toHaveAttribute('href', '#/observability?view=traces&trace=example'))
+    expect(screen.getByRole('region', { name: '运行中心' }).querySelector('.workspace-scroll')).toBe(pane)
+    window.history.back()
+    await waitFor(() => expect(link).toHaveAttribute('href', '#/observability?view=issues'))
+  })
+
+  it('closes the mobile menu with Escape or a page link and moves focus to the expected target', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => json([])))
+    render(<App />)
+    const trigger = screen.getByRole('button', { name: '打开工作台菜单' })
+    fireEvent.click(trigger)
+    const menu = screen.getByRole('dialog', { name: '工作台菜单' })
+    expect(trigger).toHaveAttribute('aria-expanded', 'true')
+    expect(within(menu).getByRole('link', { name: '对话工作台' })).toHaveFocus()
+    const close = within(menu).getByRole('button', { name: '关闭工作台菜单' })
+    close.focus()
+    fireEvent.keyDown(close, { key: 'Tab', shiftKey: true })
+    expect(within(menu).getByRole('link', { name: '数据源管理' })).toHaveFocus()
+    fireEvent.keyDown(window, { key: 'Escape' })
+    expect(menu).not.toHaveAttribute('role', 'dialog')
+    expect(trigger).toHaveFocus()
+
+    fireEvent.click(trigger)
+    fireEvent.click(within(menu).getByRole('link', { name: '任务工作台' }))
+    await screen.findByRole('heading', { name: '任务工作台' })
+    expect(trigger).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.getByRole('region', { name: '任务工作台' })).toHaveFocus()
   })
 
   it('opens chat in a fresh browser and makes no site or actor requests', async () => {
@@ -61,10 +160,37 @@ describe('business chat workspace', () => {
       .mockImplementationOnce(() => json({}, 503))
       .mockImplementationOnce(() => json({ specialists: [
         {
-          agent: 'healthcare', tools: [{ name: 'medical_exam_syllabus', description: '核对官方考纲' }],
-          skills: [{ name: 'medical-exam-syllabus', label: '医考考纲核对', tools: ['medical_exam_syllabus'] }],
+          agent: 'healthcare', tools: [{
+            name: 'medical_exam_syllabus', description: '核对官方考纲', skill_usage: {
+              scenario: '核对本次考纲的适用范围。', inputs: '提供所问版次。',
+              rules: '按原公告核对。', output: '列出公告和出处。',
+            },
+          }],
+          skills: [{
+            name: 'medical-exam-syllabus', label: '医考考纲核对', summary: '核对考纲的适用范围。', tools: ['medical_exam_syllabus'],
+          }],
+          default_prompts: [
+            { id: 'medical-exam-syllabus', label: '考纲指令', text: '以公告原文为准。\n<source>待核实</source>' },
+            { id: 'healthcare-instructions', label: '医药共用指令', text: '保留官方资料出处。' },
+          ],
         },
-        { agent: 'seo', tools: [], note: '指定网页后会载入该页可用的检查工具。' },
+        seoDirectory,
+        { agent: 'travel', skills: [], default_prompts: [], tools: [{
+          name: 'travel_transport', description: '查询班次。', availability_note: '飞猪实时查询未配置。',
+        }] },
+        {
+          agent: 'followup',
+          tools: [
+            { name: 'followup_read_materials', description: '读取资料' },
+            { name: 'followup_prepare_materials', description: '整理资料' },
+          ],
+          skills: [{
+            name: 'followup-preparation', label: '随访与复诊资料整理', summary: '检查资料是否齐全。',
+            tools: ['followup_read_materials', 'followup_prepare_materials'],
+          }],
+          default_prompts: [],
+          deterministic_path: '资料整理按固定规则执行，无专员提示词。',
+        },
       ] }))
     vi.stubGlobal('fetch', fetchMock)
     render(<App />)
@@ -77,19 +203,147 @@ describe('business chat workspace', () => {
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
     fireEvent.click(await screen.findByRole('button', { name: '重试' }))
     expect(await screen.findByText('查证考纲条款')).toBeVisible()
-    expect(screen.getByText('Skill · 医考考纲核对')).toBeVisible()
+    const health = within(screen.getByRole('region', { name: '医药业务' }))
+    expect(health.getByText('核对本次考纲的适用范围。')).not.toBeVisible()
+    expect(health.getByText('Skill：医考考纲核对')).not.toBeVisible()
+    expect(health.getByText('医药共用指令')).not.toBeVisible()
+    expect(health.queryByText('技能', { exact: true })).not.toBeInTheDocument()
+    expect(health.queryByText('默认提示词', { exact: true })).not.toBeInTheDocument()
+    fireEvent.click(health.getByText('查证考纲条款'))
+    expect(health.getByText('核对本次考纲的适用范围。')).toBeVisible()
+    const prompt = health.getByRole('region', { name: '查证考纲条款的 Skill 详情' })
+    const rawSyllabus = within(prompt).getByText('原始 Skill 指令')
+    expect(within(prompt).getByText(/以公告原文为准/)).not.toBeVisible()
+    fireEvent.click(rawSyllabus)
+    expect(within(prompt).getByText(/以公告原文为准/)).toBeVisible()
+    expect(prompt.querySelector('pre')?.textContent).toBe('以公告原文为准。\n<source>待核实</source>')
+    expect(within(prompt).getByText('医药共用指令')).toBeVisible()
+    expect(within(prompt).getByText('保留官方资料出处。')).not.toBeVisible()
+    fireEvent.click(within(prompt).getByText('医药共用指令'))
+    expect(within(prompt).getByText('保留官方资料出处。')).toBeVisible()
+    expect(prompt.querySelector('source')).toBeNull()
+    expect(health.queryByRole('textbox')).not.toBeInTheDocument()
     const choices = within(screen.getByRole('group', { name: '专员' }))
     expect(choices.getByRole('button', { name: /医药业务/ })).toHaveAttribute('aria-pressed', 'true')
-    expect(choices.getByText('1 个工具')).toBeVisible()
+    expect(choices.getByRole('button', { name: /医药业务.*1 项能力/ })).toBeVisible()
     const seo = choices.getByRole('button', { name: /SEO \/ GEO/ })
     fireEvent.click(seo)
     expect(seo).toHaveAttribute('aria-pressed', 'true')
     const seoTools = screen.getByRole('region', { name: 'SEO / GEO' })
     expect(seoTools).toHaveTextContent('指定网页后会载入该页可用的检查工具。')
-    expect(seoTools).toHaveTextContent('当前没有可用工具。')
+    const seoSkills = within(seoTools)
+    expect(seoSkills.queryByRole('status')).not.toBeInTheDocument()
+    expect(seoSkills.getByText(/^提供 1–50 个关键词。/)).not.toBeVisible()
+    expect(seoSkills.getByText('Skill：关键词指标核对')).not.toBeVisible()
+    fireEvent.click(seoSkills.getByText('查询关键词指标'))
+    const keyword = within(seoSkills.getByRole('region', { name: '查询关键词指标的 Skill 详情' }))
+    expect(seoSkills.getByText(/^提供 1–50 个关键词。/)).toBeVisible()
+    expect(keyword.getByRole('heading', { name: 'Skill：关键词指标核对' })).toBeVisible()
+    expect(keyword.getByText('提供 1–50 个关键词。可指定市场和语言，无需网址。')).toBeVisible()
+    expect(keyword.getByText(/^逐词给出可查到的搜索量/)).toBeVisible()
+    expect(keyword.getByText('处理规则')).toBeVisible()
+    expect(keyword.queryByText('按用户给的种子词和语言查询搜索联想，保留有用的原始表达并去重。联想词只表示提议的搜索表达，不代表搜索量、难度、CPC 或真实排名。')).not.toBeInTheDocument()
+    expect(seoSkills.getByText(/^提供一个种子词。可指定市场和语言。/)).not.toBeVisible()
+    fireEvent.click(seoSkills.getByText('查询搜索联想词'))
+    const autocomplete = within(seoSkills.getByRole('region', { name: '查询搜索联想词的 Skill 详情' }))
+    expect(autocomplete.getByRole('heading', { name: 'Skill：搜索联想词发现' })).toBeVisible()
+    expect(autocomplete.getByText(/^给出本次搜到的联想表达/)).toBeVisible()
+    expect(autocomplete.queryByText('在用户指定的市场和语言下批量核对搜索量、难度、点击和商业价值。保留词、市场和来源的对应关系；缺项标为无数据，不能按零计算或据此排序。')).not.toBeInTheDocument()
+    expect(keyword.queryByText('课程页与考纲核对')).not.toBeInTheDocument()
+    expect(autocomplete.queryByText('课程页与考纲核对')).not.toBeInTheDocument()
+    fireEvent.click(seoSkills.getByText('读取网页内容'))
+    const webpage = within(seoSkills.getByRole('region', { name: '读取网页内容的 Skill 详情' }))
+    expect(webpage.getByRole('heading', { name: 'Skill：网页内容与标签核对' })).toBeVisible()
+    fireEvent.click(webpage.getByText('课程页与考纲核对'))
+    expect(webpage.getByText('仅在结合考纲核对课程页时使用。')).toBeVisible()
+    expect(webpage.getByText('将页面内容与考纲条款逐项比对。')).toBeVisible()
+    expect(seoTools).not.toHaveTextContent('SEO / GEO 诊断（静态节选）')
+    expect(seoTools).not.toHaveTextContent('seo_keyword_overview')
+    fireEvent.click(choices.getByRole('button', { name: /商旅/ }))
+    expect(screen.getByText('实时查询不可用')).toBeVisible()
+    fireEvent.click(screen.getByText('查询班次。'))
+    expect(screen.getByText(/飞猪实时查询未配置/)).toBeVisible()
+    expect(screen.getByRole('link', { name: '查看数据源' })).toHaveAttribute('href', '#/sources')
     expect(screen.queryByText('查证考纲条款')).not.toBeInTheDocument()
+    fireEvent.click(choices.getByRole('button', { name: /随访与复诊/ }))
+    expect(screen.getAllByText('资料整理按固定规则执行，无专员提示词。').every(node => !node.closest('details')?.open)).toBe(true)
+    fireEvent.click(screen.getByText('核对报告并整理资料包'))
+    expect(screen.getByText(/^生成可核对的资料包草稿/)).toBeVisible()
+    expect(screen.getByText(/^汇总有效记录数/)).not.toBeVisible()
+    expect(screen.getAllByText('资料整理按固定规则执行，无专员提示词。').filter(node => node.closest('details')?.open)).toHaveLength(1)
+    fireEvent.click(choices.getByRole('button', { name: /医药业务/ }))
+    expect(screen.getByText('医药共用指令')).not.toBeVisible()
     expect(fetchMock).toHaveBeenCalledTimes(2)
     expect(fetchMock.mock.calls.every(call => String(call[0]).includes('/api/v1/chat/tools?conversation_id='))).toBe(true)
+  })
+
+  it('shows the authored Skill body when the older healthcare response only advertises its binding', async () => {
+    window.history.replaceState(null, '', '/#/capabilities')
+    vi.stubGlobal('fetch', vi.fn(() => json({ specialists: [{
+      agent: 'healthcare',
+      tools: [{ name: 'medical_exam_registration', description: '报名核对' }],
+      skills: [{ name: 'medical-exam-registration', label: '医考报名核对', tools: ['medical_exam_registration'] }],
+    }] })))
+    render(<App />)
+    fireEvent.click(await screen.findByText('核对医考报名条件'))
+    const details = within(screen.getByRole('region', { name: '核对医考报名条件的 Skill 详情' }))
+    expect(details.getByRole('heading', { name: 'Skill：医考报名核对' })).toBeVisible()
+    expect(details.getByText(/^查网上报名.*实践技能考试免考核对/)).toBeVisible()
+    expect(details.getByText(/两种核对均需报考年份/)).toBeVisible()
+    expect(details.getByText(/符合条件时免实践技能考试/)).toBeVisible()
+    const original = details.getByText(/实践技能考试免考核对（skills_retake）/)
+    expect(original).not.toBeVisible()
+    fireEvent.click(details.getByText('原始 Skill 指令'))
+    expect(original).toBeVisible()
+    expect(screen.queryByText('当前工具目录的数据版本未提供完整的 Skill 详情。')).not.toBeInTheDocument()
+  })
+
+  it('does not borrow instructions for an unrecognized tool binding', async () => {
+    window.history.replaceState(null, '', '/#/capabilities')
+    vi.stubGlobal('fetch', vi.fn(() => json({ specialists: [{
+      agent: 'healthcare',
+      tools: [{ name: 'medical_exam_registration', description: '报名核对' }],
+      skills: [{ name: 'medical-exam-syllabus', label: '医考考纲核对', tools: ['medical_exam_registration'] }],
+    }] })))
+    render(<App />)
+    expect((await screen.findByText('核对医考报名条件')).closest('summary')).toBeNull()
+    expect(screen.getByRole('status')).toHaveTextContent('当前工具目录的数据版本未提供完整的 Skill 详情。')
+  })
+
+  it('expands registered SEO tools from a legacy directory and leaves unknown rows without empty disclosures', async () => {
+    window.history.replaceState(null, '', '/#/capabilities')
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(() => json({ specialists: [{
+        agent: 'seo', skills: [], tools: [
+          seoDirectory.tools[0],
+          { name: 'seo_unrecognized_tool', description: '尚无说明的工具。' },
+        ],
+      }] }))
+      .mockImplementationOnce(() => json({ specialists: [
+        { agent: 'healthcare', tools: [], skills: [], default_prompts: [] }, seoDirectory,
+      ] }))
+    vi.stubGlobal('fetch', fetchMock)
+    render(<App />)
+
+    const directory = await screen.findByRole('region', { name: 'SEO / GEO' })
+    const legacy = within(directory)
+    expect(legacy.getByRole('status')).toHaveTextContent('当前工具目录的数据版本未提供完整的 Skill 详情。')
+    const keyword = legacy.getByText('查询关键词指标')
+    expect(keyword).toBeVisible()
+    expect(legacy.getByText('批量查询关键词搜索量、难度、点击和商业价值等指标。')).toBeVisible()
+    expect(legacy.getByText('尚无说明的工具。').closest('summary')).toBeNull()
+    expect(legacy.queryByText('查询搜索联想词')).not.toBeInTheDocument()
+    fireEvent.click(keyword)
+    const skill = within(legacy.getByRole('region', { name: '查询关键词指标的 Skill 详情' }))
+    expect(skill.getByRole('heading', { name: 'Skill：关键词指标核对' })).toBeVisible()
+    expect(skill.getByText(/^提供 1–50 个关键词。/)).toBeVisible()
+    expect(directory).not.toHaveTextContent('seo_keyword_overview')
+
+    fireEvent.click(legacy.getByRole('button', { name: '重新加载工具目录' }))
+    await waitFor(() => expect(screen.getByText('查询关键词指标').closest('summary')).not.toBeNull())
+    expect(screen.queryByText('当前工具目录的数据版本未提供完整的 Skill 详情。')).not.toBeInTheDocument()
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock).toHaveBeenLastCalledWith(expect.stringContaining('/api/v1/chat/tools?conversation_id='), expect.objectContaining({ cache: 'no-store' }))
   })
 
   it('filters tasks from the saved browser conversations and opens the original waiting run', async () => {
@@ -129,9 +383,9 @@ describe('business chat workspace', () => {
     window.history.replaceState(null, '', '/#/site-setup')
     render(<App />)
 
-    fireEvent.click(await screen.findByRole('button', { name: '登记站点' }))
+    fireEvent.click(await screen.findByRole('button', { name: '登记站点' }, { timeout: 3000 }))
 
-    expect(await screen.findByText('请先完成所有必填项')).toBeInTheDocument()
+    expect(await screen.findByText('请检查标记的字段后重新提交。')).toBeInTheDocument()
     expect(screen.getByLabelText('站点域名')).toHaveFocus()
     expect(fetchMock).not.toHaveBeenCalled()
     fireEvent.click(screen.getByRole('link', { name: '返回对话' }))
@@ -149,32 +403,37 @@ describe('business chat workspace', () => {
       default_language: 'en-US',
       timezone: 'Asia/Shanghai',
     }
-    let createdSitePayload: Record<string, unknown> | undefined
+    let registrationAttempts = 0
+    const oldConfig = { siteId: 'old-site', ownerActorId: 'old-owner', agentActorId: 'old-agent', executorActorId: 'old-executor' }
+    saveProductConfig(oldConfig)
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
-      const url = String(input)
-      const method = init?.method ?? 'GET'
-      if (url.endsWith('/api/v1/seo-agent/system/sites') && method === 'POST') {
-        createdSitePayload = JSON.parse(String(init?.body)) as Record<string, unknown>
-        return json(site)
+      if (String(input).endsWith('/api/v1/seo-agent/system/site-registrations') && init?.method === 'POST') {
+        if (++registrationAttempts === 1) return json({ detail: '暂时无法完成登记，请重试。' }, 503)
+        return json({ site, owner_actor_id: 'owner', agent_actor_id: 'agent', executor_actor_id: 'executor' }, 201)
       }
-      if (url.includes('/api/v1/seo-agent/system/actors') && method === 'POST') {
-        const body = JSON.parse(String(init?.body)) as { actor_type: string; name: string; email?: string }
-        return json({ id: `actor-${body.actor_type.toLowerCase()}`, ...body })
-      }
-      if (url.includes('/api/v1/seo-agent/notifications/subscriptions') && method === 'POST') return json({ id: 'subscription-1' })
-      if (url.endsWith('/api/v1/seo-agent/system/sites/site-new')) return json(site)
       return json([])
     })
     vi.stubGlobal('fetch', fetchMock)
     render(<App />)
 
-    fireEvent.change(await screen.findByLabelText('站点域名'), { target: { value: 'example.com' } })
+    fireEvent.change(await screen.findByLabelText('站点域名'), { target: { value: '  https://EXAMPLE.com/path  ' } })
     fireEvent.change(screen.getByLabelText('负责人邮箱'), { target: { value: 'owner@example.com' } })
     fireEvent.change(screen.getByLabelText('执行者邮箱'), { target: { value: 'writer@example.com' } })
     fireEvent.click(screen.getByRole('button', { name: '登记站点' }))
 
+    expect(await screen.findByText('暂时无法完成登记，请重试。')).toBeVisible()
+    expect(window.location.hash).toBe('#/site-setup')
+    expect(loadProductConfig()).toEqual(oldConfig)
+    expect(screen.getByLabelText('站点域名')).toHaveValue('  https://EXAMPLE.com/path  ')
+    fireEvent.click(screen.getByRole('button', { name: '登记站点' }))
+
     expect(await screen.findByRole('textbox', { name: '给业务助理发送消息' })).toBeEnabled()
-    expect(createdSitePayload).toMatchObject({ default_country: 'US', default_language: 'en-US' })
+    expect(loadProductConfig()).toEqual({ siteId: 'site-new', ownerActorId: 'owner', agentActorId: 'agent', executorActorId: 'executor' })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(JSON.parse(String(fetchMock.mock.calls[1][1]?.body))).toMatchObject({
+      domain: 'https://EXAMPLE.com/path', default_country: 'US', default_language: 'en-US',
+      owner_email: 'owner@example.com', executor_email: 'writer@example.com',
+    })
   })
 
   it('clears only the previous workspace data and preserves data from the new version', async () => {

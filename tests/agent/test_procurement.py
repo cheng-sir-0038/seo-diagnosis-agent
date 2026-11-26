@@ -3,16 +3,23 @@ from __future__ import annotations
 import hmac
 from datetime import date
 from decimal import Decimal
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from urllib.parse import parse_qs
 
 import httpx
 import pytest
 from pydantic import SecretStr
 
+from src.agent.models import AgentRun, RunStatus
+from src.agent.providers.fake import FakeModelProvider
+from src.agent.runtime.executor import AgentExecutor
 from src.procurement_agent.calculations import calculate_quote, compare, reconcile
 from src.procurement_agent.evidence import grounded_quote, grounded_record
-from src.procurement_agent.models import Need, Quote, Record
+from src.procurement_agent.models import Need, ProcurementIntake, Quote, Record
 from src.procurement_agent.taobao import GATEWAY, TaobaoAffiliate
+from src.procurement_agent.tools import BUILD_LIST, COMPARE, procurement_tools
+from src.procurement_agent.workflow import run_procurement
 
 TODAY = date(2026, 11, 23)
 
@@ -290,3 +297,145 @@ async def test_taobao_without_credentials_never_calls_network(monkeypatch):
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", unexpected)
     receipt = await _affiliate(key="", secret="", adzone="").search("纸杯", tmall_only=False)
     assert receipt["status"] == "unconfigured" and receipt["fetched_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_compare_report_discloses_partial_quotes_and_promoted_catalog_candidates():
+    receipt = await procurement_tools().get(COMPARE).execute({
+        "today": TODAY.isoformat(),
+        "intake": {
+            "procedure": "compare",
+            "needs": [{"item": "纸杯", "specification": "200ml", "unit": "个", "quantity": 60}],
+            "quotes": [quote("合成报价商家", shipping_cny=None).model_dump(mode="json")],
+        },
+        "sources": [{
+            "source": "taobao_affiliate", "status": "ok", "items": [
+                {
+                    "item_id": "123", "title": "合成商品", "shop": "合成店铺",
+                    "url": "https://example.test/catalog/123", "promotion_link": True,
+                    "reference_price_cny": "20", "estimated_price_cny": "15",
+                },
+                {
+                    "item_id": "123", "activity_id": "voucher", "amount_cny": "2",
+                    "minimum_spend_cny": "20", "starts_on": None, "ends_on": None,
+                    "remaining": None,
+                },
+            ],
+        }],
+    })
+    assert receipt.success
+    data = receipt.data
+    assert data["quotes"][0]["total_cny"] is None
+    assert any("已知小计" in caveat for caveat in data["limitations"])
+    assert any("推广链接" in caveat for caveat in data["limitations"])
+    assert any("优惠券" in caveat for caveat in data["limitations"])
+    listing = next(card for card in data["items"] if card["title"] == "合成商品")
+    assert {"label": "链接", "value": "推广链接"} in listing["metadata"]
+    assert "实买价格" in listing["summary"]
+
+
+async def test_procurement_asks_for_the_missing_quantity_then_the_quote():
+    run = AgentRun(
+        id="procurement-intake",
+        messages=[{"role": "user", "content": "想比较 200ml 纸杯按个买的报价。"}],
+        dispatch_state={"procurement_intake": {
+            "procedure": "compare",
+            "needs": [{"item": "纸杯", "specification": "200ml", "unit": "个"}],
+        }},
+    )
+    executor = AgentExecutor(FakeModelProvider([]), procurement_tools())
+    planner = SimpleNamespace(invoke=AsyncMock(return_value=SimpleNamespace(
+        output=ProcurementIntake(needs=[Need(item="纸杯", quantity=60)]), usage={},
+    )))
+
+    await run_procurement(executor, run, planner)
+    assert run.status == RunStatus.WAITING_FOR_INPUT
+    assert run.human_input.questions == ["请补充「纸杯」的所需数量。"]
+    planner.invoke.assert_not_awaited()
+
+    run.human_input.answer = "60 个"
+    await run_procurement(executor, run, planner)
+    assert run.status == RunStatus.WAITING_FOR_INPUT
+    assert "「纸杯」的商家报价原文" in run.human_input.questions[0]
+    completed = [
+        event for event in run.events
+        if event.type == "tool.completed" and event.payload["name"] == COMPARE
+    ]
+    line = completed[-1].payload["result"]["data"]["lines"][0]
+    assert (line["specification"], line["quantity"], line["unit"]) == ("200ml", 60, "个")
+
+
+@pytest.mark.parametrize("budget, expected", [(1000, True), (850, False)])
+async def test_procurement_decision_requires_complete_cost_and_meets_constraints(budget, expected):
+    arrival = date(2099, 11, 22)
+    on_time = {"arrival_date": arrival, "arrival_confirmed": True}
+    cheaper = [{"price_cny": "10", "basis": "unit"}]
+    offers = [
+        quote("甲商家", **on_time),
+        quote("缺运费商家", **on_time, shipping_cny=None, tiers=cheaper),
+        quote("到货未确认商家", arrival_date=arrival, tiers=cheaper),
+        quote("晚到商家", arrival_date=date(2099, 11, 24), arrival_confirmed=True, tiers=cheaper),
+    ]
+    intake = ProcurementIntake(
+        needs=[Need(item="纸杯", specification="200ml", quantity=60, unit="个")],
+        quotes=offers,
+        budget_cny=budget,
+        needed_by=date(2099, 11, 23),
+    )
+    run = AgentRun(
+        id="comparison", messages=[],
+        dispatch_state={"procurement": intake.model_dump(mode="json")},
+    )
+    executor = AgentExecutor(FakeModelProvider([]), procurement_tools())
+    await run_procurement(executor, run, SimpleNamespace())
+
+    assert run.status == RunStatus.WAITING_FOR_INPUT
+    reply = run.human_input.message
+    if expected:
+        assert "甲商家" in reply and "900.00 元" in reply
+        assert "在预算内" in reply and "到货承诺符合期限" in reply
+    else:
+        assert "没有完整方案满足" in reply
+    assert "缺运费商家" in run.human_input.questions[0]
+    assert "确认运费" in run.human_input.questions[0]
+    assert all(supplier.supplier not in reply for supplier in offers[1:])
+
+
+@pytest.mark.parametrize("quantity", [None, 60])
+async def test_procurement_plan_needs_confirmed_quantity_to_be_prioritized(quantity):
+    need = Need(item="纸杯", specification="200ml", per_person=3, quantity=quantity, unit="个")
+    intake = ProcurementIntake(
+        procedure="list", people=20, needs=[need], quotes=[quote("甲商家")],
+    )
+    run = AgentRun(
+        id="estimate", messages=[], dispatch_state={"procurement": intake.model_dump(mode="json")},
+    )
+    executor = AgentExecutor(FakeModelProvider([]), procurement_tools())
+    await run_procurement(executor, run, SimpleNamespace())
+
+    assert run.status == RunStatus.WAITING_FOR_INPUT
+    if quantity is None:
+        assert "按人数估算" in run.human_input.message
+        assert "优先" not in run.human_input.message
+        assert "60 个" in run.human_input.questions[0]
+        assert "最终需要的数量" in run.human_input.questions[0]
+    else:
+        assert "可优先核对采购组合 1，总费用 900.00 元" in run.human_input.message
+
+
+async def test_procurement_inquiry_targets_an_unquoted_item_in_a_mixed_list():
+    intake = ProcurementIntake(
+        procedure="list", people=20, needed_by=TODAY, budget_cny=1000,
+        needs=[
+            Need(item="纸杯", specification="200ml", quantity=60, unit="个"),
+            Need(item="礼袋", specification="牛皮纸", per_person=1, unit="个"),
+        ],
+        quotes=[quote("甲商家", arrival_date=TODAY, arrival_confirmed=True)],
+    )
+    receipt = await procurement_tools().get(BUILD_LIST).execute({
+        "today": TODAY.isoformat(), "intake": intake.model_dump(mode="json"),
+    })
+    draft = next(card["summary"] for card in receipt.data["items"] if card["key"] == "inquiry")
+    assert "礼袋 牛皮纸 暂估 20 个" in draft and "纸杯" not in draft
+    assert "运费" in draft and TODAY.isoformat() in draft
+    assert "1000" not in draft

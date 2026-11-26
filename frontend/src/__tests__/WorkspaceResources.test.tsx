@@ -139,4 +139,38 @@ describe('workspace resource features', () => {
       expect.objectContaining({ method: 'PATCH', body: '{"taobao_tbk_local_catalog":true}' }),
     ))
   })
+
+  it('clears only the optional source field and leaves untouched credentials alone', async () => {
+    window.history.replaceState(null, '', '/#/sources')
+    const source = {
+      id: 'taobao', name: '淘宝联盟', group: '购物采购', mode: 'configured',
+      description: '查商品', restart_required: false,
+      fields: [
+        { id: 'taobao_tbk_app_key', label: 'App Key', kind: 'secret', required: true, editable: true, configured: true },
+        { id: 'taobao_tbk_adzone_id', label: '推广位 ID', kind: 'text', required: false, editable: true, configured: true },
+      ],
+    }
+    const fetchMock = vi.fn((_input: RequestInfo | URL, options?: RequestInit) =>
+      options?.method === 'PATCH' ? json([{ ...source, restart_required: true }]) : json([source]),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: '配置 淘宝联盟' }))
+    const modal = within(await screen.findByRole('dialog', { name: '配置 淘宝联盟' }))
+    const save = modal.getByRole('button', { name: '保存配置' })
+    expect(save).toBeDisabled()
+    expect(modal.queryByRole('button', { name: '清空 App Key' })).toBeNull()
+    fireEvent.click(modal.getByRole('button', { name: '清空 推广位 ID' }))
+    await waitFor(() => expect(modal.getByText('保存后清空')).toBeVisible())
+    expect(save).toBeEnabled()
+    fireEvent.click(modal.getByRole('button', { name: '撤销清空 推广位 ID' }))
+    expect(save).toBeDisabled()
+    fireEvent.click(modal.getByRole('button', { name: '清空 推广位 ID' }))
+    fireEvent.click(save)
+    expect(await screen.findByText('配置已保存，重启后端后生效。')).toBeVisible()
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringMatching(/\/workspace\/sources\/taobao$/),
+      expect.objectContaining({ method: 'PATCH', body: '{"taobao_tbk_adzone_id":""}' }),
+    )
+  })
 })

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -46,6 +48,16 @@ class Pages:
                 "status_code": 200, "requested_url": params["url"], "final_url": params["url"],
             },
         }
+
+
+def test_legacy_workflow_imports_resolve_to_the_new_implementations():
+    from src.agent.workspace import supervisor, team
+    from src.seo_agent import specialist
+    from src.seo_agent.chat import runtime
+
+    assert supervisor.WorkspaceSupervisor is team.WorkspaceTeam
+    assert supervisor.conversation_context is team.conversation_context
+    assert runtime.build_seo_system_prompt is specialist.build_seo_system_prompt
 
 
 def test_app_exposes_a_standalone_chat_contract():
@@ -119,10 +131,36 @@ async def test_workspace_tasks_only_list_requested_site_free_conversations(pg_ur
             await database.shutdown()
 
 
+def test_bundled_skill_details_match_the_approved_directory_text():
+    from src.api.routes.workspace.directory import bundled_skill_catalog
+
+    root = Path(__file__).resolve().parents[2]
+    catalog = root / "frontend/src/services/bundledSkillCatalog.json"
+    assert json.loads(catalog.read_text(encoding="utf-8")) == bundled_skill_catalog(), (
+        "Regenerate with python -m src.api.routes.workspace.directory "
+        "> frontend/src/services/bundledSkillCatalog.json"
+    )
+
+
 @pytest.mark.asyncio
 async def test_tool_directory_lists_the_live_registries_without_running_tools(monkeypatch):
+    from src.procurement_agent.models import INTAKE_PROMPT
+    from src.travel_agent.intake import TRAVEL_INTAKE_PROMPT
+    from src.travel_agent.tools import travel_tools
+
+    monkeypatch.setattr(chat, "_travel_registry", travel_tools)
     pages = Pages()
     monkeypatch.setattr(chat, "facade", pages)
+    monkeypatch.setattr(chat, "seo_chat_harness_store", SimpleNamespace(
+        database=SimpleNamespace(started=False),
+    ))
+
+    def unexpected_prompt(*args, **kwargs):
+        pytest.fail("The directory must not build a runtime prompt or call a model")
+
+    monkeypatch.setattr(chat, "build_seo_system_prompt", unexpected_prompt)
+    monkeypatch.setattr(chat, "build_conversation_model", unexpected_prompt)
+    monkeypatch.setattr(chat.structured_model_automation.model_runner, "invoke", unexpected_prompt)
     app = FastAPI()
     app.include_router(chat.router, prefix="/api/v1")
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as api:
@@ -158,14 +196,42 @@ async def test_tool_directory_lists_the_live_registries_without_running_tools(mo
             "shopping_catalog", "shopping_compare_quotes", "shopping_build_list",
             "shopping_reconcile",
         }
+        assert search["skills"] == []
+        assert {prompt["id"] for prompt in search["default_prompts"]} == {
+            "seo-diagnosis", "seo-course-editor",
+        }
+        for row in (learning, exam, followup):
+            assert "无专员提示词" in row["deterministic_path"]
+            assert all("分派指令" in prompt["label"] for prompt in row["default_prompts"])
+        assert {p["id"]: p["text"] for p in travel["default_prompts"]}[
+            "travel-intake"
+        ] == TRAVEL_INTAKE_PROMPT
+        assert {p["id"]: p["text"] for p in procurement["default_prompts"]}[
+            "procurement-intake"
+        ] == INTAKE_PROMPT
+        assert len(travel["skills"]) == 1 and len(travel["skills"][0]["tools"]) == 6
+        limits = {tool["name"]: tool["availability_note"] for tool in travel["tools"]}
+        assert "未配置" in limits["travel_transport"] and "未配置" in limits["travel_hotels"]
+        assert "未配置" in limits["travel_commute"] and limits["travel_weather"] is None
         database = SimpleNamespace(started=True)
 
         async def last_target(conversation_id, *, include_dialog):
-            assert conversation_id == "course-turn" and include_dialog is False
-            return {"target_url": "https://example.com/clinical-course.html"}
+            assert include_dialog is False
+            if conversation_id == "invalid-target":
+                return {"target_url": "https://[malformed-private-target"}
+            assert conversation_id == "course-turn"
+            return {
+                "target_url": "https://example.com/private-target", "source_run_id": "private-run",
+                "system_prompt": "private-effective-prompt", "server_dialog": "private-user-input",
+                "followup_key_hash": "private-access-hash",
+            }
 
         async def find_site(host):
-            return None
+            assert host == "example.com"
+            return {
+                "id": "configured-site", "status": "ACTIVE", "name": "private-site-name",
+                "default_country": "private-setting", "prompt_override": "private-override",
+            }
 
         monkeypatch.setattr(chat, "seo_chat_harness_store", SimpleNamespace(
             database=database, latest_dispatch_state=last_target,
@@ -177,10 +243,85 @@ async def test_tool_directory_lists_the_live_registries_without_running_tools(mo
         assert "postgraduate_admissions_search" in {t["name"] for t in medical["tools"]}
         assert "graduate-admissions" in {s["name"] for s in medical["skills"]}
         assert "seo_page_metadata" in {t["name"] for t in search["tools"]}
+        assert search["skills"]
+        assert "private-" not in response.text
+        from src.api.routes.workspace.directory import bundled_skill_catalog
+
+        bundled_usage = {
+            (entry["agent"], name): usage
+            for entry in bundled_skill_catalog()
+            for name, usage in entry["usage"].items()
+        }
         for row in scoped["specialists"]:
-            assert all(set(t) == {"name", "description"} for t in row["tools"])
+            for tool in row["tools"]:
+                assert set(tool) == {"name", "description", "guidance", "availability_note", "skill_usage"}
+                assert tool["skill_usage"] == bundled_usage[(row["agent"], tool["name"])]
+                assert all(tool["skill_usage"].values())
+        registration = bundled_usage[("healthcare", "medical_exam_registration")]
+        assert "实践技能考试免考核对" in registration["scenario"]
+        assert not any("skills_retake" in value for value in registration.values())
+        assert bundled_usage[("followup", "followup_read_materials")] != bundled_usage[
+            ("followup", "followup_save_confirmed")
+        ]
+        for row in scoped["specialists"]:
+            bound_tools = set()
+            prompt_ids = {prompt["id"] for prompt in row["default_prompts"]}
+            for skill in row["skills"]:
+                assert set(skill) == {"name", "label", "summary", "tools"}
+                assert skill["summary"] and skill["tools"] and skill["name"] in prompt_ids
+                bound_tools.update(skill["tools"])
+            assert bound_tools == {tool["name"] for tool in row["tools"]}
+            for prompt in row["default_prompts"]:
+                assert set(prompt) == {"id", "label", "text"} and prompt["text"]
+        invalid = await api.get("/api/v1/chat/tools?conversation_id=invalid-target")
+        assert invalid.status_code == 200
+        assert "private-target" not in invalid.text
+        assert invalid.json()["specialists"][1]["default_prompts"] == specialists[1]["default_prompts"]
         assert (await api.get("/api/v1/chat/tools?conversation_id=")).status_code == 422
         assert pages.urls == []
+
+
+@pytest.mark.asyncio
+async def test_seo_directory_matches_the_runtime_skills_for_each_available_tool(monkeypatch):
+    from src.seo_agent.chat.tools import SEO_TOOL_DEFINITIONS, build_seo_agent_registry
+    from src.seo_agent.skills import SEO_SKILLS
+    from src.seo_agent.workflows.geo import GeoCitationWorkflow
+
+    capabilities = {item.capability for item in SEO_TOOL_DEFINITIONS}
+    facade = SimpleNamespace(live_capabilities=lambda: capabilities, semrush_available=True)
+    monkeypatch.setattr(chat, "facade", facade)
+    monkeypatch.setattr(chat, "seo_chat_harness_store", SimpleNamespace(database=SimpleNamespace(started=False)))
+    site = {"domain": "example.com"}
+    registry = build_seo_agent_registry(
+        facade, site, snapshots=chat.cache_manager,
+        model_runner=chat.structured_model_automation.model_runner,
+        geo_citation_client=SimpleNamespace(),
+    )
+    assert GeoCitationWorkflow.name in registry.names()
+    assert set(registry.names()) == SEO_SKILLS.keys()
+    app = FastAPI()
+    app.include_router(chat.router, prefix="/api/v1")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as api:
+        response = await api.get("/api/v1/chat/tools", params={"conversation_id": "empty"})
+    assert response.status_code == 200
+    seo = next(row for row in response.json()["specialists"] if row["agent"] == "seo")
+    tool_names = [tool["name"] for tool in seo["tools"]]
+    assert set(tool_names) == {
+        "seo_keyword_overview", "seo_autocomplete", "seo_news_search", "seo_image_search",
+        "seo_serp_overview", "seo_keyword_opportunity",
+    }
+    assert [skill["tools"] for skill in seo["skills"]] == [[name] for name in tool_names]
+    prompt_by_id = {prompt["id"]: prompt["text"] for prompt in seo["default_prompts"]}
+    fragments = [prompt_by_id[skill["name"]] for skill in seo["skills"]]
+    assert len(set(fragments)) == len(tool_names)
+    keyword, autocomplete = (SEO_SKILLS[name] for name in ("seo_keyword_overview", "seo_autocomplete"))
+    assert "1–50 个关键词" in seo["skills"][tool_names.index("seo_keyword_overview")]["summary"]
+    assert prompt_by_id[keyword.name] == keyword.prompt_fragment
+    assert all(tool["skill_usage"]["rules"] == SEO_SKILLS[tool["name"]].prompt_fragment for tool in seo["tools"])
+    assert prompt_by_id[autocomplete.name] == autocomplete.prompt_fragment
+    runtime_prompt = chat.build_seo_system_prompt(site, [{"function": {"name": keyword.tools[0]}}])
+    assert keyword.prompt_fragment in runtime_prompt
+    assert autocomplete.prompt_fragment not in runtime_prompt
 
 
 @pytest.mark.asyncio

@@ -27,7 +27,8 @@ PROCUREMENT_SKILL = Skill(
     tools=[CATALOG, COMPARE, BUILD_LIST, RECONCILE],
     prompt_fragment=(
         "shopping_procurement 负责按关键词找商品和查参考价、报价比较、活动采购清单、"
-        "实到数量与采购支出核对。即使缺少规格、数量或链接也先分派。"
+        "实到数量与采购支出核对。即使缺少规格、数量或链接也先分派，明确区分查参考价、"
+        "按用户报价比较、编清单和按订单凭证对账。结果由工具生成，仅用于核对和决策。"
         "要求刷新商品查询时，沿用用户已确认的商品、规格和筛选条件，采用用户明确更改的条件。"
         "采购商品链接只作商品资料。如果用户明确在做商品页面SEO，仍分给seo。"
     ),
@@ -261,6 +262,45 @@ def _provider_card(row: dict, source: dict, key: str) -> dict:
     )
 
 
+def _catalog_limitations(cards: list[dict]) -> list[str]:
+    labels = {entry["label"] for card in cards for entry in card["metadata"]}
+    notes = []
+    if labels & {"目录参考价", "平台预估价", "商品标价"}:
+        notes.append("商品标价与参考价仅供筛选，所选规格、实买数量和结算价需核对。")
+    if "链接" in labels:
+        notes.append("标为「推广链接」的链接来自平台推广渠道。")
+    if any(card["title"] == "推广券资料" for card in cards):
+        notes.append("优惠券能否用于本批采购取决于资格、规格和门槛，未计入报价总额。")
+    return notes
+
+
+def _inquiry_draft(result: dict) -> str | None:
+    quoted_items = {row["item"] for row in result["quotes"]}
+    items_with_gaps = {row["item"] for row in result["quotes"] if row["issues"]}
+    requested = []
+    for line in result["lines"]:
+        if line["item"] in quoted_items and line["item"] not in items_with_gaps:
+            continue
+        details = [line["item"]]
+        if line["specification"]:
+            details.append(line["specification"])
+        if line["quantity"] is not None:
+            prefix = "暂估 " if line["quantity_estimated"] else "需求 "
+            details.append(f"{prefix}{line['quantity']} {line['unit'] or ''}".rstrip())
+        requested.append(" ".join(details))
+    if not requested:
+        return None
+    arrival = (
+        f"如可承诺不晚于 {result['needed_by']} 送达，请在报价中注明。"
+        if result["needed_by"] else "也请注明预计到货时间。"
+    )
+    return (
+        f"您好，计划采购{'；'.join(requested)}。"
+        "请注明对应规格、每包数量、起订量、含税价、运费及其他费用或优惠。"
+        f"{arrival}"
+    )
+
+
 async def _compare_report(query: _ReportQuery) -> dict:
     intake = query.intake
     is_list = intake.procedure == Procedure.LIST
@@ -274,26 +314,30 @@ async def _compare_report(query: _ReportQuery) -> dict:
         build_list=is_list,
     )
     title = "采购清单" if is_list else "采购比价"
+    catalog_cards = _catalog_cards(query.sources)
     cards = [
         *(_line_card(line, i) for i, line in enumerate(result["lines"])),
         *(_plan_card(plan, i) for i, plan in enumerate(result["plans"])),
         *(_quote_card(row, i) for i, row in enumerate(result["quotes"])),
-        *_catalog_cards(query.sources),
+        *catalog_cards,
     ]
-    missing = list(dict.fromkeys(issue for row in result["quotes"] for issue in row["issues"]))
-    if intake.needs and (missing or not result["quotes"]):
-        names = "、".join(need.item for need in intake.needs)
-        terms = [issue[2:] for issue in missing if issue.startswith(("核对", "确认"))]
-        message = "、".join(terms[:5]) or "具体规格、包装、起订量、含税价、运费与到货时间"
-        cards.append(_card("inquiry", "询价草稿", {}, f"您好，计划采购{names}，请提供{message}。"))
+    if draft := _inquiry_draft(result):
+        cards.append(_card("inquiry", "询价草稿", {}, draft))
     context = [
         f"预算 {_yuan(result['budget_cny'])}" if result["budget_cny"] is not None else None,
         f"最迟 {result['needed_by']} 到货" if result["needed_by"] else None,
     ]
+    limitations = _catalog_limitations(catalog_cards)
+    if any(
+        row["known_subtotal_cny"] is not None and row["total_cny"] is None
+        for row in result["quotes"]
+    ):
+        limitations.insert(0, "已知小计仅包含可核实费用，需确认遗漏的费用和本次适用优惠后再核对总价。")
     return {
         **result,
         **_presentation(title, " · ".join(value for value in context if value)),
         "sources": query.sources,
+        "limitations": limitations,
         "items": cards,
     }
 
@@ -363,6 +407,7 @@ def procurement_tools(
                 "is_estimated": False,
             }
             result["items"] = _catalog_cards(sources, limit=CATALOG_RESULT_LIMIT)
+            result["limitations"] = _catalog_limitations(result["items"])
         return result
 
     return ToolRegistry(

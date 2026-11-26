@@ -35,7 +35,7 @@ export default function DataSourcesPage() {
   const [error, setError] = useState<string>()
   const [notice, setNotice] = useState<string>()
   const [editing, setEditing] = useState<WorkspaceSource>()
-  const [changes, setChanges] = useState<Record<string, string | boolean>>({})
+  const [changes, setChanges] = useState<Record<string, string | boolean | null>>({})
   const [saving, setSaving] = useState(false)
   const [formError, setFormError] = useState<string>()
 
@@ -80,9 +80,11 @@ export default function DataSourcesPage() {
   }
 
   const clearable = editing?.fields.filter(field => field.editable && field.configured && field.kind !== 'switch') ?? []
-  const editableChanges = Object.fromEntries(Object.entries(changes).filter(([, value]) =>
-    typeof value === 'boolean' || value.trim().length > 0,
-  ))
+  const editableChanges: Record<string, string | boolean> = {}
+  for (const [id, value] of Object.entries(changes)) {
+    if (typeof value === 'boolean') editableChanges[id] = value
+    else if (value === null || value.trim()) editableChanges[id] = value?.trim() ?? ''
+  }
 
   return (
     <div className="page-content workspace-resources workspace-sources">
@@ -136,13 +138,27 @@ export default function DataSourcesPage() {
             }
             const Field = field.kind === 'secret' ? Input.Password : Input
             const value = changes[field.id]
+            const clearing = value === null
             return (
-              <label key={field.id}>
-                <span>{field.label} <small>{field.editable ? field.configured ? '已保存' : '待填写' : '由服务器管理'}</small></span>
-                <Field aria-label={field.label} disabled={!field.editable} value={typeof value === 'string' ? value : ''}
-                  placeholder={field.configured ? '留空保留当前配置' : '输入配置值…'} autoComplete="off"
-                  onChange={event => setChanges(current => ({ ...current, [field.id]: event.target.value }))} />
-              </label>
+              <div key={field.id} className="workspace-source-field">
+                <label>
+                  <span>{field.label} <small>{clearing ? '保存后清空' : field.editable ? field.configured ? '已保存' : '待填写' : '由服务器管理'}</small></span>
+                  <Field aria-label={field.label} disabled={!field.editable || saving} value={typeof value === 'string' ? value : ''}
+                    placeholder={field.configured && !clearing ? '留空保留当前配置' : '输入配置值…'} autoComplete="off"
+                    onChange={event => setChanges(current => ({ ...current, [field.id]: event.target.value }))} />
+                </label>
+                {field.required === false && field.editable && field.configured && (
+                  <Button type="link" disabled={saving} aria-label={`${clearing ? '撤销清空' : '清空'} ${field.label}`}
+                    onClick={() => setChanges(current => {
+                      if (current[field.id] !== null) return { ...current, [field.id]: null }
+                      const next = { ...current }
+                      delete next[field.id]
+                      return next
+                    })}>
+                    {clearing ? '撤销清空' : '清空'}
+                  </Button>
+                )}
+              </div>
             )
           })}
         </div>

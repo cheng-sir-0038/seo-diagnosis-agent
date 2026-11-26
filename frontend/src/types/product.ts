@@ -167,6 +167,24 @@ export interface SystemStatus {
   }>
 }
 
+export interface ObservabilityWindow {
+  start_at: string
+  end_at: string
+}
+
+export interface ObservabilityCounts {
+  trace_count: number
+  failed_trace_count: number
+  tool_call_count: number
+}
+
+export interface ObservabilityOverview extends ObservabilityCounts {
+  waiting_trace_count: number
+  previous: ObservabilityCounts | null
+}
+
+export type ObservabilityTraceScope = 'all' | 'business' | 'system' | 'product'
+
 export interface ObservabilityTrace {
   id: string
   operation_name: string

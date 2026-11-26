@@ -53,3 +53,29 @@ async def test_saved_sources_enable_real_catalog_and_hide_keys(tmp_path, monkeyp
         assert Settings(_env_file=None).taobao_tbk_local_catalog is False
         locked = await http.patch(root + "/local_catalog", json={"taobao_tbk_local_catalog": True})
         assert locked.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_optional_source_field_can_be_cleared_independently(tmp_path, monkeypatch):
+    path = tmp_path / "sources.json"
+    monkeypatch.setenv("WORKSPACE_SOURCE_CONFIG", str(path))
+    for name in ("TAOBAO_TBK_APP_KEY", "TAOBAO_TBK_APP_SECRET", "TAOBAO_TBK_ADZONE_ID"):
+        monkeypatch.delenv(name, raising=False)
+    original = {
+        "taobao_tbk_app_key": "test-app-key", "taobao_tbk_app_secret": "test-app-secret",
+        "taobao_tbk_adzone_id": "test-placement",
+    }
+    path.write_text(json.dumps(original))
+    monkeypatch.setattr(sources, "settings", Settings(_env_file=None))
+    app = FastAPI()
+    app.include_router(sources.router)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as http:
+        result = await http.patch("/workspace/sources/taobao", json={"taobao_tbk_adzone_id": ""})
+    assert result.status_code == 200
+    source = next(row for row in result.json() if row["id"] == "taobao")
+    fields = {field["id"]: field for field in source["fields"]}
+    assert not fields["taobao_tbk_adzone_id"]["required"]
+    assert not fields["taobao_tbk_adzone_id"]["configured"]
+    assert fields["taobao_tbk_app_key"]["configured"] and source["restart_required"]
+    assert all(value not in result.text for value in original.values())
+    assert json.loads(path.read_text()) == {**original, "taobao_tbk_adzone_id": ""}

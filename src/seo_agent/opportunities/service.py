@@ -60,16 +60,42 @@ class ScanRunService:
         idempotency_key: str,
         scheduled_at: str | None = None,
     ) -> dict[str, Any]:
-        trigger = trigger_type.upper()
+        run = await self._start(
+            schedule_id=schedule_id, trigger=trigger_type.upper(),
+            idempotency_key=idempotency_key, scheduled_at=scheduled_at,
+            scheduled_dispatch=False,
+        )
+        assert run is not None
+        return run
+
+    async def start_scheduled_slot(self, schedule_id: str, slot: datetime) -> dict[str, Any] | None:
+        occurrence = slot.astimezone(UTC).replace(second=0, microsecond=0)
+        return await self._start(
+            schedule_id=schedule_id, trigger="SCHEDULED",
+            idempotency_key=f"scheduled-scan:{schedule_id}:{occurrence:%Y-%m-%dT%H:%M}",
+            scheduled_at=occurrence.isoformat(), scheduled_dispatch=True,
+        )
+
+    async def _start(
+        self, *, schedule_id: str, trigger: str, idempotency_key: str,
+        scheduled_at: str | None, scheduled_dispatch: bool,
+    ) -> dict[str, Any] | None:
         async with self.database.transaction() as tx:
-            # Serialize starts for this schedule, including runs skipped during an overlap.
-            schedule = await tx.fetch_value(
-                select(WorkScheduleRow.id)
+            # Serialize dispatch with both schedule updates and other starts.
+            schedule = await tx.fetch_one(
+                select(WorkScheduleRow.__table__)
                 .where(WorkScheduleRow.id == schedule_id)
                 .with_for_update()
             )
             if schedule is None:
+                if scheduled_dispatch:
+                    return None
                 raise KeyError(f"计划不存在: {schedule_id}")
+            if scheduled_dispatch and (
+                not schedule["enabled"] or schedule["archived_at"] is not None
+                or schedule["schedule_type"] != "OPPORTUNITY_SCAN"
+            ):
+                return None
             by_key = select(ScheduleRunRow.__table__).where(
                 ScheduleRunRow.idempotency_key == idempotency_key
             )
@@ -102,7 +128,16 @@ class ScanRunService:
                 )
                 result = await tx.fetch_one(by_key)
                 assert result is not None
-            if (result["schedule_id"], result["trigger_type"], result["scheduled_at"]) != (
+            previous_time = result["scheduled_at"]
+            if scheduled_dispatch and previous_time:
+                try:
+                    # Older scheduler rows recorded the callback's seconds and microseconds.
+                    previous_time = datetime.fromisoformat(previous_time).replace(
+                        second=0, microsecond=0,
+                    ).isoformat()
+                except ValueError:
+                    pass
+            if (result["schedule_id"], result["trigger_type"], previous_time) != (
                 schedule_id, trigger, scheduled_at,
             ):
                 raise OpportunityRequestConflictError("幂等键已被其他扫描请求使用")

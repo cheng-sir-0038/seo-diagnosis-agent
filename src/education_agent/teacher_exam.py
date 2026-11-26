@@ -41,11 +41,17 @@ class TeacherExamQuery(BaseModel):
     def clarification(self) -> str | None:
         if self.outside_coverage:
             return None
-        missing = [label for value, label in (
-            (self.region, "省份"), (self.year, "报考年份"), (self.session, "上半年或下半年"),
+        fields = (
+            (self.region, "省份"), (f"{self.year} 年" if self.year else None, "报考年份"),
+            (_NOTICES[self.session].label if self.session else None, "上半年或下半年"),
             (self.subject, "学段和学科"),
-        ) if not value]
-        return f"请补充{'、'.join(missing)}，我按对应公告核对。" if missing else None
+        )
+        missing = [label for value, label in fields if not value]
+        if not missing:
+            return None
+        known = "、".join(value for value, _ in fields if value)
+        question = f"请补充{'、'.join(missing)}，我按对应公告核对。"
+        return f"已确认报考条件为{known}。{question}" if known else question
 
 
 @dataclass(frozen=True)
@@ -103,8 +109,12 @@ class TeacherWrittenExam(AgentTool):
             f"需备电子证件照，具体提交内容以考区要求为准。{registration}\n"
             "- **考试科目**　综合素质（中学）、教育知识与能力、数学学科知识与教学能力（初级中学）。"
             f"{subjects}\n"
-            "- **备考顺序**　先按 304 大纲列知识点，再分别安排数学内容、教学设计和公共科目练习。"
-            f"{syllabus}\n\n"
+            f"- **备考依据**　先用 {syllabus} 核对数学专业科目的范围。\n\n"
+            "**备考起步清单（练习建议）**\n\n"
+            "- **综合素质**　做 1 道材料分析题，把观点和材料里的依据分别写出来。\n"
+            "- **教育知识与能力**　闭卷解释 1 个易混概念，再举一个课堂例子自查。\n"
+            "- **数学学科知识与教学能力**　从 304 大纲挑 1 个还不熟的知识点，"
+            "先独立做 1 道题，再写出对应的教学目标、一道课堂提问和一道检查理解的题。\n\n"
             f"以上时间是该考期的公告记录。办理报名和查看新公告请进入[中国教育考试网]({_EXAM_PORTAL})。"
         )
         return ToolResult(success=True, data={

@@ -1,4 +1,4 @@
-import { BankOutlined, ClockCircleOutlined, DownOutlined, ShoppingOutlined, UnorderedListOutlined } from '@ant-design/icons'
+import { BankOutlined, ClockCircleOutlined, ShoppingOutlined, UnorderedListOutlined } from '@ant-design/icons'
 
 import { ResultTag } from '../ResultTag'
 import { CardResult } from './CardResult'
@@ -89,6 +89,7 @@ function ProcurementTable({ section, items, quotes }: {
         const notes = section.quote ? quote?.issues ?? item.summary?.split('；') ?? [] : []
         const condition = notes.find(note => /规格与需求不同|相同型号与规格|相同的计量单位|有效期已过/.test(note))
         const firstNote = section.quote ? condition ?? notes[0] : item.summary
+        const promotion = section.catalog && fields.get('链接')?.value === '推广链接'
         const otherNotes = notes.filter(note => note !== firstNote)
         const evidence = section.quote ? fields.get('原文')?.value : undefined
         const terms = section.quote ? (item.metadata ?? []).filter(entry => (
@@ -103,7 +104,8 @@ function ProcurementTable({ section, items, quotes }: {
                 {item.url
                   ? <a href={item.url} target="_blank" rel="noreferrer">{item.title}</a>
                   : item.title}
-                {firstNote && (!section.catalog || fields.has('券面金额')) && (
+                {promotion && <small className="procurement-record-note procurement-condition">推广链接</small>}
+                {firstNote && (
                   <small className={`procurement-record-note${condition ? ' procurement-condition' : ''}`}>{firstNote}</small>
                 )}
               </th>
@@ -125,8 +127,7 @@ function ProcurementTable({ section, items, quotes }: {
             {Boolean(hasDetails) && <tr className="procurement-detail-row" role="row">
               <td colSpan={columns.length + 1} role="cell">
                 <details>
-                  <summary aria-label={`${item.title}的${detailTitle}`}>
-                    <DownOutlined aria-hidden="true" /> {detailTitle}
+                  <summary className="workbench-disclosure" aria-label={`${item.title}的${detailTitle}`}>                     {detailTitle}
                   </summary>
                   <div className="procurement-quote-evidence">
                     {evidence && <blockquote>{evidence}</blockquote>}
@@ -167,6 +168,11 @@ export function ProcurementResult({ data }: { data: CardResultData & { quotes?: 
         {title && <h3>{title}</h3>}
         {description && <p>{description}</p>}
       </header>}
+      {Boolean(data.limitations?.length) && (
+        <ul className="procurement-limitations" aria-label="采购结果说明">
+          {data.limitations?.map(note => <li key={note}>{note}</li>)}
+        </ul>
+      )}
       {tables.map(table => <ProcurementTable key={table.section.label} {...table} quotes={data.quotes} />)}
       {(remaining.length > 0 || !tables.length) && <CardResult data={{ ...data, items: remaining }} />}
     </section>

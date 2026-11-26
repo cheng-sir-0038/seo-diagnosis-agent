@@ -70,7 +70,12 @@ class ScheduleAutomationCoordinator:
             )
         return len(schedules)
 
-    async def run_scan(self, schedule_id: str, *, slot_key: str | None = None) -> dict[str, Any]:
+    async def run_scan(
+        self, schedule_id: str, *, slot_key: str | None = None,
+    ) -> dict[str, Any] | None:
+        slot = datetime.fromisoformat(slot_key) if slot_key else datetime.now(UTC)
+        if slot.tzinfo is None:
+            slot = slot.replace(tzinfo=UTC)
         async with observed_operation(
             self.observability,
             "scheduler.opportunity_scan",
@@ -83,14 +88,12 @@ class ScheduleAutomationCoordinator:
                 select(WorkScheduleRow.__table__).where(WorkScheduleRow.id == schedule_id)
             )
             if schedule is None:
-                raise KeyError(f"工作计划不存在: {schedule_id}")
-            slot = slot_key or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M")
-            run = await self.scans.start(
-                schedule_id=schedule_id,
-                trigger_type="SCHEDULED",
-                idempotency_key=f"scheduled-scan:{schedule_id}:{slot}",
-                scheduled_at=datetime.now(UTC).isoformat(),
-            )
+                return None
+            run = await self.scans.start_scheduled_slot(schedule_id, slot)
+            if run is None:
+                if span is not None:
+                    await span.event("scheduler.scan.inactive", {"schedule_id": schedule_id})
+                return None
             actor_id = self.agent_actor_id
             if actor_id is None:
                 actor = await self.database.fetch_one(

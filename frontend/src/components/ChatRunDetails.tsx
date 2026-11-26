@@ -1,6 +1,6 @@
 import {
   ApartmentOutlined, CheckCircleOutlined, ClockCircleOutlined, ExclamationCircleOutlined, LinkOutlined,
-  LoadingOutlined, RightOutlined, RobotOutlined, StopOutlined,
+  LoadingOutlined, RobotOutlined, StopOutlined,
 } from '@ant-design/icons'
 import { Tabs } from 'antd'
 import { createElement, useState } from 'react'
@@ -9,8 +9,9 @@ import { specialists, specialistStatusLabels } from '../specialists'
 import type { AppliedSkill, RunStatus, SpecialistRun, ToolRun } from '../types/agent'
 import type { DocumentSummary } from '../types/workspace'
 import { DocumentChips } from './ChatAttachments'
+import { InlineToolResults } from './InlineToolResults'
 import { toolIcon, toolResultLabel } from './toolLabels'
-import { unwrapToolResult } from './renderers/contracts'
+import { isCardResultData, resolveLocalizedText, unwrapToolResult } from './renderers/contracts'
 import { RawJsonResult } from './renderers/RawJsonResult'
 
 const toolStatus = { completed: '已完成', failed: '失败', running: '执行中', cancelled: '已停止' }
@@ -40,7 +41,7 @@ function ToolRunDetails({ tool }: { tool: ToolRun }) {
 
   return (
     <details className="chat-run-tool" onToggle={event => setOpen(event.currentTarget.open)}>
-      <summary className="chat-run-tool-heading">{heading}<RightOutlined aria-hidden="true" /></summary>
+      <summary className="workbench-disclosure chat-run-tool-heading">{heading}</summary>
       {open && (
         <div className="chat-run-tool-body">
           {tool.arguments !== undefined && <section aria-label="调用参数">
@@ -50,7 +51,7 @@ function ToolRunDetails({ tool }: { tool: ToolRun }) {
           {tool.error && <p className="chat-run-tool-error">{tool.error}</p>}
           {tool.result !== undefined && (
             <details className="chat-run-result" open={resultOpen} onToggle={event => setResultOpen(event.currentTarget.open)}>
-              <summary><RightOutlined aria-hidden="true" /> 返回数据</summary>
+              <summary className="workbench-disclosure"> 返回数据</summary>
               {resultOpen && <RawJsonResult data={tool.result} />}
             </details>
           )}
@@ -77,8 +78,7 @@ export function ChatRunDetails({ tools, agentRuns = [], title = '执行详情', 
 
   return (
     <details className="chat-run-details" open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
-      <summary>
-        <RightOutlined aria-hidden="true" />
+      <summary className="workbench-disclosure">
         <span>{title}</span>
         <span className="chat-run-count">{tools.length} 次调用</span>
       </summary>
@@ -105,36 +105,65 @@ export function ChatRunDetails({ tools, agentRuns = [], title = '执行详情', 
 const isEvidenceRecord = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === 'object' && !Array.isArray(value)
 
+function safeSourceUrl(value: unknown): URL | undefined {
+  if (typeof value !== 'string' || !/^https?:\/\//i.test(value.trim())) return undefined
+  try {
+    const url = new URL(value)
+    if (['https:', 'http:'].includes(url.protocol) && !url.username && !url.password) return url
+  } catch {
+    // Keep an invalid URL out of the clickable presentation.
+  }
+}
+
+function itemSourceUrl(item: unknown) {
+  if (!isEvidenceRecord(item)) return undefined
+  return safeSourceUrl(item.url) ?? safeSourceUrl(item.source_url) ?? safeSourceUrl(item.booking_url)
+}
+
+function withSafeCardLinks(tool: ToolRun): ToolRun {
+  if (tool.render_hint !== 'cards') return tool
+  const data = unwrapToolResult(tool.result)
+  if (!isCardResultData(data)) return tool
+  const presentation = { ...data, items: data.items.map(item => ({ ...item, url: itemSourceUrl(item)?.href })) }
+  const result = isEvidenceRecord(tool.result) && typeof tool.result.success === 'boolean' && 'data' in tool.result ? { ...tool.result, data: presentation } : presentation
+  return { ...tool, result }
+}
+
+export function CitedInlineToolResults({ tools }: { tools?: ToolRun[] }) {
+  return <InlineToolResults tools={tools?.map(withSafeCardLinks)} />
+}
+
+function evidenceArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : []
+}
+
 function runSources(tools: ToolRun[]) {
-  const evidence = new Map<string, string>()
+  const evidence = new Map<string, { url: string, label: string, named: boolean }>()
+  const add = (source: unknown) => {
+    const record = isEvidenceRecord(source) ? source : undefined
+    const url = typeof source === 'string' ? safeSourceUrl(source)
+      : itemSourceUrl(record) ?? safeSourceUrl(record?.final_url)
+        ?? (record?.source === 'open_meteo' && record.status === 'ok' ? safeSourceUrl('https://open-meteo.com/') : undefined)
+    if (!url) return
+    const label = [record?.title, record?.source_label, record?.label, record?.name, record?.supplier]
+      .map(value => resolveLocalizedText(value).trim()).find(Boolean)
+    const existing = evidence.get(url.href)
+    if (!existing || (!existing.named && label)) {
+      evidence.set(url.href, { url: url.href, label: label ?? url.hostname, named: Boolean(label) })
+    }
+  }
   for (const tool of tools) {
     const result = unwrapToolResult(tool.result)
     if (tool.status !== 'completed' || !isEvidenceRecord(result)) continue
-    const sources = [
-      result, result.provenance, result.weather,
-      ...(isEvidenceRecord(result.routes) ? Object.values(result.routes) : []),
-      ...(Array.isArray(result.sources) ? result.sources : []),
-      ...(Array.isArray(result.references) ? result.references : []),
-      ...(Array.isArray(result.offers) ? result.offers : []),
-      ...(Array.isArray(result.quotes) ? result.quotes : []),
-    ]
-    for (const source of sources) {
-      const record = isEvidenceRecord(source) ? source : undefined
-      const raw = typeof source === 'string' ? source : record?.source_url ?? record?.url ?? record?.booking_url
-        ?? (record?.source === 'open_meteo' && record.status === 'ok' ? 'https://open-meteo.com/' : undefined)
-      if (typeof raw !== 'string') continue
-      let url: URL
-      try {
-        url = new URL(raw)
-      } catch {
-        continue
-      }
-      if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password) continue
-      const label = record?.title ?? record?.source_label ?? record?.label ?? record?.name ?? record?.supplier
-      evidence.set(url.href, typeof label === 'string' && label ? label : url.hostname)
-    }
+    // Read explicit evidence collections. Raw results and tool arguments can contain private URLs.
+    const routes = isEvidenceRecord(result.routes) ? Object.values(result.routes) : []
+    for (const source of [
+      ...evidenceArray(result.items), ...evidenceArray(result.references), ...evidenceArray(result.offers),
+      ...evidenceArray(result.quotes), ...evidenceArray(result.sources),
+      ...routes, result.weather, result.provenance, result,
+    ]) add(source)
   }
-  return [...evidence].map(([url, label]) => ({ url, label }))
+  return [...evidence.values()]
 }
 
 export function ExecutionTimeline({ stage, agentRuns = [], skills = [], tools = [], started, running, elapsedMs, totalTokens,

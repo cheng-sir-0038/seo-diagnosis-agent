@@ -20,6 +20,7 @@ from src.followup_agent.materials import (
     case_evidence,
     prepare_case,
     read_material,
+    review_reports,
 )
 from src.seo_agent.db.database import SeoAgentDatabase
 from src.seo_agent.db.models import FollowupCaseRow
@@ -41,13 +42,19 @@ class CaseData(BaseModel):
     saved: dict | None = None
 
     def view(self) -> dict:
+        evidence = case_evidence(self.files)
+        comparisons, issues = review_reports(evidence)
         return {
             **self.model_dump(mode="json", exclude={"files"}),
             "files": [
                 {**file.model_dump(mode="json", exclude={"evidence"}), "rows": len(file.evidence)}
                 for file in self.files
             ],
-            "records": [entry.model_dump(mode="json") for entry in case_evidence(self.files)],
+            "records": [entry.model_dump(mode="json") for entry in evidence],
+            "report_review": {
+                "comparable_pairs": sum(row["delta"] is not None for row in comparisons),
+                "issues": issues,
+            },
         }
 
 
@@ -168,9 +175,11 @@ class FollowupCaseStore:
                 entry.record.record_date for entry in evidence
                 if entry.record.kind == RecordKind.REPORT and entry.record.record_date
             }
+            comparisons, _ = review_reports(evidence)
             return {
                 "records": len(evidence),
                 "report_dates": len(dates),
+                "comparable_pairs": sum(row["delta"] is not None for row in comparisons),
                 "rejected_files": sum(bool(file.error) for file in case.files),
                 "revision": case.revision,
             }

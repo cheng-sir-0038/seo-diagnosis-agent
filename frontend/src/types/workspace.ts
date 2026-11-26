@@ -24,6 +24,7 @@ export interface SourceField {
   id: string
   label: string
   kind: 'secret' | 'text' | 'switch'
+  required: boolean
   editable: boolean
   configured: boolean
 }

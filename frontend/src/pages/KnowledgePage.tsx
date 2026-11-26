@@ -11,8 +11,9 @@ import type { DocumentSummary, WorkspaceLibrary } from '../types/workspace'
 const dateLabel = new Intl.DateTimeFormat('zh-CN', { month: 'short', day: 'numeric', year: 'numeric' })
 const integer = new Intl.NumberFormat('zh-CN')
 
-export default function KnowledgePage({ onSelect, picker = false, selectedIds = [] }: {
+export default function KnowledgePage({ onSelect, onDelete, picker = false, selectedIds = [] }: {
   onSelect: (document: DocumentSummary) => void
+  onDelete?: (document: DocumentSummary) => void
   picker?: boolean
   selectedIds?: string[]
 }) {
@@ -54,6 +55,7 @@ export default function KnowledgePage({ onSelect, picker = false, selectedIds = 
     setError(undefined)
     try {
       await deleteLibraryDocument(document.id)
+      onDelete?.(document)
       refresh()
     } catch (cause) {
       setError((cause as Error).message)
