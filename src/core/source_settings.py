@@ -15,8 +15,9 @@ from typing import Literal
 class SourceField:
     name: str
     label: str
-    kind: Literal["secret", "text", "switch"] = "secret"
+    kind: Literal["secret", "text", "switch", "choice"] = "secret"
     required: bool = True
+    choices: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -29,8 +30,18 @@ class SourceDefinition:
 
 
 SOURCES = (
-    SourceDefinition("deepseek", "DeepSeek", "模型", "主 Agent 调度和资料问答", (
+    SourceDefinition("agent_model", "主对话与 SEO 文本", "模型", "自动选择优先使用已填写 Key 的 OpenAI。", (
+        SourceField("agent_model_provider", "服务选择", "choice", choices=(
+            ("auto", "自动（优先 OpenAI）"), ("openai", "OpenAI"), ("deepseek", "DeepSeek"),
+        )),
+    )),
+    SourceDefinition("openai", "OpenAI", "模型", "API Key 也可供独立的 GEO 引用采样使用。", (
+        SourceField("openai_api_key", "API Key"),
+        SourceField("openai_model", "对话模型", "text"),
+    )),
+    SourceDefinition("deepseek", "DeepSeek", "模型", "可选的对话和 SEO 文本服务。", (
         SourceField("deepseek_api_key", "API Key"),
+        SourceField("deepseek_model", "对话模型", "text"),
     )),
     SourceDefinition("page_html", "网页 HTML", "SEO / GEO", "读取公开网页的标题、正文和页面标签"),
     SourceDefinition("serper", "Serper", "SEO / GEO", "Google 搜索结果、联想词和媒体检索", (

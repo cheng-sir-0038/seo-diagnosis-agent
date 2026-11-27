@@ -12,7 +12,7 @@
 | 医药资料 | 查 2025 年关于青少年睡眠时长的三篇 PubMed 文献，附 PMID 和出处。 |
 | 学习陪练 | 出三道一元一次方程题，每次只出一道，等我答完再判分。 |
 | 报考备考 | 2026 年下半年湖北初中数学教资笔试考哪些科目？帮我列个备考清单。 |
-| 随访与复诊准备 | 对照我提供的两次报告，按日期列出变化、原值和来源。 |
+| 随访与复诊准备 | 我下周要复诊，帮我整理要带的资料、已有的预约安排和想问医生的问题。 |
 | 商旅行程 | 周四从上海去武汉参会，查交通、住宿、接驳和天气，预算 3,500 元。 |
 | 购物与采购 | 我要 60 个 200ml 纸杯，按两份报价核算实际要买多少和已知小计。 |
 
@@ -36,7 +36,7 @@
 
 ## 本地启动
 
-需要 Python 3.11+、Node.js 20.19+ 或 22.12+，以及 npm。首次启动将 [.env.example](.env.example) 复制为 `.env.local`，设置 `DEEPSEEK_API_KEY`，并让 `DATABASE_URL` 中的口令和 `POSTGRES_PASSWORD` 一致。
+需要 Python 3.11+、Node.js 20.19+ 或 22.12+，以及 npm。首次启动将 [.env.example](.env.example) 复制为 `.env.local`，配置 `OPENAI_API_KEY` 或 `DEEPSEEK_API_KEY`，并让 `DATABASE_URL` 中的口令和 `POSTGRES_PASSWORD` 一致。文本模型默认优先选择已填写 Key 的 OpenAI。可用 `AGENT_MODEL_PROVIDER=deepseek` 指定 DeepSeek，用 `OPENAI_MODEL` 或 `DEEPSEEK_MODEL` 设置对应的模型。
 
 ```bash
 docker compose --env-file .env.local up -d --wait db

@@ -18,6 +18,7 @@ from src.core.config import Settings
 from src.models.common import Capability, DataSource
 from src.models.page_metadata import PageMetadataReport
 from src.seo_agent.chat.tools import build_seo_agent_registry
+from src.seo_agent.workflows import cloudflare_images
 from src.seo_agent.workflows.cloudflare_images import CloudflareShareImages
 from src.seo_agent.workflows.structured_model import StructuredModelRunner
 
@@ -105,7 +106,7 @@ async def test_share_image_serves_only_generated_assets(
         share_image_directory=tmp_path / "share-images",
     )
     generator = CloudflareShareImages(config)
-    monkeypatch.setattr(conversations, "cloudflare_share_images", generator)
+    monkeypatch.setattr(cloudflare_images, "cloudflare_share_images", generator)
     calls = []
 
     def cloudflare(request: httpx.Request) -> httpx.Response:

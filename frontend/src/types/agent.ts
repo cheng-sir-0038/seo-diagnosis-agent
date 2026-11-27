@@ -1,4 +1,4 @@
-import type { Specialist, SpecialistStatus } from '../specialists'
+import type { Specialist, SpecialistProfile, SpecialistStatus } from '../specialists'
 export type { Specialist } from '../specialists'
 
 export type AgentEventType =
@@ -8,6 +8,7 @@ export type AgentEventType =
   | 'input.submitted'
   | 'input.accepted'
   | 'agent.dispatched'
+  | 'agent.started'
   | 'agent.completed'
   | 'agent.failed'
   | 'skill.loaded'
@@ -46,6 +47,7 @@ export type RenderHint = 'chart' | 'table' | 'tree' | 'cards'
 export interface SpecialistRun {
   id: string
   agent: Specialist
+  profile?: SpecialistProfile
   status: SpecialistStatus
   startedAt: string
 }
@@ -67,14 +69,17 @@ export interface DirectorySkillUsage {
 export interface SpecialistDirectoryData {
   specialists: {
     agent: Specialist
+    profile?: SpecialistProfile
+    skill_catalog_version?: number
     tools: {
       name: string
       description: string
       guidance?: string | null
       availability_note?: string | null
       skill_usage?: DirectorySkillUsage | null
+      public_prompt_ids?: string[]
     }[]
-    skills?: { name: string, label: string, summary?: string, tools: string[] }[]
+    skills?: { name: string, label: string, summary?: string, tools: string[], usage?: Record<string, DirectorySkillUsage> }[]
     default_prompts?: { id: string, label: string, text: string }[]
     deterministic_path?: string | null
     note?: string | null
@@ -146,6 +151,7 @@ export interface PendingInputSubmission {
   requestId: string
   messageId: string
   action: 'answer' | 'use_available'
+  followupRevision?: number
 }
 
 export interface Conversation {

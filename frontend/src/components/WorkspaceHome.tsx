@@ -19,7 +19,7 @@ const domains = [
     id: 'health', title: '医疗健康', icon: MedicineBoxFilled, sceneIcon: HeartOutlined,
     description: '医保目录、医学文献与复诊准备',
     examples: [
-      { title: '随访与复诊准备', detail: '核对两次报告，整理复诊资料', prompt: '用合成资料演示一次复诊准备。帮我核对两次报告，整理下次要带的资料和已有安排。' },
+      { title: '复诊前准备清单', detail: '整理要带的资料、预约和想问医生的问题', prompt: '我下周要复诊，帮我整理要带的资料、已有的预约安排和想问医生的问题。' },
       { title: '医保药品目录', detail: '核查通用名、剂型和分类', prompt: '帮我核对国家医保药品目录当前生效版，二甲双胍有哪些常规剂型，分别是甲类还是乙类？' },
       { title: 'PubMed 文献检索', detail: '查公开题录和 PMID', prompt: '在 PubMed 上找 2024 至 2025 年关于青少年睡眠时长的 3 篇文献，列出题录和 PMID。' },
       { title: '医考报名', detail: '查湖北考区的技能免考条件', prompt: '我 2025 年实践技能考过了，但医学综合考试没过。2026 年在湖北报考医师资格，还要重新考技能和办理报名吗？' },

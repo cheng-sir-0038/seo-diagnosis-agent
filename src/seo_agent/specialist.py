@@ -4,14 +4,27 @@ from __future__ import annotations
 
 import json
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 from src.agent.models import AgentRun
 from src.agent.providers.base import ToolCall
 from src.agent.runtime.executor import AgentExecutor
 from src.agent.tools.registry import ToolRegistry
-from src.seo_agent.skills import seo_skills_for_tools
-from src.seo_agent.workflows.course_review import course_editor_input
+from src.agent.workspace.registry import (
+    PublicInstruction, PublicSkill, RoutingTurn, SpecialistContextUnavailable, SpecialistDefinition,
+    SpecialistProfile, ToolContext,
+)
+from src.agent.workspace.routing import select_page
+from src.observability.instrumentation import observed_operation
+from src.observability.models import SpanKind
+from src.seo_agent.geo_a2a import configured_citation_client
+from src.seo_agent.skill_usage import SEO_SKILL_USAGE
+from src.seo_agent.skills import SEO_SKILLS, seo_skills_for_tools
+from src.seo_agent.workflows.course_review import COURSE_EDITOR_SYSTEM_PROMPT, course_editor_input
+
+if TYPE_CHECKING:
+    from src.agent.workspace.execution import SpecialistExecution
 
 SeoSpecialistFactory = Callable[[str | None, list[str]], Awaitable[tuple[str, ToolRegistry]]]
 
@@ -215,3 +228,121 @@ def build_seo_system_prompt(site: dict[str, Any], tool_schemas: list[dict[str, A
     工具明细因上下文压缩而不可读时，引导用户查看证据卡片。
     将引用链接放在相关陈述旁，只使用工具给出的 URL；不要主动切换来源或重复查询。
 """
+
+
+SEO_ID = "seo"
+
+
+class SeoTargetUnavailable(SpecialistContextUnavailable):
+    """The current context cannot supply SEO tools for this target."""
+
+
+async def resolve_seo_site(context: ToolContext) -> dict[str, Any]:
+    """Resolve a selected page to its registered or read-only domain context."""
+    if context.site is not None:
+        return context.site
+    site = {"default_country": "US", "default_language": "en"}
+    if not (target := context.target_url):
+        return site
+    try:
+        host = urlsplit(target).hostname
+    except ValueError:
+        raise SeoTargetUnavailable("当前目标不可用于 SEO 调查。") from None
+    if not host:
+        raise SeoTargetUnavailable("当前目标不可用于 SEO 调查。")
+    find_site = context.resources.find_site
+    registered = await find_site(host) if find_site else None
+    if registered:
+        if registered.get("status") != "ACTIVE" or registered.get("archived_at"):
+            raise SeoTargetUnavailable("当前目标不可用于 SEO 调查。")
+        site.update(registered)
+    else:
+        site.update(id=f"domain:{host.removeprefix('www.')}", name=host)
+    site.update(domain=host, target_url=target)
+    return site
+
+
+async def build_seo_tools(context: ToolContext) -> ToolRegistry:
+    """Build fresh workspace or standalone SEO tools from the same capability source."""
+    from src.seo_agent.chat.tools import build_seo_agent_registry
+    from src.seo_agent.workflows.cloudflare_images import cloudflare_share_images
+
+    resources = context.resources
+    site = await resolve_seo_site(context)
+    return build_seo_agent_registry(
+        resources.facade, site, observability=resources.observability,
+        snapshots=resources.cache, model_runner=resources.planner,
+        image_generator=cloudflare_share_images,
+        geo_citation_client=configured_citation_client(resources.observability),
+        user_messages=list(context.user_messages),
+    )
+
+
+def prepare_seo_route(turn: RoutingTurn) -> str | None:
+    """Retain or select the exact user-supplied page for page-bound work."""
+    target, question = select_page(
+        turn.state.get("target_url"), turn.candidates, turn.invalid_target, turn.decision,
+    )
+    turn.state["target_url"] = target
+    turn.state["awaiting_page"] = bool(question)
+    return question
+
+
+async def execute_workspace_seo(execution: SpecialistExecution) -> None:
+    """Run an ordinary SEO task or consume the workflow's confirmed public rule."""
+    run, executor = execution.run, execution.executor
+    target = run.dispatch_state.get("target_url")
+    rule = run.dispatch_state.get("public_rule")
+
+    async def configure(target: str | None, user_messages: list[str]) -> tuple[str, ToolRegistry]:
+        site = await resolve_seo_site(ToolContext(execution.resources, target_url=target))
+        registry = await execution.definition.tools(ToolContext(
+            execution.resources, site=site, user_messages=tuple(user_messages),
+        ))
+        return build_seo_system_prompt(site, registry.schemas()), registry
+
+    async with observed_operation(
+        execution.resources.observability, "workspace.seo", kind=SpanKind.AGENT,
+        input_data={"target_url": target, "public_rule": rule},
+        metadata={"agent_profile": execution.definition.profile.public_data()},
+    ) as span:
+        dialog = [] if rule else await execution.dialog()
+        await run_seo_specialist(executor, run, configure=configure, dialog=dialog)
+        if span:
+            span.output_data = {"target_url": target, "status": run.status.value}
+
+
+SEO_SPECIALIST = SpecialistDefinition(
+    id=SEO_ID, profile=SpecialistProfile("SEO / GEO", "search", "lavender", "seo"),
+    routing_prompt=(
+        "处理网站、搜索、关键词、内容草稿和 GEO。页面操作和按域名查排名需要页面；"
+        "单独研究主题词、搜索结果或解释 SEO 概念不要求网址。单纯查网页 Title 也走这里。"
+    ),
+    tools=build_seo_tools, execute=execute_workspace_seo, prepare=prepare_seo_route,
+    no_target_note="指定网页后会载入该页可用的检查工具。",
+    public_skills=tuple(PublicSkill.publish(
+        skill, summary=skill.metadata["public_summary"], instruction=skill.prompt_fragment,
+        usage={tool: (scenario, inputs, skill.prompt_fragment, output)},
+    ) for tool, skill in SEO_SKILLS.items() for scenario, inputs, output in (SEO_SKILL_USAGE[tool],)),
+    public_instructions=(
+    PublicInstruction(
+        id="seo-diagnosis", label="SEO / GEO 诊断（静态节选）", attach_to_tools=False,
+        text=(
+                "你是 SEO/GEO 专员。target_url 是本轮要检查的确切页面；延续分析时沿用完整路径。\n"
+                "没有域名时只处理已提供的研究主题，具体页面的信息必须先取得明确的网址。\n\n"
+                "工作规则：\n"
+                "1. 根据用户意图自行判断是否需要查询数据、调用哪些工具以及调用顺序。\n"
+                "2. 不要预设固定调用顺序；每次拿到工具结果后，重新判断证据是否足够、是否冲突、是否需要补查。\n"
+                "3. 只使用工具返回的真实数据形成站点结论，不得编造指标、排名、竞品或审计问题。\n"
+                "4. 工具参数中的国家默认使用站点国家；除非用户明确要求，不要擅自改变目标市场。\n"
+                "5. 结论必须区分：已观察事实、基于证据的推断、数据不足。\n"
+                "6. 已有足够证据时停止调用工具并生成简洁结论；没有必要时不要为了展示而调用工具。\n"
+                "7. 调查不执行发布、删除或站点写入；分享图仅保存为应用预览。"
+        ),
+    ),
+    PublicInstruction(
+        id="seo-course-editor", label="课程页与考纲核对",
+        text=COURSE_EDITOR_SYSTEM_PROMPT, tools=("seo_page_metadata",),
+    ),
+    ),
+)

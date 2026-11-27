@@ -2,12 +2,18 @@ import {
   BarChartOutlined, DatabaseOutlined, MedicineBoxOutlined, ReloadOutlined, RobotOutlined,
   SendOutlined, SettingOutlined, ShoppingCartOutlined,
 } from '@ant-design/icons'
-import { Alert, Button, Input, Modal, Popconfirm, Switch } from 'antd'
+import { Alert, Button, Input, Modal, Popconfirm, Select, Switch } from 'antd'
 import { createElement, useEffect, useState } from 'react'
 
 import { PageHeader } from '../components/PageHeader'
 import { listWorkspaceSources, saveWorkspaceSource } from '../services/workspaceApi'
-import type { WorkspaceSource } from '../types/workspace'
+import type { TextModelStatus, WorkspaceSource } from '../types/workspace'
+
+function modelLabel(model: TextModelStatus | null, showProvider: boolean) {
+  if (!model) return '未选择服务'
+  const provider = model.provider === 'openai' ? 'OpenAI' : 'DeepSeek'
+  return `${showProvider ? `${provider} / ` : ''}${model.model ?? '未设置模型'}`
+}
 
 const sourceGroupIcons = new Map<string, typeof DatabaseOutlined>([
   ['模型', RobotOutlined],
@@ -79,7 +85,9 @@ export default function DataSourcesPage() {
     }
   }
 
-  const clearable = editing?.fields.filter(field => field.editable && field.configured && field.kind !== 'switch') ?? []
+  const clearable = editing?.fields.filter(field => field.editable && field.configured && (
+    field.kind === 'secret' || (field.kind === 'text' && editing.group !== '模型')
+  )) ?? []
   const editableChanges: Record<string, string | boolean> = {}
   for (const [id, value] of Object.entries(changes)) {
     if (typeof value === 'boolean') editableChanges[id] = value
@@ -88,7 +96,7 @@ export default function DataSourcesPage() {
 
   return (
     <div className="page-content workspace-resources workspace-sources">
-      <PageHeader title="数据源管理" description="查看当前客户端状态，管理本地数据源配置。"
+      <PageHeader title="数据源管理" description="查看生效的本地配置。外部权限、模型可用性和额度以实际调用为准。"
         actions={<Button icon={<ReloadOutlined />} loading={loaded !== attempt} onClick={() => setAttempt(number => number + 1)}>刷新状态</Button>} />
       {error && <Alert type="error" showIcon title={error} />}
       {notice && <Alert type="success" showIcon title={notice} />}
@@ -106,6 +114,17 @@ export default function DataSourcesPage() {
                 <li key={source.id}>
                   <div className="workspace-source-copy">
                     <strong>{source.name}</strong>
+                    {source.text_model !== undefined && (
+                      <small className="workspace-source-model">
+                        {source.id === 'agent_model' ? '当前模型：' : '对话模型：'}
+                        {modelLabel(source.text_model, source.id === 'agent_model')}
+                      </small>
+                    )}
+                    {source.pending_text_model !== undefined && (
+                      <small>重启后：{modelLabel(source.pending_text_model, source.id === 'agent_model')}
+                        {source.pending_text_model && !source.pending_text_model.configured && '（待配置）'}
+                      </small>
+                    )}
                     <small>{source.description}</small>
                   </div>
                   <span className={`workspace-state workspace-state-${mode.tone}`}>{mode.text}</span>
@@ -128,16 +147,25 @@ export default function DataSourcesPage() {
         {formError && <Alert type="error" showIcon title={formError} />}
         <div className="workspace-source-form">
           {editing?.fields.map(field => {
+            const value = changes[field.id]
             if (field.kind === 'switch') {
-              const pending = changes[field.id]
               return (
-                <label key={field.id}>{field.label}<Switch aria-label={field.label} disabled={!field.editable}
-                  checked={typeof pending === 'boolean' ? pending : field.configured}
-                  onChange={value => setChanges(current => ({ ...current, [field.id]: value }))} /></label>
+                <label key={field.id}>{field.label}<Switch aria-label={field.label} disabled={!field.editable || saving}
+                  checked={typeof value === 'boolean' ? value : field.configured}
+                  onChange={checked => setChanges(current => ({ ...current, [field.id]: checked }))} /></label>
+              )
+            }
+            if (field.kind === 'choice') {
+              return (
+                <label key={field.id}>
+                  <span>{field.label} {!field.editable && <small>由服务器管理</small>}</span>
+                  <Select aria-label={field.label} disabled={!field.editable || saving}
+                    value={typeof value === 'string' ? value : field.value} options={field.options}
+                    onChange={selected => setChanges(current => ({ ...current, [field.id]: selected }))} />
+                </label>
               )
             }
             const Field = field.kind === 'secret' ? Input.Password : Input
-            const value = changes[field.id]
             const clearing = value === null
             return (
               <div key={field.id} className="workspace-source-field">

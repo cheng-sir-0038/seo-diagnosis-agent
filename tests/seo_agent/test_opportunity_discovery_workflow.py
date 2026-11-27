@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select, update
 
+from src.agent.providers.errors import ModelRequestError
 from src.core.cache import CacheManager
 from src.core.exceptions import InternalDataNotAvailableError, InternalProviderResponseError
 from src.models.common import Capability
@@ -83,6 +84,8 @@ class CandidateModel:
                 context = json.loads(messages[-1].content)
                 if model.mode == "upstream_failure":
                     raise RuntimeError("private model provider error")
+                if model.mode == "quota_failure":
+                    raise ModelRequestError("openai", 429, reason="insufficient_quota")
                 if model.mode == "invalid_schema":
                     return schema.model_validate({})
                 candidates = []
@@ -484,13 +487,16 @@ async def test_discovery_api_scope_validation_and_success(context, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("mode", "hint"), [
+    ("upstream_failure", "暂不可用"), ("quota_failure", "可用额度不足"),
+])
 async def test_discovery_api_reports_model_failure_without_partial_business_writes(
-    context, monkeypatch
+    context, monkeypatch, mode, hint,
 ):
     from src.api.routes import seo_agent_opportunities as route
 
     database, _, _, _, scan, _, _, model, workflow, request = context
-    model.mode = "upstream_failure"
+    model.mode = mode
     monkeypatch.setattr(route, "opportunity_discovery_workflow", workflow)
     app = FastAPI()
     app.include_router(route.router, prefix="/api/v1")
@@ -500,6 +506,7 @@ async def test_discovery_api_reports_model_failure_without_partial_business_writ
             json=request.model_dump(),
         )
     assert response.status_code == 503
+    assert hint in response.json()["detail"]
     assert "private" not in response.text
     assert await row_count(database, "opportunities") == 0
     assert await row_count(database, "approval_actions") == 0

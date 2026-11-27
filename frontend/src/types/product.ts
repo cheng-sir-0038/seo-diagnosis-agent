@@ -225,6 +225,7 @@ export interface ObservabilitySpan {
   component_name?: string | null
   operation_name: string
   status: string
+  metadata_json?: string
   duration_ms?: number | null
   error_code?: string | null
   error_message?: string | null

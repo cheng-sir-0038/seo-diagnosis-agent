@@ -39,6 +39,9 @@ class HumanInputAnswer(BaseModel):
     request_id: str = Field(min_length=1, max_length=256)
     answer: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2000)]
     action: Literal["answer", "use_available"] = "answer"
+    followup_revision: int | None = Field(
+        default=None, ge=0, description="确认复诊清单时提供已核对的草稿版本。",
+    )
 
 
 class HumanInputState(HumanInputRequest):
@@ -94,6 +97,8 @@ class AgentRun:
     pause_requested: bool = False
     human_input: HumanInputState | None = None
     dispatch_state: dict[str, Any] = field(default_factory=dict)
+    model_provider: str | None = None
+    model_name: str | None = None
 
     @property
     def terminal(self) -> bool:

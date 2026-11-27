@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 from src.agent.models import AgentEvent, AgentRun, HumanInputRequest
 from src.agent.providers.base import ToolCall
+from src.agent.providers.errors import ModelConfigurationError, ModelRequestError
 from src.agent.tools.base import AgentTool, ToolProtocol, ToolResult, ToolRuntimeContext
 from src.models.page_suggestions import (
     PageFactCitation,
@@ -573,7 +574,10 @@ class PageSuggestionsWorkflow(AgentTool):
                 )
                 if attempt == 0 and retryable and time.monotonic() < steps.deadline:
                     continue
-                if isinstance(exc, TimeoutError):
+                if isinstance(exc, (ModelConfigurationError, ModelRequestError)):
+                    title = "暂未取得可用建议"
+                    reason = f"{exc} "
+                elif isinstance(exc, TimeoutError):
                     title = "建议生成超时"
                     reason = "已读到页面信息，生成建议超过本次等待时间。"
                 elif draft_returned:

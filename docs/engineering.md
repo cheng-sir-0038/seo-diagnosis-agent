@@ -4,7 +4,7 @@
 
 ## Agent 如何运行
 
-- 主 Agent 用 LangGraph 决定交给谁处理。医药专员从 `SkillRegistry` 加载本轮业务指令，并只开放该 Skill 对应的工具。工具取得有效回执后，程序直接按证据给出答案。网页联查只传已核实的公开条款。恢复时读取已经选定的业务和目标页。[业务路由](../src/agent/workspace/routing.py) · [工作流](../src/agent/workspace/supervisor.py)
+- 工作台在应用启动时显式登记专员，LangGraph 按登记定义编排分派、执行和恢复。医药专员从 `SkillRegistry` 加载本轮业务指令，并按本次任务选择可用工具。课程联查沿用核实过的公开条款、适用范围、出处和目标页。[应用装配](../src/agent/workspace/bootstrap.py) · [业务路由](../src/agent/workspace/routing.py) · [工作流](../src/agent/workspace/team.py)
 - 通用对话使用 POST `/api/v1/chat/runs`，提交 `messages` 和可选的 `conversation_id`。主 Agent 先分派业务，专员再按已有证据选择工具。代码限制模型轮次、工具调用总数和超时，复用本次运行中重复的成功查询。[业务会话 API](../src/api/routes/workspace/conversations.py) · [Agent 执行器](../src/agent/runtime/executor.py)
 - 工作流安排取证步骤、校验实际来源和结构化产物。需要人工补充时，运行检查点保存已查到的证据。[工作流代码](../src/seo_agent/workflows/) · [检查点与恢复](../src/agent/harness/)
 - 查询结果和来源紧跟对话结论。「执行详情」列出实际参与的专员、工具、耗时和引用。点开对应的工具或 Trace 可以核对原始回执。配置 Langfuse 后可查看模型和工作流的完整调用树。[观测代码](../src/observability/)
@@ -12,7 +12,7 @@
 ```mermaid
 flowchart TB
     UI["React 对话"] --> API["FastAPI"]
-    API --> MAIN["LangGraph 主 Agent / DeepSeek"]
+    API --> MAIN["LangGraph 主 Agent / 已选文本服务"]
     MAIN --> MED["医药专员 / 按任务加载 Skill"]
     MAIN --> SEO["SEO/GEO 专员"]
     MAIN --> LEARN["学习陪练 / 方程练习与资源"]
@@ -30,7 +30,7 @@ flowchart TB
     PROCUREMENT --> EXEC
     EXEC --> HEALTH["医考公告 / 考研检索 / 医保目录 / PubMed"]
     HEALTH --> RUNDB
-    EXEC --> FOLLOWUP["资料读取回执 / 对照 / 确认保存"]
+    EXEC --> FOLLOWUP["读取资料 / 整理清单 / 确认保存"]
     FOLLOWUP --> RUNDB
     EXEC --> TRIP["飞猪 / 百度地图 / Open-Meteo / 行程草稿"]
     EXEC --> WF["业务工作流：页面 / 搜索 / 关键词 / 草稿"]
@@ -51,19 +51,25 @@ flowchart TB
 
 对话中的站点取证只读，建议和生成图保存在本应用。创建执行任务、审批和发布走各自的业务接口。
 
+### 登记通用专员
+
+在业务包的 `specialist.py` 定义稳定 ID、展示资料、派单说明、工具工厂和执行指令，将定义加入应用装配。具备上述字段的专员可使用通用执行器，沿用工作台分派、补充、恢复、历史和运行详情。当前登记生成 PromptOps 路由契约，应用启动时初始化相应版本。若已有部署依赖旧派单契约，需在新契约下重新核对和部署相应提示。[专员契约](../src/agent/workspace/registry.py) · [应用装配](../src/agent/workspace/bootstrap.py) · [通用专员验收样例](../tests/agent/registered_archive_fixture.py)
+
+通过 `PublicSkill.publish()` 提供批准公开的静态正文和每个工具的用法。能力目录会在当前会话范围内投影实际可用的工具及其绑定。旧版本兼容快照由同一组公开定义生成，维护内置专员的公开文案时可运行 `python -m src.api.routes.workspace.directory > frontend/src/services/bundledSkillCatalog.json`。[目录实现](../src/api/routes/workspace/directory.py) · [工作台能力页](../frontend/src/components/SpecialistDirectory.tsx)
+
 ### 学习陪练和报考备考
 
 - 学习陪练收录 TAL-SCQ5K 的 50 道「一元一次方程」及应用题，一组最多 5 道。程序按题库的选项判分，保留原解析和出处。每答一题保存回执，刷新页面或重启服务后还能接着答。回复「跳过」或「结束练习」分别计入跳过和未答；完成后在同一对话说「重练错题」，可以再次练习错题。[题库来源与许可](../src/education_agent/corpus/README.md) · [练习实现](../src/education_agent/practice.py)
 - 官方资源按年龄和主题匹配。可试「给 15 岁学生找一道方程探究题」，做完后回复「我完成了 NRICH 的方程练习」来记录。应用保存官方链接和完成状态。[资源索引](../src/education_agent/resources.py)
-- 报考备考覆盖湖北 2026 年上下半年的初中数学教师资格笔试。条件不全时追问，年度、地区、学段或科目超出资料范围时提示缺口。两条业务使用现有 DeepSeek 配置，题库与公开资料无需额外 API Key。[业务 Skill](../src/education_agent/skills.py) · [湖北报名公告](https://www.hbea.edu.cn/html/jszg/index.html) · [中国教育考试网 304 大纲](https://ntce.neea.edu.cn/html1/report/1508/347-1.htm)
+- 报考备考覆盖湖北 2026 年上下半年的初中数学教师资格笔试。条件不全时追问，年度、地区、学段或科目超出资料范围时提示缺口。两条业务由已选文本服务分派。题库与公开资料无需额外 API Key。[业务 Skill](../src/education_agent/skills.py) · [湖北报名公告](https://www.hbea.edu.cn/html/jszg/index.html) · [中国教育考试网 304 大纲](https://ntce.neea.edu.cn/html1/report/1508/347-1.htm)
 
 ### 随访与复诊准备
 
-从首页点「随访与复诊准备」，可用附带的合成报告继续整理。初始只有一份报告。载入合成补充报告后，在同一个 Run 里点「整理并核对资料」。资料区保留每行的来源，展示报告差值、不可直接比较的项目，以及原记录中的安排。核对后点保存，程序将当前版本和已确认的待办写入 PostgreSQL。修订资料会更新版本，旧预览需要重新核对。[Agent 工作流](../src/followup_agent/workflow.py) · [验收用例](../tests/agent/test_workspace_scenarios.py)
+从首页发送「复诊前准备清单」。在复诊资料区导入文件，或在空白任务中载入合成的门诊小结、预约单和日常记录。一份可读资料即可在同一 Run 整理草稿。清单列出要带的资料、已有安排和要问医生的问题，每项可展开文件名和解析行。报告原值、对照依据和旧版资料包可按需回查。确认当前草稿版本后，资料包及有依据的待办保存到 PostgreSQL，可从历史会话打开。[Agent 工作流](../src/followup_agent/workflow.py) · [验收用例](../tests/agent/test_workspace_scenarios.py)
 
-手动导入时使用匿名对象编号。首版支持 UTF-8 CSV、记录数组 JSON 和同字段模板的文字 PDF。PDF 每页首行是列名，字段用 `|` 分隔。必填字段是 `subject_id`、`kind` 和 `item`，日期使用 `YYYY-MM-DD`。样例展示了报告、已有安排、用户自述和用药资料的字段。[合成资料模板](../src/followup_agent/examples/initial.csv) · [合成补充报告](../src/followup_agent/examples/supplement.csv) · [FHIR R4 Observation 字段参考](https://hl7.org/fhir/R4/observation.html)
+手动导入使用与文件一致的匿名对象编号。支持 UTF-8 CSV、记录数组 JSON 和同字段模板的文字 PDF。PDF 每页首行是列名，字段用 `|` 分隔。必填字段为 `subject_id`、`kind` 和 `item`，日期使用 `YYYY-MM-DD`。为兼容旧客户端，原修订端点保留为 deprecated；工作台补充资料使用导入入口。[门诊小结](../src/followup_agent/examples/initial.csv) · [预约单](../src/followup_agent/examples/appointment.csv) · [日常记录](../src/followup_agent/examples/daily-notes.csv)
 
-资料内容保存在当前服务的独立资料表。模型对话和执行日志只使用步骤及数量回执。报告对照仅核对原值与来源，临床解释由医生或药师负责。可用附带的合成记录核对操作流程。
+明确的复诊资料整理在本地运行，生成及恢复均无需文本模型。资料内容保存在当前服务的独立资料表，执行日志记录步骤及数量回执。报告对照仅核对原值与来源，临床解释由医生或药师负责。可用附带的合成记录核对操作流程。
 
 ### 商旅行程
 
@@ -125,9 +131,9 @@ flowchart TB
 
 医保工具覆盖两版常规西药目录，默认按公告生效日期选版。PubMed 可匿名查询公开题录，工具按 NCBI 公布的无 Key 速率限制发送请求。两项公开查询无需新增第三方 API Key。[NCBI 接口使用说明](https://www.ncbi.nlm.nih.gov/books/NBK25497/)
 
-「网页与考纲联查」会把医药专员查到的考纲交给 SEO 专员。后者读取用户指定网页，对照原句核对适用类别。[跨专员工作流](../src/agent/workspace/supervisor.py)
+「网页与考纲联查」由工作台编排。医药专员核实公开考纲后，工作台登记依据和出处，再让 SEO 专员读取用户指定的课程页。补充网址或恢复失败均沿用原 Run，恢复时复用已成功的取证回执。「运行中心」按运行 ID 能找到各阶段的 Trace，原会话保留结果与出处。[跨专员工作流](../src/agent/workspace/team.py)
 
-SEO / GEO 专员按当前数据源、已确认的网址和任务注册工具。[SEO 工具注册表](../src/seo_agent/chat/tools.py)
+SEO / GEO 专员按当前数据源、已确认的网址和任务注册工具。工作台目录和独立站点对话使用同一工具工厂。[SEO 专员定义](../src/seo_agent/specialist.py) · [SEO 工具注册表](../src/seo_agent/chat/tools.py)
 
 | 分组 | 工具 | 数据来源 |
 | --- | --- | --- |
@@ -177,7 +183,7 @@ seo_site_diagnosis
 
 关键词研究的 `limit` 默认 5、上限 10，主题词和联想词合并去重后受此数量限制；SERP 不会逐个核验所有候选词。综合诊断仅在提供 `query` 时研究关键词，性能和竞品步骤分别由 `include_performance`、`include_competitors` 显式开启。
 
-搜索现状需要站点指标和排名关键词；关键词研究需要 SERP 及联想词或关键词指标中的至少一种。综合诊断可仅用页面和站点文件完成技术检查，DataForSEO、Serper 等数据源按需配置。自然语言对话仍需要 DeepSeek。
+搜索现状需要站点指标和排名关键词；关键词研究需要 SERP 及联想词或关键词指标中的至少一种。综合诊断可仅用页面和站点文件完成技术检查，DataForSEO、Serper 等数据源按需配置。自然语言对话使用当前配置的文本服务。
 
 技术检查读取受检页面所在源的根路径 `/robots.txt`。站点地图优先使用用户提供的同源地址，其次用 robots.txt 中的首个同源 Sitemap 声明，最后尝试 `/sitemap.xml`。每次最多读取一个地图，展示最多 5 个同源条目；遇到 sitemap 索引只展示子地图地址。文件和页面共用请求超时与站内 URL 校验。报告展示读到的抓取指令样例。
 
@@ -189,7 +195,7 @@ seo_site_diagnosis
 
 ### 页面 SEO 信息建议
 
-在对话中提出“根据这个页面拟一份标题、描述、关键词、分享信息和结构化数据建议”即可；用户不需要选择工具或填写参数。此流程只需页面可访问和 DeepSeek 配置，不需要搜索数据服务的 Key。
+在对话中提出“根据这个页面拟一份标题、描述、关键词、分享信息和结构化数据建议”即可；用户不需要选择工具或填写参数。此流程需要可访问的页面和可用的文本模型。
 
 流程读取当前页的标签、正文摘录和已有 JSON-LD，由模型理解页面实际用途并提出草稿。输入与输出由 [`PageSuggestionInput`、`PageSeoDraft`](../src/models/page_suggestions.py) 的 JSON Schema 定义，JSON-LD 直接返回对象。模型使用 JSON Output，后端再校验字段格式、引用原文和 URL 来源，生成 TDK、OG、JSON-LD 与 HTML 片段。
 
@@ -207,7 +213,7 @@ seo_site_diagnosis
 
 在对话中说「按这页内容帮我生成一张分享图」即可，省略地址时取当前站点首页。工作流从页面的 `og:title`、Title、H1 中依次选取标题，描述取 `og:description` 或 Meta Description。标题都缺失时，同一次运行等待用户输入，恢复后复用页面证据。
 
-DeepSeek 根据页面内容和用户要求选取主体及构图。代码校验 JSON Schema 和引用原文，缺少主体依据时请用户补充。Cloudflare Workers AI 生成 1216 × 640 的图片，图片保存在 `SHARE_IMAGE_DIRECTORY` 指定的目录，并在对话中与页面文案一起展示。绘图提示词可在运行的模型调用记录中查看。上游失败时保留已取得的页面证据。[对话截图](screenshots/18-share-image-brief.png) · [工作流](../src/seo_agent/workflows/share_image.py) · [Cloudflare 接入](../src/seo_agent/workflows/cloudflare_images.py) · [业务测试](../tests/seo_agent/test_share_image.py)
+当前文本模型根据页面内容和用户要求选取主体及构图。代码校验 JSON Schema 和引用原文，缺少主体依据时请用户补充。Cloudflare Workers AI 生成 1216 × 640 的图片，图片保存在 `SHARE_IMAGE_DIRECTORY` 指定的目录，并在对话中与页面文案一起展示。绘图提示词可在运行的模型调用记录中查看。上游失败时保留已取得的页面证据。[对话截图](screenshots/18-share-image-brief.png) · [工作流](../src/seo_agent/workflows/share_image.py) · [Cloudflare 接入](../src/seo_agent/workflows/cloudflare_images.py) · [业务测试](../tests/seo_agent/test_share_image.py)
 
 ### GEO 多 Agent
 
@@ -246,7 +252,7 @@ sequenceDiagram
 
 选题使用 Serper 的 Google 关联问题和联想词，每种各查一次。引用核验只采样一个问题，按模型回答中的 `url_citation` 匹配目标域名和子域。报告标明查询时间、模型和链接，分别呈现本次没有搜、搜索失败、没有返回引用，以及返回的引用未命中目标站。改稿从目标页最多 3500 字符的正文摘录选出适合前置的原文，逐条校验原文和引用 ID。卡片与总结使用同一批前置建议。外部引用用于回答引用核验结果，无法从摘录确认的细节留待核实。
 
-默认引用来源是 DeepSeek，使用 `DEEPSEEK_API_KEY` 调官方 `deepseek-flash` 和 `deepseek_web_search`。可选填 `OPENAI_API_KEY`，并在对话中明确要求用 OpenAI API 核验，使用 Responses `web_search`。`GEO_OPENAI_MODEL` 默认 `gpt-6.2-astra`。选题、主对话和改稿沿用已有 DeepSeek 配置。每次结论限定在指定模型的 API 样本。 [DeepSeek 文档](https://api-docs.deepseek.com/guides/web_tools/) · [OpenAI 文档](https://developers.openai.com/api/docs/guides/tools-web-search)
+默认引用来源是 DeepSeek，使用 `DEEPSEEK_API_KEY` 调官方 `deepseek-flash` 和 `deepseek_web_search`。可选填 `OPENAI_API_KEY`，并在对话中明确要求用 OpenAI API 核验，使用 Responses `web_search`。`GEO_OPENAI_MODEL` 默认 `gpt-6.2-astra`。选题、主对话和改稿使用工作台选择的文本模型，引用核验独立按本次请求选择服务。每次结论限定在指定模型的 API 样本。 [DeepSeek 文档](https://api-docs.deepseek.com/guides/web_tools/) · [OpenAI 文档](https://developers.openai.com/api/docs/guides/tools-web-search)
 
 独立启动引用 Agent 时，在主服务的 `.env.local` 设置 `GEO_A2A_URL=http://127.0.0.1:8011`，重启主服务并在同一仓库另开终端运行。
 
@@ -280,7 +286,7 @@ POST /api/v1/seo-agent/scan-runs/{run_id}/discover-opportunities
 }
 ```
 
-站点范围由扫描记录决定，不能在请求中替换 `site_id`。流程复用关键词研究，将结果冻结到PostgreSQL 证据快照库，再由 DeepSeek 生成结构化候选。代码校验市场、关键词、竞品 URL 和快照引用；搜索量、难度使用首个关键词的实际指标，缺失时保持未知。模型可以明确返回空候选列表。
+站点范围由扫描记录决定，不能在请求中替换 `site_id`。流程复用关键词研究，将结果冻结到PostgreSQL 证据快照库，再由当前文本模型生成结构化候选。代码校验市场、关键词、竞品 URL 和快照引用；搜索量、难度使用首个关键词的实际指标，缺失时保持未知。模型可以明确返回空候选列表。
 
 SERP 返回未解析的 Google 跳转地址时，原始快照照常保留，但跳转地址不作为竞品页面入库，竞品数量保持未知。
 
@@ -360,18 +366,20 @@ SEO Chat 可调用 `seo_page_change_review`；需要 live 页面 HTML 能力和�
 
 ## 配置与外部服务
 
-按需将配置写入项目根目录的 `.env.local`，或在工作台的「数据源管理」保存已支持的数据源配置。修改后重启后端。页面保存的配置写入 `data/workspace-sources.json`，可通过进程环境变量 `WORKSPACE_SOURCE_CONFIG` 指定位置。配置优先级为进程环境变量、页面保存的配置、`.env.local`、`.env`、默认值。配置页只回显状态，生产环境通过服务端配置管理。变量定义见 [`.env.example`](../.env.example) 和 [`Settings`](../src/core/config.py)。
+按需将配置写入项目根目录的 `.env.local`，或在工作台的「数据源管理」保存支持的配置。修改后重启后端。页面保存的配置写入 `data/workspace-sources.json`，可通过进程环境变量 `WORKSPACE_SOURCE_CONFIG` 指定位置。配置优先级为进程环境变量、页面保存的配置、`.env.local`、`.env`、默认值。生产环境通过服务端配置管理。变量定义见 [`.env.example`](../.env.example) 和 [`Settings`](../src/core/config.py)。
+
+`AGENT_MODEL_PROVIDER=auto` 优先选择已填写 Key 的 OpenAI，仅有 DeepSeek Key 时使用 DeepSeek。可显式指定 `openai` 或 `deepseek`。选定服务的认证、权限、额度和超时错误会在该次运行显示。模型卡分列当前模型和重启后模型，运行中心的 Trace 显示该次记录的模型。GEO 引用采样读取专用配置。
 
 | 服务 | 用途 | 配置变量 | 使用前提 |
 | --- | --- | --- | --- |
-| DeepSeek | 对话中的工具选择、结论整理、页面信息建议、机会候选生成，以及 PRD 生成和交付审核 | `DEEPSEEK_API_KEY`；可选 `DEEPSEEK_BASE_URL`、`DEEPSEEK_MODEL` | 需要 API 账号、有效 Key 和所选模型的可用调用额度；缺失 Key 时模型请求不可用 |
+| DeepSeek | 对话、SEO 文本与结构化结果，也可用于 GEO 引用核验 | `DEEPSEEK_API_KEY`、`DEEPSEEK_MODEL`、`DEEPSEEK_BASE_URL`、`DEEPSEEK_REQUEST_TIMEOUT` | 需要 API 账号、有效 Key 和所选模型的可用调用额度。[GEO 配置](#geo-多-agent) |
 | 页面 HTML | 读取当前站点页面的源 HTML 和元信息 | 不需要第三方 Key | 当前运行环境能够访问目标公网页面，URL 属于当前站点；不执行 JavaScript |
-| OpenAI（可选） | GEO 引用核验，采样 OpenAI Responses 联网回答 | `OPENAI_API_KEY`；可选 `GEO_OPENAI_MODEL` | 需要 API 项目访问权限和额度。默认 GEO 引用采样使用 DeepSeek。[GEO 配置](#geo-多-agent) |
+| OpenAI | 对话、SEO 文本与结构化结果，也可用于 GEO 引用核验 | `OPENAI_API_KEY`、`OPENAI_MODEL`、`OPENAI_BASE_URL`、`OPENAI_REQUEST_TIMEOUT`，GEO 使用 `GEO_OPENAI_MODEL` | 对话模型需支持 Chat Completions 流式、函数调用和 JSON 模式。权限和额度以服务回执为准。[GEO 配置](#geo-多-agent) |
 | Serper | Google SERP、联想词、关联问题、新闻、图片、视频搜索 | `SERPER_API_KEY` | 需要 Serper API 账号、有效 Key 和相应调用额度 |
 | DataForSEO | 关键词指标、自然排名、竞品、外链及 SERP | `DATAFORSEO_LOGIN`、`DATAFORSEO_API_KEY` | 分别填写 API Access 提供的 login 和 API password（API 专用密码）；还需相应端点权限及可用余额或额度 |
 | Semrush（可选） | 站点月度概览、自然排名与搜索竞品 | `SEMRUSH_API_KEY` | 需 v4 Key、SEO API 的 Domain Analytics 权限及可用 API units |
 | PageSpeed | 单页面 Lighthouse 实验室检查 | `PAGESPEED_API_KEY` | 本项目要求配置 PageSpeed API Key，且请求需满足对应 Google API 项目的权限、限制和配额 |
-| Cloudflare Workers AI（可选） | 用 FLUX.2 klein 4B 生成页面分享图 | `CLOUDFLARE_ACCOUNT_ID`、`CLOUDFLARE_API_TOKEN` | 同时需配置 DeepSeek。[配置步骤](#cloudflare-workers-ai-生图) |
+| Cloudflare Workers AI（可选） | 用 FLUX.2 klein 4B 生成页面分享图 | `CLOUDFLARE_ACCOUNT_ID`、`CLOUDFLARE_API_TOKEN` | 画面规划还需要可用的文本模型。[配置步骤](#cloudflare-workers-ai-生图) |
 | Langfuse Cloud（可选） | 将模型和工具运行记录上传到项目 | `LANGFUSE_HOST`、`LANGFUSE_PUBLIC_KEY`、`LANGFUSE_SECRET_KEY` | 需要 Langfuse 项目及有写入权限的项目密钥，Host 与项目区域一致；不配置时保留本地记录 |
 | 飞猪 FlyAI（商旅） | 查询火车、航班及酒店候选 | `FLYAI_API_KEY`、可选 `FLYAI_EXECUTABLE` | 从飞猪控制台获取可用 Key，并在运行后端的机器或容器中安装官方 CLI。[飞猪快速开始](https://flyai.open.fliggy.com/docs/quickstart) |
 | 百度地图（商旅） | 地点解析、驾车距离、耗时和路线预览 | `BAIDU_MAPS_AK` | 需 Web 服务 AK，并开通地理编码、地点检索、轻量级驾车路线和静态图权限。[百度地图 Web API](https://lbsyun.baidu.com/docs/webapi) |
@@ -379,7 +387,7 @@ SEO Chat 可调用 `seo_page_change_review`；需要 live 页面 HTML 能力和�
 | 淘宝联盟（购物与采购） | 商品搜索、简版详情、指定推广券资料 | `TAOBAO_TBK_APP_KEY`、`TAOBAO_TBK_APP_SECRET`、搜索另需 `TAOBAO_TBK_ADZONE_ID` | 需应用已获得对应接口权限和额度。留空时可用自己提供的报价做比价、清单和到货核对。[搜索](https://developer.alibaba.com/docs/api.htm?apiId=64759&source=search) · [详情](https://developer.alibaba.com/docs/api.htm?apiId=64763) · [推广券](https://developer.alibaba.com/docs/api.htm?apiId=31106) |
 | 本地商品库（购物与采购） | 按关键词、规格和天猫筛选查商品 | `TAOBAO_TBK_LOCAL_CATALOG=true` | 在本地环境开启。25 个品类共 1,000 条商品由项目生成，使用淘宝联盟商品搜索的 JSON 回包结构。[商品库代码](../src/procurement_agent/local_catalog.py) · [接口文档](https://developer.alibaba.com/docs/api.htm?apiId=64759) |
 
-飞猪适配已验证官方 CLI `1.0.16`。本机可运行 `npm install -g @fly-ai/flyai-cli@1.0.16`，或者将 `FLYAI_EXECUTABLE` 指向已安装的 `flyai` 完整路径。商旅仍使用已有 DeepSeek 配置。缺飞猪或百度凭据时，来源卡会展示配置状态，天气仍可单独查询。[FlyAI 源码和许可证](https://github.com/alibaba-flyai/flyai-skill)
+飞猪适配已验证官方 CLI `1.0.16`。本机可运行 `npm install -g @fly-ai/flyai-cli@1.0.16`，或者将 `FLYAI_EXECUTABLE` 指向已安装的 `flyai` 完整路径。商旅分派和补充解析使用当前文本模型。缺飞猪或百度凭据时，来源卡会展示配置状态，天气仍可单独查询。[FlyAI 源码和许可证](https://github.com/alibaba-flyai/flyai-skill)
 
 DataForSEO 的关键词和站点指标分别使用 [Keyword Overview](https://docs.dataforseo.com/v3/dataforseo_labs-google-keyword_overview-live/) 和 [Domain Rank Overview](https://docs.dataforseo.com/v3/dataforseo_labs-google-domain_rank_overview-live/)；可按官方文档核对端点权限与返回字段。
 
@@ -404,7 +412,7 @@ PageSpeed 检测可能耗时较长，启用时可将 `AGENT_TOOL_TIMEOUT` 设为
 
 ### Cloudflare Workers AI 生图
 
-Agent 读取页面，DeepSeek 根据页面内容规划画面，Cloudflare Workers AI 的 FLUX.2 klein 4B 负责出图。先配好 `DEEPSEEK_API_KEY`。[模型文档](https://developers.cloudflare.com/workers-ai/models/flux-2-klein-4b/)
+Agent 读取页面，当前文本模型根据页面内容规划画面，Cloudflare Workers AI 的 FLUX.2 klein 4B 负责出图。先配置可用的文本服务。[模型文档](https://developers.cloudflare.com/workers-ai/models/flux-2-klein-4b/)
 
 1. 打开 Cloudflare 控制台，进入 **Workers AI → Use REST API**，复制当前账号的 **Account ID**。
 2. 点击 **Create a Workers AI API Token**，将账号范围设为当前账号，使用已实测可生图的 `Workers AI Read` 权限。创建后复制 Token。[Cloudflare 创建步骤](https://developers.cloudflare.com/workers-ai/get-started/rest-api/)

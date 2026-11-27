@@ -5,6 +5,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from src.agent.providers.errors import ModelConfigurationError, ModelRequestError
 from src.seo_agent.runtime import (
     automation_lifecycle,
     digest_service,
@@ -37,9 +38,10 @@ async def generate_prd(task_id: str, body: ActorRequest) -> dict:
         return await structured_model_automation.generate_prd(
             task_id=task_id, created_by_actor_id=body.actor_id
         )
+    except (ModelConfigurationError, ModelRequestError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
     except ValueError as exc:
-        status = 503 if "DEEPSEEK_API_KEY" in str(exc) else 400
-        raise HTTPException(status_code=status, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -50,9 +52,10 @@ async def review_delivery(delivery_id: str, body: ActorRequest) -> dict:
         return await structured_model_automation.review_delivery(
             delivery_id=delivery_id, reviewer_actor_id=body.actor_id
         )
+    except (ModelConfigurationError, ModelRequestError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
     except ValueError as exc:
-        status = 503 if "DEEPSEEK_API_KEY" in str(exc) else 400
-        raise HTTPException(status_code=status, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -105,8 +108,9 @@ async def optimize_prompt(prompt_id: str, body: OptimizePromptRequest) -> dict:
             success_criteria=body.success_criteria,
             canary_percentage=body.canary_percentage,
         )
+    except (ModelConfigurationError, ModelRequestError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
     except ValueError as exc:
-        status = 503 if "DEEPSEEK_API_KEY" in str(exc) else 400
-        raise HTTPException(status_code=status, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except (KeyError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

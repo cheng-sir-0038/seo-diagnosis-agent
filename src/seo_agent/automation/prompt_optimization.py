@@ -108,7 +108,7 @@ class DeepSeekCandidateGenerator:
                         raise
                     await span.model_call(
                         provider=_provider_name(model),
-                        model=_model_name(model),
+                        model=invocation.model_name or _model_name(model),
                         operation="generate_challenger",
                         prompt_key="agent.prompt.optimize",
                         prompt_version=meta_prompt["version_label"],
@@ -201,7 +201,7 @@ class DeepSeekPromptExecutor:
                                 raise
                             await span.model_call(
                                 provider=_provider_name(model),
-                                model=_model_name(model),
+                                model=invocation.model_name or _model_name(model),
                                 operation="evaluate_case",
                                 prompt_version=version["version_label"],
                                 prompt_version_id=version["id"],

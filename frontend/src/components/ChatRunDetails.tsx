@@ -5,7 +5,7 @@ import {
 import { Tabs } from 'antd'
 import { createElement, useState } from 'react'
 
-import { specialists, specialistStatusLabels } from '../specialists'
+import { specialistPresentation, specialistStatusLabels } from '../specialists'
 import type { AppliedSkill, RunStatus, SpecialistRun, ToolRun } from '../types/agent'
 import type { DocumentSummary } from '../types/workspace'
 import { DocumentChips } from './ChatAttachments'
@@ -71,7 +71,7 @@ export function ChatRunDetails({ tools, agentRuns = [], title = '执行详情', 
   if (!tools?.length) return null
   const groups = agentRuns.map(run => ({
     id: run.id,
-    name: specialists[run.agent].name,
+    name: specialistPresentation(run.agent, run.profile).name,
     tools: tools.filter(tool => tool.agentRunId === run.id),
   })).filter(group => group.tools.length)
   const unassigned = tools.filter(tool => !groups.some(group => group.id === tool.agentRunId))
@@ -205,7 +205,7 @@ export function ExecutionTimeline({ stage, agentRuns = [], skills = [], tools = 
           </div>
         </li>
         {agentRuns.map(agentRun => {
-          const { name, icon: Icon, tone } = specialists[agentRun.agent]
+          const { name, icon: Icon, tone } = specialistPresentation(agentRun.agent, agentRun.profile)
           const calls = tools.filter(tool => tool.agentRunId === agentRun.id).length
           const skill = skills.find(item => item.agentRunId === agentRun.id)?.label
           return (

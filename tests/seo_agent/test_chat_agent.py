@@ -188,11 +188,7 @@ async def test_seo_chat_api_creates_site_bound_run(monkeypatch) -> None:
     monkeypatch.setattr(
         route, "build_conversation_model", lambda: FakeModelProvider.text("分析完成")
     )
-    monkeypatch.setattr(
-        route,
-        "build_seo_agent_registry",
-        lambda _facade, _site, **kwargs: build_seo_agent_registry(FakeFacade(), SITE, **kwargs),
-    )
+    monkeypatch.setattr(route, "facade", FakeFacade())
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -258,19 +254,14 @@ def test_registry_keeps_site_metrics_for_questions_that_may_need_them(
 @pytest.mark.asyncio
 async def test_seo_chat_api_rejects_when_no_live_tools(monkeypatch) -> None:
     from src.api.routes.workspace import conversations as route
+    from src.seo_agent import specialist as seo_specialist
 
     async def get_site(_site_id: str) -> dict[str, Any]:
         return SITE
 
     monkeypatch.setattr(route.seo_agent_system_service, "get_site", get_site)
-    monkeypatch.setattr(route, "configured_citation_client", lambda *_: None)
-    monkeypatch.setattr(
-        route,
-        "build_seo_agent_registry",
-        lambda _facade, _site, **kwargs: build_seo_agent_registry(
-            FakeFacade(set()), SITE, **kwargs
-        ),
-    )
+    monkeypatch.setattr(seo_specialist, "configured_citation_client", lambda *_: None)
+    monkeypatch.setattr(route, "facade", FakeFacade(set()))
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:

@@ -19,6 +19,7 @@ class ModelChunk:
     tool_calls: list[ToolCall] = field(default_factory=list)
     finish_reason: str | None = None
     usage: dict[str, int] = field(default_factory=dict)
+    model: str | None = None
 
 
 class ModelProvider(ABC):

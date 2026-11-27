@@ -1,8 +1,7 @@
 import { agentApiUrl } from './agentApi'
 
 export const followupActions = {
-  prepare: '整理并核对资料',
-  available: '按现有资料整理',
+  prepare: '整理复诊前准备清单',
   confirm: '确认保存资料与待办',
   finish: '结束本次整理',
 } as const
@@ -18,7 +17,7 @@ export interface RecordFields {
 }
 
 export interface MedicalRecord extends RecordFields {
-  kind: 'report' | 'visit_plan' | 'self_report' | 'purchase' | 'medication_note'
+  kind: 'report' | 'visit_plan' | 'self_report' | 'purchase' | 'medication_note' | 'visit_summary'
   item: string
   note: string | null
   reference_range: string | null
@@ -40,6 +39,16 @@ export interface ReviewIssue {
   source: string | null
 }
 
+export interface ChecklistItem {
+  id: string
+  title: string
+  detail?: string
+  gaps?: string[]
+  due_date?: string
+  plan_status?: NonNullable<MedicalRecord['plan_status']>
+  sources: { record_id: string, source: string }[]
+}
+
 export interface FollowupCase {
   subject_id: string | null
   demo: boolean
@@ -48,6 +57,12 @@ export interface FollowupCase {
   records: Evidence[]
   report_review: { comparable_pairs: number, issues: ReviewIssue[] }
   draft: {
+    revision?: number
+    checklist?: {
+      materials_to_bring: ChecklistItem[]
+      existing_arrangements: ChecklistItem[]
+      questions_for_doctor: ChecklistItem[]
+    }
     comparisons: { item: string, earlier: string, later: string, delta: string | null, unit: string | null, reasons: string[] }[]
     issues: ReviewIssue[]
     plans: string[]

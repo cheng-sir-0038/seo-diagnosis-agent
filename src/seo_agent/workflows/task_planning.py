@@ -9,6 +9,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 
+from src.agent.providers.errors import ModelConfigurationError, ModelRequestError
 from src.core.exceptions import InternalProviderRequestError, InternalProviderResponseError
 from src.observability.client import ObservabilityClient
 from src.observability.instrumentation import observed_operation
@@ -98,6 +99,8 @@ class TaskPlanningWorkflow:
                             "opportunities": opportunities,
                         }
                     )
+                except (ModelConfigurationError, ModelRequestError):
+                    raise
                 except ValueError as exc:
                     raise InternalProviderResponseError("PRD 模型未返回有效结构化内容") from exc
                 except Exception as exc:

@@ -280,6 +280,7 @@ async def test_durable_chat_api_exposes_task_and_run_status(pg_url: str, monkeyp
 
     from src.agent.harness.store import AgentChatHarnessStore
     from src.api.routes.workspace import conversations as route
+    from src.seo_agent import specialist as seo_specialist
     from src.server import app
 
     database = SeoAgentDatabase(pg_url)
@@ -295,7 +296,7 @@ async def test_durable_chat_api_exposes_task_and_run_status(pg_url: str, monkeyp
     store = AgentChatHarnessStore(database)
     monkeypatch.setattr(route, "seo_agent_system_service", system)
     monkeypatch.setattr(route, "seo_chat_harness_store", store)
-    monkeypatch.setattr(route, "configured_citation_client", lambda *_: None)
+    monkeypatch.setattr(seo_specialist, "configured_citation_client", lambda *_: None)
     monkeypatch.setattr(route, "build_conversation_model", lambda: FakeModelProvider.text("完成"))
 
     class LiveFacade:
@@ -307,13 +308,7 @@ async def test_durable_chat_api_exposes_task_and_run_status(pg_url: str, monkeyp
         async def query_live(self, **kwargs: Any) -> dict[str, Any]:
             return {"meta": {}, "data": {}}
 
-    monkeypatch.setattr(
-        route,
-        "build_seo_agent_registry",
-        lambda _facade, site_data, **kwargs: __import__(
-            "src.seo_agent.chat.tools", fromlist=["build_seo_agent_registry"]
-        ).build_seo_agent_registry(LiveFacade(), site_data, **kwargs),
-    )
+    monkeypatch.setattr(route, "facade", LiveFacade())
     try:
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:

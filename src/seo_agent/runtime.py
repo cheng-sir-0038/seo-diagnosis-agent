@@ -1,4 +1,7 @@
+from langchain_openai import ChatOpenAI
+
 from src.agent.harness.store import AgentChatHarnessStore
+from src.agent.providers.factory import require_text_model
 from src.agent.run_manager import run_manager
 from src.core.cache import cache_manager
 from src.core.config import settings
@@ -122,11 +125,16 @@ seo_data_tool_bridge = SeoDataToolBridge(facade, observability=observability_cli
 
 
 def build_structured_model():
+    """Use the shared text model selection for routing and SEO structured output."""
+    selected = require_text_model(settings)
+    if selected.provider == "openai":
+        return ChatOpenAI(
+            api_key=selected.api_key, base_url=selected.base_url, model=selected.model,
+            timeout=selected.timeout, max_retries=0, use_responses_api=False,
+        )
     return LangChainDeepSeekFactory(
-        api_key=settings.deepseek_api_key,
-        base_url=settings.deepseek_base_url,
-        model=settings.deepseek_model,
-        timeout=settings.deepseek_request_timeout,
+        api_key=selected.api_key.get_secret_value(), base_url=selected.base_url,
+        model=selected.model, timeout=selected.timeout,
     ).create(temperature=0.0)
 
 

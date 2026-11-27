@@ -266,6 +266,9 @@
 .obs-trace-summary div + div { border-inline-start: 1px solid var(--obs-line); }
 .obs-trace-summary dt, .obs-tool-meta dt { color: #52617a; font-size: 11px; }
 .obs-trace-summary dd { margin: 3px 0 0; font-size: 13px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.obs-trace-models { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 9px; margin: 0; padding: 2px 9px; font-size: 12px; }
+.obs-trace-models dt { color: #52617a; }
+.obs-trace-models dd { margin: 0; font-weight: 650; overflow-wrap: anywhere; }
 .obs-trace-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin: 12px 0 4px; }
 .obs-trace-action {
   display: inline-flex;

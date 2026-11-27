@@ -1,5 +1,5 @@
-import { isSpecialist, specialistStatusLabels, type SpecialistStatus } from '../specialists'
-import type { AgentEvent, AppliedSkill, RenderHint, RunState, SpecialistRun, ToolRun } from '../types/agent'
+import { isSpecialist, readSpecialistProfile, specialistStatusLabels, type SpecialistStatus } from '../specialists'
+import type { AgentEvent, AgentEventType, AppliedSkill, RenderHint, RunState, SpecialistRun, ToolRun } from '../types/agent'
 import type { AgentRunDetail } from '../services/agentApi'
 
 export const initialRunState: RunState = {
@@ -42,11 +42,34 @@ const upsertTool = (tools: ToolRun[], next: ToolRun): ToolRun[] => {
   return tools.map(tool => tool.id === next.id ? { ...tool, ...next } : tool)
 }
 
-const updateSpecialistStatus = (
-  runs: SpecialistRun[], agentRunId: unknown, status: SpecialistStatus,
-): SpecialistRun[] => agentRunId
-  ? runs.map(run => run.id === agentRunId ? { ...run, status } : run)
-  : runs
+const specialistEventStatuses: Partial<Record<AgentEventType, SpecialistStatus>> = {
+  'agent.dispatched': 'running',
+  'agent.started': 'running',
+  'agent.completed': 'completed',
+  'agent.failed': 'failed',
+  'run.waiting_for_input': 'waiting_for_input',
+}
+
+function applySpecialistEvent(runs: SpecialistRun[], event: AgentEvent): SpecialistRun[] {
+  const { agent, agent_run_id: runId, agent_profile: payloadProfile } = event.payload
+  const id = nonEmptyText(runId)
+  if (!id || (agent !== undefined && !isSpecialist(agent))) return runs
+  const status = Object.hasOwn(specialistEventStatuses, event.type) ? specialistEventStatuses[event.type] : undefined
+  const profile = readSpecialistProfile(payloadProfile)
+  if (!status && !profile) return runs
+
+  const run = runs.find(item => item.id === id)
+  if (!run) {
+    if (status !== 'running' || !isSpecialist(agent)) return runs
+    return [...runs, { id, agent, ...(profile && { profile }), status, startedAt: event.created_at }]
+  }
+  if (agent !== undefined && run.agent !== agent) return runs
+  return runs.map(item => item.id === id ? {
+    ...item,
+    status: status ?? item.status,
+    ...(profile && { profile }),
+  } : item)
+}
 
 const stopOpenSpecialists = (runs: SpecialistRun[]): SpecialistRun[] =>
   runs.map(run => run.status === 'running' || run.status === 'waiting_for_input'
@@ -90,6 +113,7 @@ export function reduceAgentEvent(state: RunState, event: AgentEvent): RunState {
   const base: RunState = {
     ...state,
     runId: event.run_id,
+    agentRuns: applySpecialistEvent(state.agentRuns, event),
     events: stableEvent ? [...state.events, event] : state.events,
     lastSequence: stableEvent ? event.sequence : state.lastSequence,
     lastDeltaSequence: event.type === 'run.resumed'
@@ -106,7 +130,6 @@ export function reduceAgentEvent(state: RunState, event: AgentEvent): RunState {
     case 'run.waiting_for_input':
       return {
         ...base, status: 'waiting_for_input', stage: '等待你补充信息',
-        agentRuns: updateSpecialistStatus(state.agentRuns, event.payload.agent_run_id, 'waiting_for_input'),
         humanInput: {
           requestId: String(event.payload.request_id),
           questions: Array.isArray(event.payload.questions) ? event.payload.questions.map(String) : [],
@@ -117,23 +140,6 @@ export function reduceAgentEvent(state: RunState, event: AgentEvent): RunState {
       const stage = String(event.payload.stage ?? '')
       return { ...base, stage: stageLabels[stage] ?? '处理中' }
     }
-    case 'agent.dispatched': {
-      const { agent, agent_run_id: id } = event.payload
-      if (!isSpecialist(agent) || typeof id !== 'string' || !id) return base
-      const known = state.agentRuns.find(run => run.id === id)
-      const agentRuns = known
-        ? updateSpecialistStatus(state.agentRuns, id, 'running')
-        : [...state.agentRuns, { id, agent, status: 'running' as const, startedAt: event.created_at }]
-      return { ...base, agentRuns }
-    }
-    case 'agent.completed':
-    case 'agent.failed':
-      return {
-        ...base,
-        agentRuns: updateSpecialistStatus(
-          state.agentRuns, event.payload.agent_run_id, event.type === 'agent.completed' ? 'completed' : 'failed',
-        ),
-      }
     case 'skill.loaded': {
       const skill = {
         agent: event.payload.agent,
@@ -142,7 +148,7 @@ export function reduceAgentEvent(state: RunState, event: AgentEvent): RunState {
         label: event.payload.label,
       }
       if (!isAppliedSkill(skill)
-        || state.skills.some(item => item.name === skill.name && item.agentRunId === skill.agentRunId)) return base
+        || state.skills.some(item => item.agent === skill.agent && item.name === skill.name && item.agentRunId === skill.agentRunId)) return base
       return { ...base, skills: [...state.skills, skill] }
     }
     case 'message.delta':
@@ -195,14 +201,14 @@ export function reduceAgentEvent(state: RunState, event: AgentEvent): RunState {
     case 'run.failed':
       return {
         ...base, status: 'failed', humanInput: undefined, stage: '执行失败',
-        agentRuns: stopOpenSpecialists(state.agentRuns),
+        agentRuns: stopOpenSpecialists(base.agentRuns),
         tools: stopOpenTools(state.tools),
         error: String(event.payload.message ?? 'Agent 执行失败'),
       }
     case 'run.cancelled':
       return {
         ...base, status: 'cancelled', humanInput: undefined, stage: '已停止',
-        agentRuns: stopOpenSpecialists(state.agentRuns),
+        agentRuns: stopOpenSpecialists(base.agentRuns),
         tools: stopOpenTools(state.tools),
       }
     default:

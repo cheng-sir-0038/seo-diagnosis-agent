@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import App from '../App'
+import bundledSkillCatalog from '../services/bundledSkillCatalog.json'
 import { loadProductConfig, saveProductConfig } from '../services/productApi'
 import type { SpecialistDirectoryData } from '../types/agent'
 
@@ -92,6 +93,42 @@ describe('business chat workspace', () => {
     expect(chat).not.toHaveAttribute('aria-current')
   })
 
+  it('shows the active text model and saves a provider selection for the next restart', async () => {
+    const source = {
+      id: 'agent_model', name: '主对话与 SEO 文本', group: '模型', description: '模型配置',
+      mode: 'configured', restart_required: false,
+      text_model: { provider: 'openai', model: 'openai-current', configured: true },
+      fields: [{
+        id: 'agent_model_provider', label: '服务选择', kind: 'choice', editable: true, configured: true,
+        value: 'auto', options: [{ value: 'auto', label: '自动（优先 OpenAI）' }, { value: 'deepseek', label: 'DeepSeek' }],
+      }],
+    }
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'PATCH' && String(input).endsWith('/workspace/sources/agent_model')) {
+        return json([{
+          ...source, restart_required: true,
+          pending_text_model: { provider: 'deepseek', model: 'deepseek-next', configured: true },
+          fields: [{ ...source.fields[0], value: 'deepseek' }],
+        }])
+      }
+      return json(String(input).endsWith('/workspace/sources') ? [source] : [])
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<App />)
+    fireEvent.click(screen.getByRole('link', { name: '数据源管理' }))
+    expect(await screen.findByText('当前模型：OpenAI / openai-current')).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: '配置 主对话与 SEO 文本' }))
+    const dialog = within(await screen.findByRole('dialog', { name: '配置 主对话与 SEO 文本' }))
+    fireEvent.mouseDown(dialog.getByRole('combobox', { name: '服务选择' }))
+    fireEvent.click(await screen.findByText('DeepSeek', { exact: true }))
+    fireEvent.click(dialog.getByRole('button', { name: '保存配置' }))
+    expect(await screen.findByText('重启后：DeepSeek / deepseek-next')).toBeVisible()
+    expect(screen.getByText('当前模型：OpenAI / openai-current')).toBeVisible()
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/workspace/sources/agent_model'), expect.objectContaining({
+      method: 'PATCH', body: JSON.stringify({ agent_model_provider: 'deepseek' }),
+    }))
+  })
+
   it('recognizes the running center with fragment query parameters and preserves existing deep links', async () => {
     window.history.replaceState(null, '', '/#/observability?view=issues')
     vi.stubGlobal('fetch', vi.fn(() => json([])))
@@ -160,8 +197,9 @@ describe('business chat workspace', () => {
       .mockImplementationOnce(() => json({}, 503))
       .mockImplementationOnce(() => json({ specialists: [
         {
-          agent: 'healthcare', tools: [{
-            name: 'medical_exam_syllabus', description: '核对官方考纲', skill_usage: {
+          agent: 'healthcare', skill_catalog_version: 1, tools: [{
+            name: 'medical_exam_syllabus', description: '核对官方考纲',
+            public_prompt_ids: ['healthcare-instructions'], skill_usage: {
               scenario: '核对本次考纲的适用范围。', inputs: '提供所问版次。',
               rules: '按原公告核对。', output: '列出公告和出处。',
             },
@@ -256,7 +294,8 @@ describe('business chat workspace', () => {
     expect(webpage.getByRole('heading', { name: 'Skill：网页内容与标签核对' })).toBeVisible()
     fireEvent.click(webpage.getByText('课程页与考纲核对'))
     expect(webpage.getByText('仅在结合考纲核对课程页时使用。')).toBeVisible()
-    expect(webpage.getByText('将页面内容与考纲条款逐项比对。')).toBeVisible()
+    const coursePrompt = bundledSkillCatalog.instructions.find(prompt => prompt.id === 'seo-course-editor')!
+    expect(webpage.getByText(coursePrompt.text, { normalizer: text => text })).toBeVisible()
     expect(seoTools).not.toHaveTextContent('SEO / GEO 诊断（静态节选）')
     expect(seoTools).not.toHaveTextContent('seo_keyword_overview')
     fireEvent.click(choices.getByRole('button', { name: /商旅/ }))
@@ -267,9 +306,9 @@ describe('business chat workspace', () => {
     expect(screen.queryByText('查证考纲条款')).not.toBeInTheDocument()
     fireEvent.click(choices.getByRole('button', { name: /随访与复诊/ }))
     expect(screen.getAllByText('资料整理按固定规则执行，无专员提示词。').every(node => !node.closest('details')?.open)).toBe(true)
-    fireEvent.click(screen.getByText('核对报告并整理资料包'))
-    expect(screen.getByText(/^生成可核对的资料包草稿/)).toBeVisible()
-    expect(screen.getByText(/^汇总有效记录数/)).not.toBeVisible()
+    fireEvent.click(screen.getByText('整理复诊前准备清单'))
+    expect(screen.getByText(/^生成带文件和解析行的清单草稿/)).toBeVisible()
+    expect(screen.getByText(/^统计有效记录和未读入的文件/)).not.toBeVisible()
     expect(screen.getAllByText('资料整理按固定规则执行，无专员提示词。').filter(node => node.closest('details')?.open)).toHaveLength(1)
     fireEvent.click(choices.getByRole('button', { name: /医药业务/ }))
     expect(screen.getByText('医药共用指令')).not.toBeVisible()
@@ -277,12 +316,16 @@ describe('business chat workspace', () => {
     expect(fetchMock.mock.calls.every(call => String(call[0]).includes('/api/v1/chat/tools?conversation_id='))).toBe(true)
   })
 
-  it('shows the authored Skill body when the older healthcare response only advertises its binding', async () => {
+  it('uses the approved Skill body and shared text even when legacy healthcare sends router fields', async () => {
     window.history.replaceState(null, '', '/#/capabilities')
     vi.stubGlobal('fetch', vi.fn(() => json({ specialists: [{
       agent: 'healthcare',
       tools: [{ name: 'medical_exam_registration', description: '报名核对' }],
       skills: [{ name: 'medical-exam-registration', label: '医考报名核对', tools: ['medical_exam_registration'] }],
+      default_prompts: [
+        { id: 'medical-exam-registration', label: '医考报名核对', text: '按 registration 和 skills_retake 选择。' },
+        { id: 'healthcare-instructions', label: '医药共用指令', text: '收到 clarification_received 后以 confirmed 重试。' },
+      ],
     }] })))
     render(<App />)
     fireEvent.click(await screen.findByText('核对医考报名条件'))
@@ -291,11 +334,31 @@ describe('business chat workspace', () => {
     expect(details.getByText(/^查网上报名.*实践技能考试免考核对/)).toBeVisible()
     expect(details.getByText(/两种核对均需报考年份/)).toBeVisible()
     expect(details.getByText(/符合条件时免实践技能考试/)).toBeVisible()
-    const original = details.getByText(/实践技能考试免考核对（skills_retake）/)
+    const original = details.getByText(/实践技能考试免考核对按上次技能考试年份/)
     expect(original).not.toBeVisible()
     fireEvent.click(details.getByText('原始 Skill 指令'))
     expect(original).toBeVisible()
+    fireEvent.click(details.getByText('医药共用指令'))
+    expect(details.getByText(/采用用户更正后的条件/)).toBeVisible()
+    expect(details.queryByText(/registration|skills_retake|clarification_received|confirmed/)).not.toBeInTheDocument()
     expect(screen.queryByText('当前工具目录的数据版本未提供完整的 Skill 详情。')).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ['seo', 'seo_page_metadata', '读取网页内容'],
+    ['healthcare', 'medical_exam_registration', '核对医考报名条件'],
+  ])('does not display unversioned %s text which has no approved binding', async (agent, tool, label) => {
+    window.history.replaceState(null, '', '/#/capabilities')
+    const name = 'legacy-public-review'
+    const instruction = '核对公开条款。\n保留原始行。'
+    vi.stubGlobal('fetch', vi.fn(() => json({ specialists: [{
+      agent, tools: [{ name: tool, description: '核对公开信息。' }],
+      skills: [{ name, label: '核对条款', tools: [tool] }],
+      default_prompts: [{ id: name, label: '核对条款', text: instruction }],
+    }] })))
+    render(<App />)
+    expect((await screen.findByText(label)).closest('summary')).toBeNull()
+    expect(screen.queryByText(/保留原始行/)).not.toBeInTheDocument()
   })
 
   it('does not borrow instructions for an unrecognized tool binding', async () => {
@@ -315,7 +378,7 @@ describe('business chat workspace', () => {
     const fetchMock = vi.fn()
       .mockImplementationOnce(() => json({ specialists: [{
         agent: 'seo', skills: [], tools: [
-          seoDirectory.tools[0],
+          { ...seoDirectory.tools[0], skill_usage: null },
           { name: 'seo_unrecognized_tool', description: '尚无说明的工具。' },
         ],
       }] }))
@@ -344,6 +407,92 @@ describe('business chat workspace', () => {
     expect(screen.queryByText('当前工具目录的数据版本未提供完整的 Skill 详情。')).not.toBeInTheDocument()
     expect(fetchMock).toHaveBeenCalledTimes(2)
     expect(fetchMock).toHaveBeenLastCalledWith(expect.stringContaining('/api/v1/chat/tools?conversation_id='), expect.objectContaining({ cache: 'no-store' }))
+  })
+
+  it.each([[], undefined].map(ids => ({ ids })))('renders only declared versioned tool bindings ($ids)', async ({ ids }) => {
+    window.history.replaceState(null, '', '/#/capabilities')
+    const instruction = '仅核对已有档案。\n<source>原始记录</source>'
+    vi.stubGlobal('fetch', vi.fn(() => json({ specialists: [
+      {
+        agent: 'archive_review', skill_catalog_version: 1,
+        profile: { name: '档案核验', icon: 'book', tone: 'indigo', directory_tone: 'learning' },
+        tools: [
+          { name: 'archive_scan', description: '核对档案编号。', public_prompt_ids: ['archive-sources'] },
+          { name: 'archive_index', description: '整理档案索引。' },
+        ],
+        skills: [
+          { name: 'archive-scan', label: '核对档案', tools: ['archive_scan'] },
+          { name: 'archive-index', label: '索引档案', summary: '按原始编号整理。', tools: ['archive_index'] },
+        ],
+        default_prompts: [
+          { id: 'archive-scan', label: '核对档案', text: instruction },
+          { id: 'archive-sources', label: '核对来源', text: '保留档案编号。' },
+          { id: 'unbound', label: '未绑定的指令', text: '不可显示。' },
+        ],
+      },
+      {
+        ...seoDirectory, skill_catalog_version: 1, skills: [],
+        tools: [{ ...seoDirectory.tools[2], public_prompt_ids: ids }],
+      },
+      { agent: 'supervisor', tools: [] },
+    ] })))
+    render(<App />)
+    const choices = within(await screen.findByRole('group', { name: '专员' }))
+    const choice = choices.getByRole('button', { name: /档案核验/ })
+    expect(choice).toHaveClass('workbench-tone-learning')
+    expect(choice.querySelector('[data-icon="book"]')).toBeVisible()
+    expect(choices.getAllByRole('button')).toHaveLength(2)
+    const archive = within(screen.getByRole('region', { name: '档案核验' }))
+    fireEvent.click(archive.getByLabelText('核对档案编号。'))
+    const details = archive.getByRole('region', { name: '核对档案编号。的 Skill 详情' })
+    expect(within(details).getByRole('heading', { name: 'Skill：核对档案' })).toBeVisible()
+    expect(details.querySelector('pre')?.textContent).toBe(instruction)
+    expect(details.querySelector('source')).toBeNull()
+    expect(within(details).getByText('核对来源')).toBeVisible()
+    expect(archive.queryByText('未绑定的指令')).not.toBeInTheDocument()
+
+    fireEvent.click(archive.getByLabelText('整理档案索引。'))
+    const index = within(archive.getByRole('region', { name: '整理档案索引。的 Skill 详情' }))
+    expect(index.getByRole('heading', { name: 'Skill：索引档案' })).toBeVisible()
+    expect(index.getByText('按原始编号整理。')).toBeVisible()
+    expect(index.queryByText('原始 Skill 指令')).not.toBeInTheDocument()
+
+    fireEvent.click(choices.getByRole('button', { name: /SEO \/ GEO/ }))
+    const seo = within(screen.getByRole('region', { name: 'SEO / GEO' }))
+    expect(seo.getByText('读取网页内容').closest('summary')).toBeNull()
+    expect(seo.queryByText('课程页与考纲核对')).not.toBeInTheDocument()
+    expect(seo.queryByRole('status')).not.toBeInTheDocument()
+  })
+
+  it('never renders the Travel router fragment in a legacy Skill row', async () => {
+    window.history.replaceState(null, '', '/#/capabilities')
+    const routerText = 'travel 处理国内单目的地的单程或往返交通、住宿与到访地点安排，核对时间预算并保存用户选择。即使缺日期或城市，也先派给 travel，保留明确的条件。用户贴的报价和链接是行程资料。想做旅游站点的 SEO 仍归 seo。'
+    const name = 'business-trip-planning'
+    vi.stubGlobal('fetch', vi.fn(() => json({ specialists: [{
+      agent: 'travel',
+      tools: [{ name: 'travel_transport', description: '查询班次。' }],
+      skills: [{ name, label: '国内商旅行程', tools: ['travel_transport'] }],
+      default_prompts: [
+        { id: name, label: '商旅分派指令', text: routerText },
+        { id: 'travel-intake', label: '商旅条件提取', text: '保留已确认的条件。' },
+      ],
+    }] })))
+    render(<App />)
+    fireEvent.click(await screen.findByLabelText('查询高铁与航班'))
+    const details = screen.getByRole('region', { name: '查询高铁与航班的 Skill 详情' })
+    const row = within(details)
+    const bundled = bundledSkillCatalog.skills.find(skill => skill.agent === 'travel' && skill.name === name
+      && skill.tools.includes('travel_transport'))!
+    expect(row.getByRole('heading', { name: `Skill：${bundled.label}` })).toBeVisible()
+    expect(row.getByText('适用场景')).toBeVisible()
+    expect(row.getByText('商旅条件提取')).toBeVisible()
+    const disclosure = row.getByText('原始 Skill 指令')
+    fireEvent.click(disclosure)
+    const instruction = disclosure.closest('details')?.querySelector('pre')
+    expect(instruction).toBeVisible()
+    expect(instruction?.textContent).toBe(bundled.instruction)
+    expect(row.queryByText('保留已确认的条件。', { exact: true })).not.toBeInTheDocument()
+    expect(details).not.toHaveTextContent(/travel 处理国内单目的地|先派给 travel/)
   })
 
   it('filters tasks from the saved browser conversations and opens the original waiting run', async () => {

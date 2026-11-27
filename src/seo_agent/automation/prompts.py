@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from src.agent.workspace.routing import ROUTE_PROMPT_KEY, ROUTING_PROMPT, RouteDecision
+from src.agent.workspace.registry import SpecialistRegistry
+from src.agent.workspace.routing import routing_prompt
 from src.models.geo import GeoContentDraft, GeoQuestionSelection
 from src.models.page_suggestions import PageSeoDraft
 from src.models.share_image import ShareImageBrief
@@ -17,13 +18,6 @@ from src.seo_agent.tasks.models import TaskPrdContent
 from src.travel_agent.intake import TRAVEL_INTAKE_PROMPT, TRAVEL_INTAKE_PROMPT_KEY, TravelIntake
 
 SEO_PROMPT_DEFINITIONS: dict[str, dict[str, Any]] = {
-    ROUTE_PROMPT_KEY: {
-        "name": "工作台业务分派",
-        "purpose": "根据业务意图、对话上下文和用户提供的目标选择专员",
-        "system_template": ROUTING_PROMPT,
-        "user_template": "{{input}}",
-        "output_schema": RouteDecision.model_json_schema(),
-    },
     TRAVEL_INTAKE_PROMPT_KEY: {
         "name": "商旅条件与报价整理",
         "purpose": "在同一次行程规划中更新条件和用户提供的报价",
@@ -176,14 +170,22 @@ SEO_PROMPT_DEFINITIONS: dict[str, dict[str, Any]] = {
 
 
 class SeoPromptSeeder:
-    def __init__(self, registry: PromptRegistry, *, environment: str = "production") -> None:
+    def __init__(
+        self, registry: PromptRegistry, *, environment: str = "production",
+        specialists: SpecialistRegistry | None = None,
+    ) -> None:
         self.registry = registry
         self.environment = environment
+        self.specialists = specialists
 
     async def seed(self) -> dict[str, dict[str, Any]]:
         await self.registry.startup()
+        from src.agent.workspace.bootstrap import workspace_specialists
+
+        route_key, route_definition = routing_prompt(self.specialists or workspace_specialists)
+        definitions = {route_key: route_definition, **SEO_PROMPT_DEFINITIONS}
         resolved: dict[str, dict[str, Any]] = {}
-        for prompt_key, definition in SEO_PROMPT_DEFINITIONS.items():
+        for prompt_key, definition in definitions.items():
             prompt = await self.registry.create_prompt(
                 prompt_key=prompt_key,
                 name=definition["name"],
@@ -209,8 +211,9 @@ class SeoPromptSeeder:
         return resolved
 
 
-def builtin_prompt(prompt_key: str) -> dict[str, Any]:
-    definition = SEO_PROMPT_DEFINITIONS[prompt_key]
+def builtin_prompt(prompt_key: str, definition: dict[str, Any] | None = None) -> dict[str, Any]:
+    if definition is None:
+        definition = SEO_PROMPT_DEFINITIONS[prompt_key]
     return {
         "id": None,
         "prompt_key": prompt_key,

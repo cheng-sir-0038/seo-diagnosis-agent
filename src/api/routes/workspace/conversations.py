@@ -7,7 +7,6 @@ import secrets
 from collections.abc import AsyncIterator
 from hmac import compare_digest
 from typing import Annotated, Any, Literal
-from urllib.parse import urlsplit
 from uuid import UUID
 
 from fastapi import APIRouter, Header, HTTPException, Query, status
@@ -16,13 +15,18 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_vali
 from sqlalchemy.exc import SQLAlchemyError
 
 from src.agent.harness.persistence import StoreRunPersistence
-from src.agent.models import AgentEvent, AgentRun, HumanInputAnswer, RunStatus
+from src.agent.models import AgentEvent, AgentRun, HumanInputAnswer, HumanInputState, RunStatus
 from src.agent.observability import EXECUTOR_WORKFLOW, AgentRunObserver
 from src.agent.providers.base import ModelProvider
-from src.agent.providers.deepseek import DeepSeekProvider
+from src.agent.providers.errors import ModelConfigurationError
+from src.agent.providers.factory import build_text_provider
 from src.agent.run_manager import run_manager
 from src.agent.runtime.executor import AgentExecutor
 from src.agent.tools.registry import ToolRegistry
+from src.agent.workspace.bootstrap import workspace_specialists
+from src.agent.workspace.registry import (
+    SpecialistContextUnavailable, SpecialistUnavailable, ToolContext, WorkspaceResources,
+)
 from src.agent.workspace.documents import (
     DOCUMENT_PROMPT_VERSION,
     DOCUMENT_SYSTEM_PROMPT,
@@ -31,36 +35,31 @@ from src.agent.workspace.documents import (
     conversation_scope,
     workspace_owner,
 )
-from src.agent.workspace.routing import ROUTING_PROMPT, Route, Specialist
+from src.agent.workspace.routing import routing_prompt
 from src.agent.workspace.team import WorkspaceTeam, conversation_context
-from src.api.routes.workspace.directory import ToolDirectory, describe_specialist
+from src.api.routes.workspace.directory import ToolDirectory, describe_registered
 from src.api.routes.workspace.documents import DocumentId, OptionalWorkspaceKey, document_store
 from src.api.routes.workspace.followup import router as followup_router
 from src.core.cache import cache_manager
 from src.core.config import settings
-from src.education_agent.skills import education_tools
 from src.facade.data_facade import facade
 from src.followup_agent.store import FollowupCaseStore, access_hash
+from src.followup_agent.specialist import FOLLOWUP_SPECIALIST
 from src.followup_agent.workflow import (
     SAFE_INTENT,
     FollowupCommand,
+    SaveFollowup,
     explicit_followup,
-    followup_tools,
 )
-from src.healthcare_agent import build_healthcare_registry
 from src.observability.runtime import observability_client, observability_database
-from src.procurement_agent.tools import procurement_tools
-from src.seo_agent.chat.tools import build_seo_agent_registry
-from src.seo_agent.geo_a2a import configured_citation_client
 from src.seo_agent.runtime import (
     seo_agent_system_service,
     seo_chat_harness_store,
     seo_chat_recovery_service,
     structured_model_automation,
 )
-from src.seo_agent.specialist import build_seo_system_prompt
-from src.seo_agent.workflows.cloudflare_images import cloudflare_share_images
-from src.travel_agent.tools import travel_tools
+from src.seo_agent.specialist import SEO_ID, build_seo_system_prompt
+from src.seo_agent.workflows import cloudflare_images
 
 site_chat_router = APIRouter(prefix="/seo-agent/chat", tags=["SEO Agent Chat"])
 router = APIRouter(prefix="/chat", tags=["Conversations"])
@@ -124,39 +123,26 @@ class WorkspaceRunStats(BaseModel):
 
 
 def build_conversation_model() -> ModelProvider:
-    return DeepSeekProvider(
-        api_key=settings.deepseek_api_key,
-        base_url=settings.deepseek_base_url,
-        model=settings.deepseek_model,
-        timeout=settings.deepseek_request_timeout,
-    )
+    """Build the startup-selected text provider for workspace and SEO chats."""
+    return build_text_provider(settings)
+
+
+def _run_text_model(site_id: str | None, state: dict) -> ModelProvider | None:
+    """Use a provider for supervision and model-backed specialists only."""
+    if site_id is None and not state.get("question"):
+        definition = workspace_specialists.find(state.get("route"))
+        if definition is not None and not definition.requires_text_model:
+            return None
+    return build_conversation_model()
 
 
 def _durable_enabled() -> bool:
     return seo_chat_harness_store.database.started
 
 
-def _travel_registry() -> ToolRegistry:
-    return travel_tools(
-        flyai_api_key=settings.flyai_api_key.get_secret_value(),
-        flyai_executable=settings.flyai_executable,
-        baidu_maps_ak=settings.baidu_maps_ak.get_secret_value(),
-    )
-
-
-def _procurement_registry() -> ToolRegistry:
-    return procurement_tools(
-        app_key=settings.taobao_tbk_app_key,
-        app_secret=settings.taobao_tbk_app_secret,
-        adzone_id=settings.taobao_tbk_adzone_id,
-        local_catalog=settings.taobao_tbk_local_catalog,
-        cache=cache_manager,
-    )
-
-
 async def _execute(
     run_id: str,
-    provider: ModelProvider,
+    provider: ModelProvider | None,
     registry: ToolRegistry | None,
     conversation_id: str | None,
     document_context: str | None = None,
@@ -219,55 +205,26 @@ async def _execute(
         await executor.run(run)
     else:
         team = WorkspaceTeam(
-            executor, structured_model_automation.model_runner, _workspace_seo,
-            lambda: build_healthcare_registry(database=seo_chat_harness_store.database),
+            executor, workspace_specialists, _workspace_resources(),
             seo_chat_harness_store.completed_dialog,
             seo_chat_harness_store.completed_tool_data if _durable_enabled() else None,
-            FollowupCaseStore(seo_chat_harness_store.database) if _durable_enabled() else None,
-            travel_registry=_travel_registry,
-            procurement_registry=_procurement_registry,
         )
         await executor.run(run, workflow=team.execute)
 
 
-def _seo_registry(site: dict[str, Any], user_messages: list[str]) -> ToolRegistry:
-    client = observability_client if observability_database.started else None
-    return build_seo_agent_registry(
-        facade, site,
-        observability=client, snapshots=cache_manager,
-        model_runner=structured_model_automation.model_runner,
-        image_generator=cloudflare_share_images,
-        geo_citation_client=configured_citation_client(client),
-        user_messages=user_messages,
+def _workspace_resources() -> WorkspaceResources:
+    return WorkspaceResources(
+        settings=settings, database=seo_chat_harness_store.database,
+        facade=facade, cache=cache_manager, planner=structured_model_automation.model_runner,
+        observability=observability_client if observability_database.started else None,
+        find_site=seo_agent_system_service.find_site_by_host if _durable_enabled() else None,
     )
 
 
-async def _workspace_site(target: str | None) -> dict[str, Any]:
-    site: dict[str, Any] = {"default_country": "US", "default_language": "en"}
-    if target:
-        host = urlsplit(target).hostname
-        if not host:
-            raise ValueError("请提供有效的网址")
-        registered = (
-            await seo_agent_system_service.find_site_by_host(host) if _durable_enabled() else None
-        )
-        if registered:
-            if registered.get("status") != "ACTIVE" or registered.get("archived_at"):
-                raise ValueError("站点当前不可用于 SEO 调查")
-            site.update(registered)
-        else:
-            site.update(id=f"domain:{host.removeprefix('www.')}", name=host)
-        site.update(domain=host, target_url=target)
-    return site
-
-
-async def _workspace_seo(
-    target: str | None, user_messages: list[str],
-) -> tuple[str, ToolRegistry]:
-    site = await _workspace_site(target)
-    registry = _seo_registry(site, user_messages)
-    prompt = build_seo_system_prompt(site, registry.schemas())
-    return prompt, registry
+async def _site_seo_tools(site: dict[str, Any], messages: list[str]) -> ToolRegistry:
+    return await workspace_specialists.get(SEO_ID).tools(ToolContext(
+        _workspace_resources(), site=site, user_messages=tuple(messages),
+    ))
 
 
 @router.get("/tools", response_model=ToolDirectory)
@@ -281,44 +238,43 @@ async def list_workspace_tools(
             conversation_id, include_dialog=False,
         )
     target = previous.get("target_url")
-    note = None if target else "指定网页后会载入该页可用的检查工具。"
-    try:
-        site = await _workspace_site(target)
-    except ValueError:
-        seo, note = ToolRegistry(), "当前目标不可用于 SEO 调查。"
-    else:
-        seo = _seo_registry(site, [])
-    healthcare = build_healthcare_registry(database=seo_chat_harness_store.database)
-    education = [
-        (agent, education_tools(agent), None)
-        for agent in (Specialist.LEARNING, Specialist.EXAM_PREP)
-    ]
-    return ToolDirectory(specialists=[
-        describe_specialist(agent, registry, description)
-        for agent, registry, description in (
-            (Specialist.HEALTHCARE, healthcare, None), (Specialist.SEO, seo, note), *education,
-            (Specialist.FOLLOWUP, followup_tools(), "使用本次提供的资料整理随访与复诊准备清单。"),
-            (Specialist.TRAVEL, _travel_registry(), "核对国内出差的交通、住宿、路线和天气。"),
-            (Specialist.PROCUREMENT, _procurement_registry(), "比较报价、列采购清单和核对到货。"),
-        )
-    ])
+    context = ToolContext(_workspace_resources(), target_url=target)
+    rows = []
+    for definition in workspace_specialists:
+        note = (definition.no_target_note if not target else None) or definition.directory_note
+        try:
+            tools = await definition.tools(context)
+        except SpecialistContextUnavailable as exc:
+            tools, note = ToolRegistry(), str(exc)
+        rows.append(describe_registered(definition, tools, note))
+    return ToolDirectory(specialists=rows)
 
 
 async def _schedule_restored_run(run: AgentRun) -> None:
-    """Rebuild the live dependencies for a restored run before re-entering it."""
+    """Restore dependencies without silently sending a saved conversation to another provider."""
+    if run.site_id is None and "document_owner" not in run.dispatch_state:
+        workspace_specialists.check_saved_route(run.dispatch_state)
+    provider = _run_text_model(run.site_id, run.dispatch_state)
+    original_provider = run.dispatch_state.get("text_model_provider", run.model_provider)
+    if (
+        provider is not None and original_provider in {"openai", "deepseek"}
+        and original_provider != provider.provider_name
+    ):
+        raise ModelConfigurationError(
+            "当前模型服务与此运行开始时不同。请恢复原服务，或新建对话。"
+        )
     if run.site_id is None:
-        provider = build_conversation_model()
         run.task = asyncio.create_task(
             _execute(run.id, provider, None, run.conversation_id),
             name=f"workspace-recover:{run.id}",
         )
         return
     site = await seo_agent_system_service.get_site(run.site_id)
-    registry = _seo_registry(site, [str(message.get("content", "")) for message in run.messages
-                                    if message.get("role") == "user"])
+    registry = await _site_seo_tools(site, [
+        str(message.get("content", "")) for message in run.messages if message.get("role") == "user"
+    ])
     if not registry.schemas():
         raise RuntimeError("恢复运行没有真实 SEO 数据工具可用")
-    provider = build_conversation_model()
     run.task = asyncio.create_task(
         _execute(run.id, provider, registry, run.conversation_id),
         name=f"seo-agent-recover:{run.id}",
@@ -341,7 +297,7 @@ async def create_site_run(body: CreateSiteRunRequest) -> ConversationRunResponse
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     if str(site.get("status") or "ACTIVE") != "ACTIVE":
         raise HTTPException(status_code=409, detail="站点当前不可用于 SEO Agent 调查")
-    registry = _seo_registry(site, [m.content for m in body.messages if m.role == "user"])
+    registry = await _site_seo_tools(site, [m.content for m in body.messages if m.role == "user"])
     if not registry.schemas():
         raise HTTPException(
             status_code=503,
@@ -385,10 +341,10 @@ async def create_run(
         previous = await seo_chat_harness_store.latest_dispatch_state(
             body.conversation_id, include_dialog=False,
         )
-    state = conversation_context(previous)
+    state = conversation_context(previous, workspace_specialists)
     if explicit_followup(latest):
         state = {
-            "route": Route.FOLLOWUP, "intent": SAFE_INTENT,
+            "route": FOLLOWUP_SPECIALIST.id, "intent": SAFE_INTENT,
             "followup_demo": "合成" in latest and "演示" in latest,
         }
         # The attachments and clinical notes belong in the case, outside model messages.
@@ -398,8 +354,9 @@ async def create_run(
     key = secrets.token_urlsafe(32) if _durable_enabled() else None
     if key:
         state["followup_key_hash"] = access_hash(key)
+    _, prompt = routing_prompt(workspace_specialists)
     response = await _start_run(
-        body, site_id=None, registry=None, system_prompt=ROUTING_PROMPT, dispatch_state=state,
+        body, site_id=None, registry=None, system_prompt=prompt["system_template"], dispatch_state=state,
     )
     return response.model_copy(update={"followup_key": key})
 
@@ -409,10 +366,13 @@ async def _start_run(
     registry: ToolRegistry | None, system_prompt: str, dispatch_state: dict | None = None,
     document_context: str | None = None,
 ) -> ConversationRunResponse:
+    dispatch_state = dict(dispatch_state or {})
     try:
-        provider = build_conversation_model()
-    except ValueError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        provider = _run_text_model(site_id, dispatch_state)
+    except ModelConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
+    if provider is not None:
+        dispatch_state["text_model_provider"] = provider.provider_name
     user_turn = body.messages[-1:] if site_id is None else body.messages
     messages = [
         {"role": "system", "content": system_prompt},
@@ -426,8 +386,8 @@ async def _start_run(
         )
         created = await seo_chat_harness_store.create_task_run(
             site_id=site_id, conversation_id=body.conversation_id, title=intent[:120],
-            user_intent=intent, messages=messages, model_provider=provider.provider_name,
-            model_name=provider.model_name, dispatch_state=dispatch_state,
+            user_intent=intent, messages=messages, model_provider=None, model_name=None,
+            dispatch_state=dispatch_state,
             prompt_version=(
                 DOCUMENT_PROMPT_VERSION if document_context
                 else "seo-chat-v1" if site_id else "workspace-v1"
@@ -441,7 +401,7 @@ async def _start_run(
         thread_id=created.thread_id if created else None, site_id=site_id,
         conversation_id=body.conversation_id,
     )
-    run.dispatch_state = dispatch_state or {}
+    run.dispatch_state = dispatch_state
     run.task = asyncio.create_task(
         _execute(run.id, provider, registry, body.conversation_id, document_context),
         name=f"chat:{run.id}",
@@ -462,7 +422,7 @@ def _run_urls(run: AgentRun) -> dict[str, str]:
 
 @site_chat_router.get("/images/{image_id}", response_class=FileResponse)
 def get_share_image(image_id: UUID) -> FileResponse:
-    stored = cloudflare_share_images.get_file(image_id)
+    stored = cloudflare_images.cloudflare_share_images.get_file(image_id)
     if stored is None:
         raise HTTPException(status_code=404, detail="分享图不存在")
     path, media_type = stored
@@ -581,6 +541,8 @@ async def get_run(run_id: str, workspace_key: OptionalWorkspaceKey = None) -> di
         "id": run.id,
         "status": run.status.value,
         "current_stage": run.events[-1].type if run.events else "created",
+        "model_provider": run.model_provider,
+        "model_name": run.model_name,
         "events": [event.model_dump(mode="json") for event in run.events],
     }
 
@@ -651,6 +613,12 @@ async def resume_run(run_id: str, workspace_key: OptionalWorkspaceKey = None) ->
     run_manager.register(run)
     try:
         await _schedule_restored_run(run)
+    except SpecialistUnavailable as exc:
+        await seo_chat_harness_store.mark_recovery_blocked(run_id, str(exc))
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    except ModelConfigurationError as exc:
+        await seo_chat_harness_store.mark_recovery_blocked(run_id, str(exc))
+        raise HTTPException(status_code=503, detail=str(exc)) from None
     except Exception as exc:
         await seo_chat_harness_store.mark_recovery_blocked(run_id, str(exc))
         raise HTTPException(status_code=503, detail="run 恢复条件不足") from exc
@@ -680,6 +648,19 @@ async def submit_run_input(
     commands = {item.value for item in FollowupCommand}
     if followup and (body.action != "answer" or body.answer not in commands):
         raise HTTPException(422, "请通过本次复诊资料区提交操作。")
+    confirming_followup = followup and body.answer == FollowupCommand.CONFIRM
+    if body.followup_revision is not None and not confirming_followup:
+        raise HTTPException(422, "仅确认保存复诊清单时需要提供草稿版本。")
+
+    def validate_confirmation(pending: HumanInputState) -> None:
+        if body.followup_revision is None:
+            raise HTTPException(422, "请确认当前复诊清单的草稿版本。")
+        if (
+            pending.tool_name != SaveFollowup.name
+            or pending.tool_arguments.get("revision") != body.followup_revision
+        ):
+            raise ValueError("这份复诊清单的确认请求已变化，请刷新后核对当前版本。")
+
     if (
         existing is not None and existing.task is not None and not existing.task.done()
         and existing.status == RunStatus.WAITING_FOR_INPUT
@@ -689,7 +670,9 @@ async def submit_run_input(
         except TimeoutError as exc:
             raise HTTPException(status_code=409, detail="正在保存进度，请稍后再提交") from exc
     try:
-        run, replayed, sequence = await seo_chat_harness_store.submit_input(run_id, body)
+        run, replayed, sequence = await seo_chat_harness_store.submit_input(
+            run_id, body, validate_pending=validate_confirmation if confirming_followup else None,
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
@@ -698,6 +681,12 @@ async def submit_run_input(
         run_manager.register(run)
         try:
             await _schedule_restored_run(run)
+        except SpecialistUnavailable as exc:
+            await seo_chat_harness_store.mark_recovery_blocked(run_id, str(exc))
+            raise HTTPException(status_code=409, detail=f"补充已保存。{exc}") from None
+        except ModelConfigurationError as exc:
+            await seo_chat_harness_store.mark_recovery_blocked(run_id, str(exc))
+            raise HTTPException(status_code=503, detail=f"补充已保存。{exc}") from None
         except Exception as exc:
             await seo_chat_harness_store.mark_recovery_blocked(run_id, str(exc))
             raise HTTPException(status_code=503, detail="补充已保存，运行暂时无法恢复") from exc

@@ -282,6 +282,45 @@ describe('ChatPage SEO Agent integration', () => {
       .toHaveTextContent('医药业务已完成SEO / GEO已完成')
   })
 
+  it('shows a registered specialist and its Skill in chat, history and tasks', async () => {
+    const archive = { agent: 'archive_review', agent_run_id: 'archive' }
+    const profile = { name: '档案核验', icon: 'search', tone: 'indigo', directory_tone: 'learning' }
+    streamAgentEvents.mockImplementationOnce(async (_url, onEvent: (item: AgentEvent) => void) => {
+      onEvent(event(1, 'run.started', {}))
+      onEvent(event(2, 'agent.dispatched', archive))
+      onEvent(event(3, 'skill.loaded', { ...archive, skill: 'archive-scan', label: '核对档案', agent_profile: profile }))
+      onEvent(event(4, 'tool.completed', { ...archive, tool_call_id: 'read', name: 'archive_read', result: { present: true } }))
+      onEvent(event(5, 'agent.completed', archive))
+      onEvent(event(6, 'message.completed', { content: '档案已经核验。' }))
+      onEvent(event(7, 'run.completed', {}))
+      return { lastEventId: 7, terminal: true }
+    })
+    const first = render(<ChatPage />)
+    fireEvent.change(screen.getByRole('textbox', { name: '给业务助理发送消息' }), { target: { value: '检查档案清单' } })
+    fireEvent.click(screen.getByRole('button', { name: '发送消息' }))
+    const answer = await screen.findByText('档案已经核验。')
+    expect(within(answer.closest('article')!).getByRole('list', { name: '专员进度' })).toHaveTextContent('档案核验已完成')
+    first.unmount()
+
+    const conversationId = createAgentRun.mock.calls[0][1]
+    const now = new Date().toISOString()
+    listWorkspaceTasks.mockResolvedValue([{
+      id: 'task-archive', conversation_id: conversationId, current_run_id: 'run_1', title: '检查档案清单',
+      status: 'COMPLETED', created_at: now, updated_at: now,
+    }])
+    window.history.replaceState(null, '', '/#/tasks')
+    render(<ChatPage />)
+    const taskList = within(screen.getByRole('region', { name: '任务列表' }))
+    const task = await taskList.findByRole('button', { name: /检查档案清单/ })
+    expect(task.querySelector('[data-icon="search"]')).toBeVisible()
+    await openHistoryConversation('检查档案清单')
+    const saved = await screen.findByText('档案已经核验。')
+    expect(within(saved.closest('article')!).getByRole('list', { name: '专员进度' })).toHaveTextContent('档案核验已完成')
+    const drawer = await openExecutionDrawer()
+    expect(drawer.getByRole('list', { name: '本轮执行链路' })).toHaveTextContent('核对档案 · 1 次工具调用')
+    expect(drawer.getByRole('region', { name: '档案核验' })).toHaveTextContent('archive_read')
+  })
+
   it('renders a math exercise and submits the choice to the same run after reload', async () => {
     const coach = { agent: 'learning', agent_run_id: 'practice' }
     streamAgentEvents.mockImplementationOnce(async (_url, onEvent: (item: AgentEvent) => void) => {

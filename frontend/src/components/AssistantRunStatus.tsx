@@ -1,6 +1,6 @@
 import { LoadingOutlined, RightOutlined } from '@ant-design/icons'
 
-import { specialists, specialistStatusLabels } from '../specialists'
+import { specialistPresentation, specialistStatusLabels } from '../specialists'
 import type { SpecialistRun } from '../types/agent'
 
 export function AssistantRunStatus({ agentRuns, stage, running, onInspect }: {
@@ -14,7 +14,7 @@ export function AssistantRunStatus({ agentRuns, stage, running, onInspect }: {
       <span className="assistant-name">主 Agent</span>
       {!!agentRuns?.length && <ol aria-label="专员进度">
         {agentRuns.map(run => {
-          const { name, icon: Icon } = specialists[run.agent]
+          const { name, icon: Icon } = specialistPresentation(run.agent, run.profile)
           return <li key={run.id}><RightOutlined aria-hidden="true" /><Icon aria-hidden="true" />{name}
             <small data-status={run.status}>{specialistStatusLabels[run.status]}</small>
           </li>

@@ -23,9 +23,17 @@ export interface WorkspaceLibrary {
 export interface SourceField {
   id: string
   label: string
-  kind: 'secret' | 'text' | 'switch'
+  kind: 'secret' | 'text' | 'switch' | 'choice'
   required: boolean
   editable: boolean
+  configured: boolean
+  options?: { value: string, label: string }[]
+  value?: string
+}
+
+export interface TextModelStatus {
+  provider: 'openai' | 'deepseek'
+  model: string | null
   configured: boolean
 }
 
@@ -37,4 +45,6 @@ export interface WorkspaceSource {
   mode: string
   restart_required: boolean
   fields: SourceField[]
+  text_model?: TextModelStatus | null
+  pending_text_model?: TextModelStatus | null
 }

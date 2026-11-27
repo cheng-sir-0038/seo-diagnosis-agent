@@ -1,3 +1,4 @@
+import { isSpecialist } from '../specialists'
 import { workspaceHeaders } from '../state/workspaceAccess'
 import type {
   AgentEvent, AgentTaskStatusGroup, AgentTaskSummary, ChatMessage, SpecialistDirectoryData, WorkspaceTaskRow,
@@ -17,7 +18,7 @@ export async function listWorkspaceTools(conversationId: string, signal?: AbortS
   if (!response.ok) throw new Error(`读取工具目录失败（${response.status}）`)
   const directory: SpecialistDirectoryData = await response.json()
   if (!Array.isArray(directory?.specialists)) throw new Error('工具目录格式不受支持')
-  return directory
+  return { ...directory, specialists: directory.specialists.filter(entry => isSpecialist(entry?.agent)) }
 }
 
 export async function listWorkspaceTasks(conversationIds: string[], signal?: AbortSignal): Promise<WorkspaceTaskRow[]> {
@@ -41,13 +42,13 @@ export interface CreateRunResponse {
 
 export async function submitAgentInput(
   runId: string, requestId: string, answer: string,
-  action: 'answer' | 'use_available' = 'answer', followupKey?: string,
+  action: 'answer' | 'use_available' = 'answer', followupKey?: string, followupRevision?: number,
 ): Promise<CreateRunResponse> {
   const headers = new Headers({ 'Content-Type': 'application/json', ...workspaceHeaders() })
   if (followupKey) headers.set('X-Followup-Key', followupKey)
   const response = await fetch(agentApiUrl(`${CHAT_RUNS}/${runId}/input`), {
     method: 'POST', headers,
-    body: JSON.stringify({ request_id: requestId, answer, action }),
+    body: JSON.stringify({ request_id: requestId, answer, action, followup_revision: followupRevision }),
   })
   if (!response.ok) {
     const detail = await response.json().catch(() => ({}))

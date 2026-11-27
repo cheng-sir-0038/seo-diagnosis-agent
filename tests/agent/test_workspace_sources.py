@@ -79,3 +79,60 @@ async def test_optional_source_field_can_be_cleared_independently(tmp_path, monk
     assert fields["taobao_tbk_app_key"]["configured"] and source["restart_required"]
     assert all(value not in result.text for value in original.values())
     assert json.loads(path.read_text()) == {**original, "taobao_tbk_adzone_id": ""}
+
+
+@pytest.mark.asyncio
+async def test_text_model_status_uses_startup_values_and_reports_saved_selection(tmp_path, monkeypatch):
+    source_file = tmp_path / "source-settings.json"
+    default_env = tmp_path / ".env"
+    local_env = tmp_path / ".env.local"
+    deepseek_key = "synthetic-deepseek-for-source-test"
+    openai_key = "synthetic-openai-for-source-test"
+    default_env.write_text(f"DEEPSEEK_API_KEY={deepseek_key}\nDEEPSEEK_MODEL=default-deepseek\n")
+    local_env.write_text("DEEPSEEK_MODEL=local-deepseek\nGEO_OPENAI_MODEL=geo-only-sample\n")
+    monkeypatch.setenv("WORKSPACE_SOURCE_CONFIG", str(source_file))
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    for key in ("OPENAI_API_KEY", "OPENAI_MODEL", "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL",
+                "AGENT_MODEL_PROVIDER", "GEO_OPENAI_MODEL"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setitem(Settings.model_config, "env_file", (default_env, local_env))
+    monkeypatch.setattr(sources, "settings", Settings())
+    app = FastAPI()
+    app.include_router(sources.router)
+    root = "/workspace/sources"
+    current = {"provider": "deepseek", "model": "local-deepseek", "configured": True}
+    pending = {"provider": "openai", "model": "openai-saved", "configured": True}
+
+    def row(result, source_id="agent_model"):
+        assert result.status_code == 200
+        assert openai_key not in result.text and deepseek_key not in result.text
+        return next(item for item in result.json() if item["id"] == source_id)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as http:
+        first = row(await http.get(root))
+        assert first["text_model"] == current and not first["restart_required"]
+        registered = await http.patch(root + "/openai", json={
+            "openai_api_key": openai_key, "openai_model": "openai-saved",
+        })
+        assert row(registered)["text_model"] == current
+        assert row(registered)["pending_text_model"] == pending
+        assert row(registered, "openai")["restart_required"]
+        assert Settings().geo_openai_model == "geo-only-sample"
+        assert (await http.patch(root + "/agent_model", json={"agent_model_provider": "other"})).status_code == 422
+        assert (await http.patch(root + "/openai", json={"openai_model": "a b"})).status_code == 422
+
+        explicitly_saved = row(await http.patch(root + "/agent_model", json={"agent_model_provider": "deepseek"}))
+        assert explicitly_saved["fields"][0]["value"] == "deepseek"
+        assert explicitly_saved["restart_required"]
+        assert "pending_text_model" not in explicitly_saved
+        monkeypatch.setattr(sources, "settings", Settings())
+        assert not row(await http.get(root))["restart_required"]
+
+        monkeypatch.setenv("AGENT_MODEL_PROVIDER", "openai")
+        monkeypatch.setenv("OPENAI_MODEL", "server-openai")
+        monkeypatch.setattr(sources, "settings", Settings())
+        managed = await http.get(root)
+        assert row(managed)["text_model"] == {**pending, "model": "server-openai"}
+        assert not row(managed)["fields"][0]["editable"]
+        assert (await http.patch(root + "/agent_model", json={"agent_model_provider": "auto"})).status_code == 409
+        assert (await http.patch(root + "/openai", json={"openai_model": "openai-edit"})).status_code == 409

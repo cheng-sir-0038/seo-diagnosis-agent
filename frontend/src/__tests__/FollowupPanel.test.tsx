@@ -16,17 +16,20 @@ const after: api.Evidence = {
   ...before, id: 'after', source: 'second.csv · 第 2 行',
   record: { ...before.record, record_date: '2026-10-14', value: '5.4', method: '方法 B' },
 }
-const issue = { item: '示例项目', text: '请核对两条原记录：方法缺失或不同', source: `${before.source} / ${after.source}` }
+const empty: api.FollowupCase = {
+  subject_id: null, demo: false, revision: 0, files: [], records: [],
+  report_review: { comparable_pairs: 0, issues: [] }, draft: null, saved: null,
+}
+const uploaded = {
+  ...empty, subject_id: 'CASE-01', revision: 3, records: [before],
+  files: [{ name: 'first.csv', digest: 'file-1', uploaded_at: '2026-10-01', rows: 1, error: null }],
+}
 
-function renderCase(overrides: Partial<api.FollowupCase> = {}) {
-  vi.spyOn(api, 'followupRequest').mockResolvedValue({
-    subject_id: 'CASE-01', demo: false, revision: 1, files: [], records: [before, after],
-    report_review: { comparable_pairs: 0, issues: [issue] }, draft: null, saved: null,
-    ...overrides,
-  })
+function renderCase(data: api.FollowupCase = empty, canContinue = true) {
+  const request = vi.spyOn(api, 'followupRequest').mockResolvedValue(data)
   const onContinue = vi.fn()
-  render(<FollowupPanel runId="test-run" access="test-access" canContinue onContinue={onContinue} />)
-  return onContinue
+  render(<FollowupPanel runId="test-run" access="test-access" canContinue={canContinue} onContinue={onContinue} />)
+  return { onContinue, request }
 }
 
 afterEach(() => {
@@ -34,39 +37,68 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
-it('keeps the existing-records option available for two incompatible report dates', async () => {
-  const onContinue = renderCase()
-  const available = await screen.findByRole('button', { name: '按现有资料整理' })
-  expect(screen.getByText(issue.text)).toBeVisible()
-  expect(screen.getByText(issue.source)).toBeVisible()
-  expect(screen.queryByRole('button', { name: '整理并核对资料' })).not.toBeInTheDocument()
-  fireEvent.click(available)
-  expect(onContinue).toHaveBeenCalledWith(api.followupActions.available)
+it('offers both importing and loading the demo from the empty case', async () => {
+  const { request } = renderCase()
+  const importButton = await screen.findByRole('button', { name: '导入资料' })
+  expect(importButton).toBeDisabled()
+  fireEvent.change(screen.getByRole('textbox', { name: '匿名对象编号' }), { target: { value: 'CASE-01' } })
+  expect(importButton).toBeEnabled()
+  expect(screen.queryByRole('button', { name: '整理复诊前准备清单' })).not.toBeInTheDocument()
+  request.mockResolvedValueOnce({ ...uploaded, demo: true })
+  fireEvent.click(screen.getByRole('button', { name: '载入合成样例' }))
+  expect(request).toHaveBeenLastCalledWith('test-run', 'test-access', '/demo-materials', { method: 'POST' })
+  expect(await screen.findByRole('button', { name: '整理复诊前准备清单' })).toBeEnabled()
 })
 
-it('attributes comparison fields and review context to their source rows', async () => {
+it('uses a single file to prepare the checklist with no per-record write action', async () => {
+  const { onContinue } = renderCase(uploaded)
+  const panel = within(await screen.findByRole('region', { name: '复诊资料区' }))
+  fireEvent.click(panel.getByRole('button', { name: '整理复诊前准备清单' }))
+  expect(onContinue).toHaveBeenCalledWith(api.followupActions.prepare)
+  panel.getByText('资料记录（1 条）').closest('details')!.open = true
+  expect(panel.getByText(before.source)).toBeVisible()
+  expect(panel.queryByRole('button', { name: /修订|核对/ })).not.toBeInTheDocument()
+})
+
+it('presents source evidence next to checklist items and confirms the visible revision', async () => {
+  const { onContinue } = renderCase({
+    ...uploaded,
+    draft: {
+      revision: 3, comparisons: [], issues: [], plans: [], pending_plans: [],
+      checklist: {
+        materials_to_bring: [{ id: 'file-1', title: 'first.csv', sources: [{ record_id: before.id, source: before.source }] }],
+        existing_arrangements: [],
+        questions_for_doctor: [{ id: 'question-1', title: '复诊时需要带哪份原报告？', sources: [{ record_id: before.id, source: before.source }] }],
+      },
+    },
+  })
+  const materials = within(await screen.findByRole('region', { name: '要带的资料' }))
+  materials.getByText('查看来源（1 行）').closest('details')!.open = true
+  expect(materials.getByText(before.source)).toBeVisible()
+  expect(materials.getByText(/标本 A/)).toBeVisible()
+  expect(screen.getByText(/当前资料没有预约记录/)).toBeVisible()
+  fireEvent.click(screen.getByRole('button', { name: '确认保存资料包' }))
+  expect(onContinue).toHaveBeenCalledWith(api.followupActions.confirm, 3)
+})
+
+it('keeps saved legacy packages and their report comparison provenance readable', async () => {
   const corrected = { ...after, original: after.record, record: { ...after.record, method: before.record.method } }
-  const purchase: api.Evidence = {
-    id: 'purchase', source: 'purchase.csv · 第 2 行', original: null,
-    record: { ...before.record, kind: 'purchase', item: '示例药盒', note: '购药单备注' },
-  }
   renderCase({
-    records: [before, corrected, purchase], report_review: { comparable_pairs: 1, issues: [] },
+    ...uploaded, records: [before, corrected],
     draft: {
       comparisons: [{ item: '示例项目', earlier: before.id, later: after.id, delta: '-0.5', unit: 'U', reasons: [] }],
       issues: [], plans: [], pending_plans: [],
     },
-  })
-  const comparison = within(await screen.findByRole('region', { name: '报告对照' }))
-  expect(comparison.getByText('后次 − 前次 = -0.5 U')).toBeVisible()
-  expect(comparison.getByText(before.source)).toBeVisible()
-  expect(comparison.getByText(after.source)).toBeVisible()
-  expect(comparison.getByText('含人工修订。修订前 方法 方法 B')).toBeVisible()
-  expect(comparison.getAllByText('原报告参考范围 1–6')).toHaveLength(2)
-
-  const review = within(screen.getByRole('region', { name: '复诊准备清单' }))
-  const purchaseDetails = review.getByText('供复诊核对的日常与用药资料（1 条）').closest('details')!
-  purchaseDetails.open = true
-  expect(review.getByText('购药记录仅用于核对购买情况。当前使用情况需另行确认。')).toBeVisible()
-  expect(review.getByText(purchase.source)).toBeVisible()
+    saved: { saved_at: '2026-10-01', tasks: [] },
+  }, false)
+  const legacy = (await screen.findByText('查看旧版资料包')).closest('details')!
+  legacy.open = true
+  const compare = within(legacy).getByText('报告原值与比较依据').closest('details')!
+  compare.open = true
+  expect(within(compare).getByText('后次 − 前次 = -0.5 U')).toBeVisible()
+  expect(within(compare).getByText(after.source)).toBeVisible()
+  expect(within(compare).getByText('导入时的记录：方法 方法 B')).toBeVisible()
+  expect(within(compare).getAllByText('原报告参考范围 1–6')).toHaveLength(2)
+  expect(screen.getByText('已保存资料包')).toBeVisible()
+  expect(screen.queryByRole('button', { name: '确认保存资料包' })).not.toBeInTheDocument()
 })

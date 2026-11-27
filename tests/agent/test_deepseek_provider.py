@@ -51,7 +51,7 @@ async def test_deepseek_stream_preserves_utf8_split_across_network_chunks(monkey
         def post(self, *_args, **_kwargs):
             return Response()
 
-    monkeypatch.setattr("src.agent.providers.deepseek.aiohttp.ClientSession", Session)
+    monkeypatch.setattr("src.agent.providers.chat_completions.aiohttp.ClientSession", Session)
     provider = DeepSeekProvider(api_key="test")
     chunks = [chunk async for chunk in provider.stream([], [])]
     assert chunks[0].text == "中文"

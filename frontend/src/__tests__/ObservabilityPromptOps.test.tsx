@@ -174,6 +174,30 @@ describe('Observability and PromptOps product pages', () => {
     expect(tracePanel.getByRole('button', { name: '主 Agent 对话' })).toBeVisible()
   })
 
+  it('labels newly registered specialists from event payloads and span metadata', async () => {
+    const profile = { name: '档案核验', icon: 'search', tone: 'indigo', directory_tone: 'learning' }
+    const base = { started_at: new Date().toISOString(), status: 'COMPLETED' }
+    window.history.replaceState(null, '', '/#/observability?trace=trace_archive')
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => json(String(input).includes('/traces/trace_archive') ? {
+      ...base, id: 'trace_archive', operation_name: 'workspace.chat',
+      runs: [{ id: 'run-archive', trigger_type: 'api', agent_name: 'workspace-supervisor', status: base.status, spans: [
+        { id: 'route', kind: 'MODEL', operation_name: 'workspace.route.v9.012345abcdef', status: base.status },
+        { id: 'archive', kind: 'AGENT', operation_name: 'workspace.archive_review', status: base.status },
+        { id: 'ledger', kind: 'AGENT', operation_name: 'workspace.ledger_review', status: base.status,
+          metadata_json: JSON.stringify({ agent_profile: { ...profile, name: '账册核验', icon: 'book' } }) },
+      ] }],
+      events: [{ id: 'agent-start', event_type: 'agent.started', sequence: 1, occurred_at: base.started_at,
+        payload_json: JSON.stringify({ agent: 'archive_review', agent_profile: profile }) }],
+    } : [])))
+    render(<ObservabilityPage />)
+    expect(await screen.findByText('档案核验')).toBeVisible()
+    expect(screen.getByText('理解需求并分派专员')).toBeVisible()
+    expect(screen.getByText('账册核验').closest('.obs-call-header')?.querySelector('[data-icon="book"]')).toBeVisible()
+    fireEvent.click(screen.getByRole('tab', { name: '事件日志' }))
+    const events = within(screen.getByRole('list', { name: '运行事件' }))
+    expect(events.getByText('专员开始处理 · 档案核验')).toBeVisible()
+  })
+
   it('shows the real status and tool span, then links a Trace to its saved conversation', async () => {
     const trace = {
       id: 'trace_waiting', operation_name: 'workspace.chat', status: 'INTERRUPTED',
@@ -309,6 +333,7 @@ describe('Observability and PromptOps product pages', () => {
     vi.stubGlobal('fetch', requested)
     render(<ObservabilityPage />)
     expect(await screen.findByText('生成 SEO 周报')).toBeVisible()
+    expect(screen.getByText('此运行未记录模型')).toBeVisible()
     expect(requested).toHaveBeenCalledWith(expect.stringContaining('/trace-old?hide_maintenance=true'), expect.anything())
     fireEvent.click(screen.getByRole('button', { name: '返回列表' }))
     expect(window.location.hash).toBe('#/observability')
@@ -336,13 +361,16 @@ describe('Observability and PromptOps product pages', () => {
           { id: 'model-span', kind: 'MODEL', operation_name: 'model.iteration.1', status: 'COMPLETED' },
         ] }],
         tool_calls: [],
-        model_calls: [{ id: 'model', model: 'deepseek-v4-flash', operation: 'stream', status: 'COMPLETED' }],
+        model_calls: [{
+          id: 'model', provider: 'openai', model: 'openai-recorded-snapshot', operation: 'stream', status: 'COMPLETED',
+        }],
       })
       return json(new URL(url).pathname.endsWith('/traces') ? [trace] : [])
     }))
     render(<ObservabilityPage />)
     fireEvent.click(await screen.findByRole('button', { name: /资料问答/ }))
     expect(await screen.findByText('由模型直接生成资料答复，本次工具调用 0 次。')).toBeVisible()
+    expect(screen.getByText('OpenAI / openai-recorded-snapshot')).toBeVisible()
     expect(screen.getByText('生成资料答复')).toBeVisible()
     expect(screen.getByText('主 Agent')).toBeVisible()
     expect(screen.queryByText('model.iteration.1')).not.toBeInTheDocument()

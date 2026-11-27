@@ -45,7 +45,7 @@ class AgentRunObserver:
     def run_id(self) -> str | None:
         return self.run_scope.run_id if self.run_scope else None
 
-    async def start(self, run: AgentRun, provider: ModelProvider) -> None:
+    async def start(self, run: AgentRun, provider: ModelProvider | None) -> None:
         await self.client.startup()
         self._initial_sequence = run.sequence
         self.trace_scope = self.client.trace(
@@ -67,8 +67,8 @@ class AgentRunObserver:
             trigger_type="api",
             agent_name=self.agent_name,
             workflow_name=self.workflow_name,
-            model_provider=provider.provider_name,
-            model_name=provider.model_name,
+            model_provider=provider.provider_name if provider else None,
+            model_name=provider.model_name if provider else None,
             metadata={"application_run_id": run.id},
         )
         await self.run_scope.__aenter__()

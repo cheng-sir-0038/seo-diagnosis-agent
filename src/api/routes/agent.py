@@ -11,7 +11,8 @@ from pydantic import BaseModel, Field
 from src.agent.models import AgentEvent
 from src.agent.observability import AgentRunObserver
 from src.agent.providers.base import ModelProvider
-from src.agent.providers.deepseek import DeepSeekProvider
+from src.agent.providers.errors import ModelConfigurationError
+from src.agent.providers.factory import build_text_provider
 from src.agent.run_manager import run_manager
 from src.agent.runtime.executor import AgentExecutor
 from src.agent.tools.registry import build_default_registry
@@ -34,12 +35,8 @@ class CreateRunResponse(BaseModel):
 
 
 def build_model_provider() -> ModelProvider:
-    return DeepSeekProvider(
-        api_key=settings.deepseek_api_key,
-        base_url=settings.deepseek_base_url,
-        model=settings.deepseek_model,
-        timeout=settings.deepseek_request_timeout,
-    )
+    """Build the startup-selected text provider for the standalone Agent API."""
+    return build_text_provider(settings)
 
 
 async def _execute(
@@ -75,8 +72,8 @@ async def _execute(
 async def create_run(body: CreateRunRequest) -> CreateRunResponse:
     try:
         provider = build_model_provider()
-    except ValueError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ModelConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
     run = run_manager.create_run(body.messages)
     run.task = asyncio.create_task(
         _execute(run.id, provider, body.conversation_id),

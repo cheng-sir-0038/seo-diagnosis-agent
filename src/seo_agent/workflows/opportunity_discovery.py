@@ -10,6 +10,7 @@ from pydantic import Field
 from sqlalchemy import select
 
 from src.agent.observability import run_observed_tool
+from src.agent.providers.errors import ModelRequestError
 from src.agent.tools.base import ToolRuntimeContext
 from src.core.cache import CacheManager
 from src.core.config import settings
@@ -168,6 +169,8 @@ class OpportunityDiscoveryWorkflow:
                         business_object={"site_id": site["id"], "scan_run_id": scan_run_id},
                         model=model,
                     )
+                except ModelRequestError:
+                    raise
                 except ValueError as exc:
                     raise InternalProviderResponseError("机会模型没有返回有效结构化输出") from exc
                 except Exception as exc:

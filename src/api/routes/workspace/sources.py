@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from pydantic import SecretStr
 
 from src.api.routes.workspace.request_body import read_limited_body
-from src.core.config import Settings, settings
+from src.core.config import Settings, TextModelConfig, public_model_id, settings
 from src.core.source_settings import (
     SOURCES,
     SourceDefinition,
@@ -31,7 +31,24 @@ def _editable(field: str) -> bool:
     return not settings.is_production and not environment_manages(field)
 
 
+def _public_model(model: TextModelConfig | None) -> dict | None:
+    if model is None:
+        return None
+    return {"provider": model.provider, "model": model.model or None, "configured": model.configured}
+
+
 def _describe(source: SourceDefinition, saved: Settings, modes: dict[str, str]) -> dict:
+    model_metadata = {}
+    if source.id in {"agent_model", "openai", "deepseek"}:
+        if source.id == "agent_model":
+            current_model, next_model = settings.text_model(), saved.text_model()
+        else:
+            current_model = settings.text_model(source.id)
+            next_model = saved.text_model(source.id)
+        current, pending = _public_model(current_model), _public_model(next_model)
+        model_metadata["text_model"] = current
+        if pending != current:
+            model_metadata["pending_text_model"] = pending
     configured = all(
         bool(_value(settings, field.name)) for field in source.fields if field.required
     )
@@ -42,17 +59,24 @@ def _describe(source: SourceDefinition, saved: Settings, modes: dict[str, str]) 
         else "configured" if source.fields
         else "builtin"
     )
-    if source.id == "local_catalog":
+    if model_metadata:
+        current = model_metadata["text_model"]
+        mode = "configured" if current and current["configured"] else "unconfigured"
+    elif source.id == "local_catalog":
         mode = "builtin" if settings.taobao_tbk_local_catalog else "disabled"
     return {
         "id": source.id, "name": source.name, "group": source.group,
-        "description": source.description, "mode": mode,
-        "restart_required": any(
+        "description": source.description, "mode": mode, **model_metadata,
+        "restart_required": "pending_text_model" in model_metadata or any(
             _value(saved, field.name) != _value(settings, field.name) for field in source.fields
         ),
         "fields": [{
             "id": field.name, "label": field.label, "kind": field.kind, "required": field.required,
             "editable": _editable(field.name), "configured": bool(_value(saved, field.name)),
+            **({
+                "options": [{"value": value, "label": label} for value, label in field.choices],
+                "value": _value(saved, field.name),
+            } if field.choices else {}),
         } for field in source.fields],
     }
 
@@ -100,7 +124,12 @@ async def update_source(source_id: str, request: Request) -> JSONResponse:
                 or any(ord(char) < 32 for char in value)
             ):
                 raise HTTPException(422, "请提供单行配置值。")
-            changes[name] = value.strip()
+            value = value.strip()
+            if fields[name].choices and value not in dict(fields[name].choices):
+                raise HTTPException(422, "请选择自动、OpenAI 或 DeepSeek。")
+            if name in {"openai_model", "deepseek_model"} and not public_model_id(value):
+                raise HTTPException(422, "请输入有效的模型名称。")
+            changes[name] = value
     try:
         await asyncio.to_thread(save_source_settings, changes)
     except (OSError, ValueError):

@@ -18,7 +18,7 @@ const labels: Record<string, string> = {
   math_resource_lookup: '查询官方学习资料',
   ntce_written_exam_lookup: '核对教资笔试公告',
   followup_read_materials: '读取资料回执',
-  followup_prepare_materials: '核对报告并整理资料包',
+  followup_prepare_materials: '整理复诊前准备清单',
   followup_save_confirmed: '保存已确认资料和待办',
   travel_transport: '查询高铁与航班',
   travel_hotels: '查询酒店和参考价',
@@ -33,6 +33,10 @@ const labels: Record<string, string> = {
   seo_page_metadata: '读取网页内容',
   seo_page_performance: '检查网页性能',
   seo_search_metrics: '查询站点指标',
+  seo_search_history: '查询搜索趋势',
+  seo_audit_issues: '查询历史审计问题',
+  seo_site_profile: '查看站点档案',
+  seo_top_pages: '查询热门页面',
   seo_organic_keywords: '查询自然排名',
   seo_serp_overview: '核对搜索结果',
   seo_keyword_overview: '查询关键词指标',
@@ -90,7 +94,8 @@ const healthcareDescriptions: Record<string, string> = {
   postgraduate_admissions_search: '按院校、招生年份和专业检索目录，返回命中段落及官方出处。',
 }
 
-export const toolDescription = (id: string, description: string) => healthcareDescriptions[id] ?? description
+export const toolDescription = (id: string, description: string) =>
+  Object.hasOwn(healthcareDescriptions, id) ? healthcareDescriptions[id] : description
 
 export function toolResultLabel(tool: ToolRun): string {
   const result = unwrapToolResult(tool.result)

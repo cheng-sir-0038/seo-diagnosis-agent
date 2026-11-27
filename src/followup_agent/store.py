@@ -18,6 +18,7 @@ from src.followup_agent.materials import (
     RecordEdit,
     RecordKind,
     case_evidence,
+    is_open_plan,
     prepare_case,
     read_material,
     review_reports,
@@ -27,6 +28,11 @@ from src.seo_agent.db.models import FollowupCaseRow
 
 DEMO_SUBJECT = "DEMO-001"
 _EXAMPLES = Path(__file__).with_name("examples")
+_DEMO_FILES = (
+    ("合成门诊小结.csv", "initial.csv"),
+    ("合成预约单.csv", "appointment.csv"),
+    ("合成日常记录.csv", "daily-notes.csv"),
+)
 
 
 class CaseConflictError(ValueError):
@@ -34,6 +40,8 @@ class CaseConflictError(ValueError):
 
 
 class CaseData(BaseModel):
+    """Persist case data while retaining the shape of drafts and saves from earlier runs."""
+
     subject_id: str | None = None
     demo: bool = False
     revision: int = 0
@@ -42,15 +50,16 @@ class CaseData(BaseModel):
     saved: dict | None = None
 
     def view(self) -> dict:
-        evidence = case_evidence(self.files)
-        comparisons, issues = review_reports(evidence)
+        """Expose every imported source row without reshaping historical draft or save payloads."""
+        records = case_evidence(self.files, deduplicate=False)
+        comparisons, issues = review_reports(case_evidence(self.files))
         return {
             **self.model_dump(mode="json", exclude={"files"}),
             "files": [
                 {**file.model_dump(mode="json", exclude={"evidence"}), "rows": len(file.evidence)}
                 for file in self.files
             ],
-            "records": [entry.model_dump(mode="json") for entry in evidence],
+            "records": [entry.model_dump(mode="json") for entry in records],
             "report_review": {
                 "comparable_pairs": sum(row["delta"] is not None for row in comparisons),
                 "issues": issues,
@@ -72,24 +81,37 @@ class FollowupCaseStore:
         self.database = database
 
     async def create(self, run_id: str, key_hash: str, *, demo: bool) -> None:
+        """Seed demo files only on first creation so a resumed case keeps its stored inputs."""
         async with self.database.orm_session(write=True) as session:
             if await session.get(FollowupCaseRow, run_id) is not None:
                 return
-            case = CaseData(demo=demo)
-            if demo:
-                material = read_material(
-                    "合成首诊与日常记录.csv",
-                    (_EXAMPLES / "initial.csv").read_bytes(),
-                    DEMO_SUBJECT,
-                )
-                if material.error:
-                    raise RuntimeError("合成资料模板读取失败。")
-                case.subject_id = DEMO_SUBJECT
-                case.files = [material]
-                case.revision = 1
+            case = self._demo_case() if demo else CaseData()
             await session.execute(insert(FollowupCaseRow).values(
                 run_id=run_id, access_hash=key_hash, state=case.model_dump(mode="json"),
             ).on_conflict_do_nothing())
+
+    @staticmethod
+    def _demo_case() -> CaseData:
+        files = [
+            read_material(name, (_EXAMPLES / path).read_bytes(), DEMO_SUBJECT)
+            for name, path in _DEMO_FILES
+        ]
+        if any(file.error for file in files):
+            raise RuntimeError("合成资料模板读取失败。")
+        return CaseData(demo=True, subject_id=DEMO_SUBJECT, files=files, revision=1)
+
+    async def load_demo(self, run_id: str, key: str) -> dict:
+        """Load a repeatable demo into an empty case without mixing material sources."""
+        async with self.database.orm_session(write=True) as session:
+            row, case = await self._row(session, run_id, key=key, lock=True)
+            if case.demo:
+                return case.view()
+            if case.files or case.subject_id or case.saved:
+                raise CaseConflictError("请在空白复诊任务中载入合成样例。")
+            demo = self._demo_case()
+            demo.revision = case.revision + 1
+            row.state = demo.model_dump(mode="json")
+            return demo.view()
 
     async def _row(
         self, session: AsyncSession, run_id: str, *, key: str | None = None, lock: bool = False,
@@ -149,10 +171,8 @@ class FollowupCaseStore:
             row, case = await self._row(session, run_id, key=key, lock=True)
             if case.saved or revision != case.revision:
                 raise CaseConflictError("资料版本已变化，请刷新后重新核对。")
-            evidence = next(
-                (entry for entry in case_evidence(case.files) if entry.id == record_id),
-                None,
-            )
+            records = case_evidence(case.files, deduplicate=False)
+            evidence = next((entry for entry in records if entry.id == record_id), None)
             if evidence is None:
                 raise KeyError("记录不存在。")
             current = MedicalRecord.model_validate({
@@ -185,40 +205,55 @@ class FollowupCaseStore:
             }
 
     async def prepare(self, run_id: str) -> dict:
+        """Persist a checklist for the current inputs and return counts to the run trace."""
         async with self.database.orm_session(write=True) as session:
             row, case = await self._row(session, run_id, lock=True)
             if case.saved:
                 return {"already_saved": True, "revision": case.revision}
-            result = prepare_case(case_evidence(case.files))
+            if not any(file.evidence for file in case.files):
+                return {"no_materials": True, "revision": case.revision}
+            result = prepare_case(case.files)
             case.draft = {**result, "revision": case.revision}
             row.state = case.model_dump(mode="json")
             return {
                 "revision": case.revision,
                 "comparisons": len(result["comparisons"]),
                 "pending_plans": len(result["pending_plans"]),
+                **{section: len(items) for section, items in result["checklist"].items()},
             }
 
     async def confirm(self, run_id: str, revision: int) -> dict:
+        """Freeze the approved draft and its eligible explicit todos under the case lock."""
         async with self.database.orm_session(write=True) as session:
             row, case = await self._row(session, run_id, lock=True)
-            if case.draft is None or case.revision != revision:
-                return {"saved": False, "reason": "revision_changed"}
-            if case.saved is None:
-                evidence = {entry.id: entry for entry in case_evidence(case.files)}
-                tasks = []
-                for record_id in case.draft["pending_plans"]:
-                    entry = evidence[record_id]
-                    due = entry.record.due_date
-                    tasks.append({
-                        "id": uuid5(NAMESPACE_URL, f"{run_id}:{record_id}").hex,
-                        "title": entry.record.item,
-                        "due_date": due.isoformat() if due else None,
-                        "source": entry.source,
-                    })
-                case.saved = {
-                    "revision": revision,
-                    "saved_at": datetime.now(UTC).isoformat(),
-                    "tasks": tasks,
-                }
-                row.state = case.model_dump(mode="json")
-            return {"saved": True, "tasks": len(case.saved["tasks"])}
+            changed = {"saved": False, "reason": "revision_changed"}
+            if case.saved is not None:
+                if case.saved.get("revision", case.revision) != revision:
+                    return changed
+                return {"saved": True, "tasks": len(case.saved["tasks"])}
+            if (
+                case.draft is None or case.revision != revision
+                or case.draft.get("revision") != revision
+            ):
+                return changed
+
+            evidence = {entry.id: entry for entry in case_evidence(case.files, deduplicate=False)}
+            tasks = []
+            for record_id in dict.fromkeys(case.draft.get("pending_plans", [])):
+                entry = evidence.get(record_id)
+                if entry is None or not is_open_plan(entry.record):
+                    continue
+                due = entry.record.due_date
+                tasks.append({
+                    "id": uuid5(NAMESPACE_URL, f"{run_id}:{record_id}").hex,
+                    "title": entry.record.item,
+                    "due_date": due.isoformat() if due else None,
+                    "source": entry.source,
+                })
+            case.saved = {
+                "revision": revision,
+                "saved_at": datetime.now(UTC).isoformat(),
+                "tasks": tasks,
+            }
+            row.state = case.model_dump(mode="json")
+            return {"saved": True, "tasks": len(tasks)}

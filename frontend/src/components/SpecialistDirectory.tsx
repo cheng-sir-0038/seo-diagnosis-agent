@@ -4,57 +4,60 @@ import { createElement, useEffect, useState } from 'react'
 
 import { listWorkspaceTools } from '../services/agentApi'
 import bundledSkillCatalog from '../services/bundledSkillCatalog.json'
-import { specialists, type Specialist } from '../specialists'
+import { specialistPresentation, type Specialist } from '../specialists'
 import type { DirectorySkillUsage, SpecialistDirectoryData } from '../types/agent'
 import { PageHeader } from './PageHeader'
 import { toolDescription, toolIcon, toolLabel } from './toolLabels'
 
-const specialistTones = {
-  healthcare: 'health',
-  seo: 'seo',
-  learning: 'learning',
-  exam_prep: 'learning',
-  followup: 'health',
-  travel: 'travel',
-  shopping_procurement: 'procurement',
-} satisfies Record<Specialist, string>
-
-const commonPromptIds: Partial<Record<Specialist, string>> = {
-  healthcare: 'healthcare-instructions',
-  travel: 'travel-intake',
-  shopping_procurement: 'procurement-intake',
-}
-
 type DirectorySpecialist = SpecialistDirectoryData['specialists'][number]
 type DirectoryPrompt = NonNullable<DirectorySpecialist['default_prompts']>[number]
 type DirectoryTool = DirectorySpecialist['tools'][number]
-type SkillDetails = { name: string; label: string; summary: string; instruction: string; usage?: DirectorySkillUsage }
+type SkillDetails = { name: string; label: string; summary: string; instruction?: string; usage?: DirectorySkillUsage }
 type BundledSkill = Omit<SkillDetails, 'usage'> & {
   agent: string
+  instruction: string
   tools: string[]
   usage: Partial<Record<string, DirectorySkillUsage>>
 }
 
-const builtInSkills: BundledSkill[] = bundledSkillCatalog
+const builtInSkills: BundledSkill[] = bundledSkillCatalog.skills
 const usageFields = {
   scenario: '适用场景', inputs: '需要提供', rules: '处理规则', output: '交付结果',
 } satisfies Record<keyof DirectorySkillUsage, string>
 
-function readSkillDetails(specialist: DirectorySpecialist, tool: DirectoryTool, promptsById: ReadonlyMap<string, DirectoryPrompt>) {
-  const builtIns = builtInSkills.filter(entry => entry.agent === specialist.agent && entry.tools.includes(tool.name))
+function readSkillDetails(specialist: DirectorySpecialist, tool: DirectoryTool, promptsById: ReadonlyMap<string, DirectoryPrompt>): SkillDetails[] {
   const bindings = specialist.skills?.filter(skill => skill.tools.includes(tool.name)) ?? []
-  // Some older directories list working tools without any Skill binding (notably SEO).
-  const candidates = specialist.skills?.length || tool.skill_usage !== undefined ? bindings : builtIns
-  return candidates.flatMap(skill => {
-    const bundled = builtIns.find(entry => entry.name === skill.name)
-    const instruction = promptsById.get(skill.name)?.text ?? bundled?.instruction
-    if (!instruction) return []
-    return [{
-      name: skill.name, label: skill.label,
-      summary: skill.summary?.trim() || bundled?.summary || '', instruction,
-      usage: tool.skill_usage ?? bundled?.usage[tool.name],
-    }]
-  })
+  if (specialist.skill_catalog_version === 1) {
+    return bindings.map(skill => ({
+      name: skill.name, label: skill.label, summary: skill.summary ?? '',
+      instruction: promptsById.get(skill.name)?.text,
+      usage: skill.usage ? skill.usage[tool.name] : bindings.length === 1 ? tool.skill_usage ?? undefined : undefined,
+    }))
+  }
+  if (specialist.skill_catalog_version != null) return []
+
+  // Older payloads lack an explicit publication contract. Use approved bundled text
+  // for the exact specialist, tool and declared Skill, when a binding is present.
+  const hasBindings = Boolean(specialist.skills?.length) || tool.skill_usage != null
+  return builtInSkills.filter(entry => entry.agent === specialist.agent && entry.tools.includes(tool.name)
+    && (!hasBindings || bindings.some(skill => skill.name === entry.name)))
+    .map(({ name, label, summary, instruction, usage }) => ({
+      name, label, summary, instruction, usage: usage[tool.name],
+    }))
+}
+
+function readPublicPrompts(specialist: DirectorySpecialist, tool: DirectoryTool, promptsById: ReadonlyMap<string, DirectoryPrompt>) {
+  if (specialist.skill_catalog_version === 1) {
+    const skillIds = new Set(specialist.skills?.map(skill => skill.name))
+    return [...new Set(tool.public_prompt_ids)].flatMap(id => {
+      const prompt = promptsById.get(id)
+      return prompt && !skillIds.has(id) ? [prompt] : []
+    })
+  }
+  if (specialist.skill_catalog_version != null) return []
+  const promptIds = tool.public_prompt_ids ?? [...promptsById.keys()]
+  return bundledSkillCatalog.instructions.filter(prompt => prompt.agent === specialist.agent
+    && promptIds.includes(prompt.id) && (prompt.tools === null || prompt.tools.includes(tool.name)))
 }
 
 function SkillInstruction({ label, text, initiallyOpen, note }: {
@@ -83,12 +86,12 @@ function CapabilityRow({ tool, specialist, skills, promptsById }: {
   skills: SkillDetails[]
   promptsById: ReadonlyMap<string, DirectoryPrompt>
 }) {
-  const label = toolLabel(tool.name)
+  const description = toolDescription(tool.name, tool.description)
+  const knownLabel = toolLabel(tool.name)
+  const label = knownLabel === tool.name ? (description.trim() || knownLabel) : knownLabel
   const statusId = tool.availability_note ? `capability-status-${tool.name}` : undefined
-  const commonPromptId = commonPromptIds[specialist.agent]
-  const commonPrompt = commonPromptId ? promptsById.get(commonPromptId) : undefined
-  const coursePrompt = tool.name === 'seo_page_metadata' ? promptsById.get('seo-course-editor') : undefined
-  const hasSkillDetails = skills.length > 0 || Boolean(commonPrompt || coursePrompt)
+  const publicPrompts = readPublicPrompts(specialist, tool, promptsById)
+  const hasSkillDetails = skills.length > 0 || publicPrompts.length > 0
   const canExpand = hasSkillDetails || Boolean(tool.availability_note || tool.guidance || specialist.deterministic_path)
 
   const row = (
@@ -96,7 +99,7 @@ function CapabilityRow({ tool, specialist, skills, promptsById }: {
       <span className="workspace-row-icon">{createElement(toolIcon(tool.name), { 'aria-hidden': true })}</span>
       <span className="workspace-capability-copy">
         <strong>{label}</strong>
-        <span>{toolDescription(tool.name, tool.description)}</span>
+        {description !== label && <span>{description}</span>}
       </span>
       {statusId && <span id={statusId} className="workspace-capability-status">实时查询不可用</span>}
     </>
@@ -131,16 +134,15 @@ function CapabilityRow({ tool, specialist, skills, promptsById }: {
                         ))}
                       </dl>
                     ) : skill.summary && <p>{skill.summary}</p>}
-                    <SkillInstruction label="原始 Skill 指令" text={skill.instruction} initiallyOpen={!skill.usage} />
+                    {skill.instruction && (
+                      <SkillInstruction label="原始 Skill 指令" text={skill.instruction} initiallyOpen={!skill.usage} />
+                    )}
                   </div>
                 ))}
-                {commonPrompt && (
-                  <SkillInstruction label={commonPrompt.label} text={commonPrompt.text} initiallyOpen={!skills.length} />
-                )}
-                {coursePrompt && (
-                  <SkillInstruction label={coursePrompt.label} text={coursePrompt.text} initiallyOpen={!skills.length}
-                    note="仅在结合考纲核对课程页时使用。" />
-                )}
+                {publicPrompts.map(prompt => (
+                  <SkillInstruction key={prompt.id} label={prompt.label} text={prompt.text} initiallyOpen={!skills.length}
+                    note={specialist.agent === 'seo' && prompt.id === 'seo-course-editor' ? '仅在结合考纲核对课程页时使用。' : undefined} />
+                ))}
               </div>
             )}
           </div>
@@ -167,13 +169,14 @@ export default function SpecialistDirectory({ conversationId }: { conversationId
   }, [conversationId, attempt])
 
   const selected = directory?.specialists.find(({ agent }) => agent === activeAgent) ?? directory?.specialists[0]
+  const selectedProfile = specialistPresentation(selected?.agent, selected?.profile)
   const promptsById = new Map(selected?.default_prompts?.filter(prompt => prompt.text.trim()).map(prompt => [prompt.id, prompt]))
   const toolSkills = selected?.tools.map(tool => ({
     tool,
     skills: readSkillDetails(selected, tool, promptsById),
   })) ?? []
   const missingSkillDetails = toolSkills.some(({ tool, skills }) => (
-    !skills.length || selected?.skills?.some(skill => (
+    (selected?.skill_catalog_version === undefined && !skills.length) || selected?.skills?.some(skill => (
       skill.tools.includes(tool.name) && !skills.some(detail => detail.name === skill.name)
     ))
   ))
@@ -196,10 +199,10 @@ export default function SpecialistDirectory({ conversationId }: { conversationId
       {!error && directory && (selected ? (
         <>
           <div className="workbench-domains workspace-specialist-choices" role="group" aria-label="专员">
-            {directory.specialists.map(({ agent, tools }) => {
-              const { name, icon: Icon } = specialists[agent]
+            {directory.specialists.map(({ agent, profile, tools }) => {
+              const { name, icon: Icon, directoryTone } = specialistPresentation(agent, profile)
               return (
-                <button type="button" key={agent} className={`workbench-domain workbench-tone-${specialistTones[agent]}`}
+                <button type="button" key={agent} className={`workbench-domain workbench-tone-${directoryTone}`}
                   aria-pressed={agent === selected.agent} aria-controls="workspace-specialist-tools"
                   onClick={() => setActiveAgent(agent)}>
                   <span className="workbench-domain-title"><Icon aria-hidden="true" /><strong>{name}</strong></span>
@@ -209,9 +212,9 @@ export default function SpecialistDirectory({ conversationId }: { conversationId
             })}
           </div>
           <section key={selected.agent} id="workspace-specialist-tools"
-            className={`workbench-panel workspace-specialist-tools workbench-tone-${specialistTones[selected.agent]}`}
+            className={`workbench-panel workspace-specialist-tools workbench-tone-${selectedProfile.directoryTone}`}
             aria-labelledby="workspace-specialist-title">
-            <h2 id="workspace-specialist-title">{specialists[selected.agent].name}</h2>
+            <h2 id="workspace-specialist-title">{selectedProfile.name}</h2>
             {selected.note && <p className="workspace-resource-hint">{selected.note}</p>}
             {missingSkillDetails && (
               <div className="workspace-capability-version">

@@ -1,14 +1,4 @@
-subject_id,kind,record_date,item,value,unit,specimen,method,reference_range,flag,note,due_date,plan_status
-DEMO-001,visit_plan,2026-11-10,带上两次检查报告,,,,,,,"演示门诊记录中的安排",2026-11-27,unknown
-DEMO-001,visit_plan,2026-11-10,整理一周测量记录,,,,,,,"演示服务记录已确认收到",,documented_done
-DEMO-001,report,2026-11-10,空腹血糖,6.2,mmol/L,静脉血浆,己糖激酶法,3.9-6.1,原报告标记偏高,,,
-DEMO-001,report,2026-11-10,肌酐,80,μmol/L,血清,酶法,,,,,
-DEMO-001,self_report,2026-11-11,日常记录,,,,,,,"记录了当天测量时间",,
-DEMO-001,self_report,2026-11-12,日常记录,,,,,,,"测量前的条件未写明",,
-DEMO-001,self_report,2026-11-13,日常记录,,,,,,,"用户自述忘记记录一次",,
-DEMO-001,self_report,2026-11-14,日常记录,,,,,,,"记录了早餐后测量",,
-DEMO-001,self_report,2026-11-15,日常记录,,,,,,,"记录了测量时间",,
-DEMO-001,self_report,2026-11-16,日常记录,,,,,,,"用户自述尚未整理报告",,
-DEMO-001,self_report,2026-11-17,日常记录,,,,,,,"用户自述已整理自测清单",,
-DEMO-001,purchase,2026-11-15,演示药盒 A,,,,,,,"仅为购药单",,
-DEMO-001,medication_note,,演示药盒 A,,,,,,,"旧记录列出该品名，当前使用状态待确认",,
+subject_id,kind,record_date,item,note,due_date,plan_status
+DEMO-001,visit_summary,2026-11-19,上次门诊小结,小结注明上次门诊核对了本人带来的记录，并留存小结供下次复诊查阅。,,
+DEMO-001,visit_plan,2026-11-19,复诊时携带上次门诊小结,门诊小结内已有的复诊准备安排。,,unknown
+DEMO-001,visit_plan,2026-11-19,核对上次门诊记录,小结注明本项已在上次门诊完成。,,documented_done

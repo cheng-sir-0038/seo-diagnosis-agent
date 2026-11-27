@@ -10,7 +10,7 @@ import { PageHeader } from '../components/PageHeader'
 import { RawJsonResult } from '../components/renderers/RawJsonResult'
 import { toolIcon, toolLabel } from '../components/toolLabels'
 import { productApi, ProductRequestError } from '../services/productApi'
-import { isSpecialist, specialists } from '../specialists'
+import { isSpecialist, readSpecialistProfile, specialistPresentation, type SpecialistProfile } from '../specialists'
 import type { Conversation } from '../types/agent'
 import type { AgentIssue, MetricSummary, ModelCallRecord, ObservabilityEvent, ObservabilityOverview, ObservabilitySpan, ObservabilityTrace, ToolCallRecord } from '../types/product'
 import './observability.css'
@@ -111,6 +111,7 @@ const eventLabels: Record<string, string> = {
   'run.waiting_for_input': '等待用户补充',
   'stage.changed': '切换执行阶段',
   'agent.dispatched': '专员开始处理',
+  'agent.started': '专员开始处理',
   'agent.completed': '专员处理完成',
   'agent.failed': '专员处理失败',
   'skill.loaded': '加载技能',
@@ -181,6 +182,11 @@ function readJson(value?: string): unknown {
   } catch {
     return value
   }
+}
+
+function readJsonFields(value?: string): Record<string, unknown> {
+  const data = readJson(value)
+  return data && typeof data === 'object' && !Array.isArray(data) ? data as Record<string, unknown> : {}
 }
 
 function traceMetadata(trace: ObservabilityTrace) {
@@ -619,14 +625,20 @@ export function ObservabilityPage({ conversationForRun, onOpenConversation }: {
   )
 }
 
+function specialistOperationId(name: string) {
+  const id = /^(?:workspace\.|specialist:)(.+)$/.exec(name)?.[1]
+  return isSpecialist(id) ? id : undefined
+}
+
 function stepLabel(name: string, documentRun: boolean, fallback = '执行步骤') {
-  if (/^workspace\.route(?:\.v\d+)?$/.test(name)) return '理解需求并分派专员'
+  if (/^workspace\.route(?:\.v\d+(?:\.[0-9a-f]{12})?)?$/.test(name)) return '理解需求并分派专员'
   if (name === 'stream') return documentRun ? '生成资料答复' : '生成答复'
   const iteration = /^model\.iteration\.(\d+)$/.exec(name)
   if (iteration) return documentRun ? '生成资料答复' : `模型处理 · 第 ${iteration[1]} 轮`
-  const agent = /^(?:workspace\.|specialist:)(.+)$/.exec(name)?.[1]
-  if (isSpecialist(agent)) return `${specialists[agent].name}专员`
-  return Object.hasOwn(stepLabels, name) ? stepLabels[name] : fallback
+  if (Object.hasOwn(stepLabels, name)) return stepLabels[name]
+  if (Object.hasOwn(operationLabels, name)) return operationLabels[name]
+  const agent = specialistOperationId(name)
+  return agent ? `${specialistPresentation(agent).name}专员` : fallback
 }
 
 function toolTitle(name: string) {
@@ -634,17 +646,32 @@ function toolTitle(name: string) {
   return label === name ? '工具调用' : label
 }
 
-function spanTitle(span: ObservabilitySpan, documentRun: boolean) {
+function spanPresentation(span: ObservabilitySpan, documentRun: boolean, profiles: ReadonlyMap<string, SpecialistProfile>) {
   const name = span.operation_name
-  if (span.kind !== 'TOOL') return stepLabel(name, documentRun, span.kind === 'MODEL' ? '模型处理' : '执行步骤')
-  if (name.endsWith('.reused')) return stepLabel(name, documentRun, `复用结果 · ${toolTitle(name.slice(0, -'.reused'.length))}`)
-  return toolTitle(name)
+  if (span.kind === 'AGENT') {
+    const metadata = readJsonFields(span.metadata_json)
+    const agent = isSpecialist(metadata.agent) ? metadata.agent : specialistOperationId(name)
+    const profile = readSpecialistProfile(metadata.agent_profile) ?? (agent ? profiles.get(agent) : undefined)
+    if (profile || agent) {
+      const presentation = specialistPresentation(agent, profile)
+      return { title: profile?.name ?? stepLabel(name, documentRun, presentation.name), icon: presentation.icon }
+    }
+  }
+  if (span.kind === 'TOOL') {
+    const title = name.endsWith('.reused')
+      ? stepLabel(name, documentRun, `复用结果 · ${toolTitle(name.slice(0, -'.reused'.length))}`)
+      : toolTitle(name)
+    return { title, icon: toolIcon(name) }
+  }
+  const model = span.kind === 'MODEL'
+  return { title: stepLabel(name, documentRun, model ? '模型处理' : '执行步骤'), icon: model ? FileTextOutlined : ApartmentOutlined }
 }
 
-function SpanTree({ spans, callsBySpan, documentRun }: {
+function SpanTree({ spans, callsBySpan, documentRun, profiles }: {
   spans: ObservabilitySpan[]
   callsBySpan: ReadonlyMap<string, ToolCallRecord[]>
   documentRun: boolean
+  profiles: ReadonlyMap<string, SpecialistProfile>
 }) {
   const parents = new Set(spans.map(span => span.id))
   const groups = new Map<string | null, ObservabilitySpan[]>()
@@ -660,12 +687,11 @@ function SpanTree({ spans, callsBySpan, documentRun }: {
       <ul className="obs-tree">
         {nodes.map(span => {
           const calls = callsBySpan.get(span.id)
+          const presentation = spanPresentation(span, documentRun, profiles)
           return (
             <li key={span.id}>
               {calls ? calls.map(call => <ToolCallDetails key={call.id} call={call} />) : (
-                <CallHeader title={spanTitle(span, documentRun)}
-                  status={span.status} latency={span.duration_ms}
-                  icon={span.kind === 'MODEL' ? FileTextOutlined : span.kind === 'TOOL' ? toolIcon(span.operation_name) : ApartmentOutlined} />
+                <CallHeader {...presentation} status={span.status} latency={span.duration_ms} />
               )}
               {tree(span.id)}
             </li>
@@ -787,6 +813,13 @@ function PromptEvidence({ label, text }: { label: string, text: string }) {
   )
 }
 
+function recordedModelLabel(call: ModelCallRecord): string | undefined {
+  if (!call.model || call.model === 'unknown') return undefined
+  const provider = call.provider === 'openai' ? 'OpenAI'
+    : call.provider === 'deepseek' ? 'DeepSeek' : call.provider
+  return provider ? `${provider} / ${call.model}` : call.model
+}
+
 function TracePrompts({ calls, documentRun }: { calls?: ModelCallRecord[], documentRun: boolean }) {
   if (!calls?.length) return <p className="workbench-empty">暂无已记录的模型调用。</p>
   return (
@@ -797,7 +830,7 @@ function TracePrompts({ calls, documentRun }: { calls?: ModelCallRecord[], docum
         const title = stepLabel(key, documentRun, documentRun ? '生成资料答复' : '模型调用')
         return (
           <li key={call.id}>
-            <CallHeader title={title} identifier={call.model}
+            <CallHeader title={title} identifier={recordedModelLabel(call)}
               status={call.status} latency={call.latency_ms} icon={FileTextOutlined} />
             {(call.prompt_version || call.total_tokens != null) && (
               <div className="obs-call-meta">
@@ -823,10 +856,11 @@ function TracePrompts({ calls, documentRun }: { calls?: ModelCallRecord[], docum
   )
 }
 
-function TraceEvents({ events, spans, documentRun }: {
+function TraceEvents({ events, spans, documentRun, profiles }: {
   events?: ObservabilityEvent[]
   spans: ObservabilitySpan[]
   documentRun: boolean
+  profiles: ReadonlyMap<string, SpecialistProfile>
 }) {
   if (!events?.length) return <p className="workbench-empty">暂无事件日志。</p>
   const groups: ObservabilityEvent[][] = []
@@ -842,12 +876,13 @@ function TraceEvents({ events, spans, documentRun }: {
       {groups.map(group => {
         const event = group[0]
         const span = event.span_id ? bySpan.get(event.span_id) : undefined
-        const payload = readJson(event.payload_json)
-        const fields = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {}
+        const fields = readJsonFields(event.payload_json)
+        const participant = event.event_type.startsWith('agent.') && isSpecialist(fields.agent)
+          ? specialistPresentation(fields.agent, readSpecialistProfile(fields.agent_profile) ?? profiles.get(fields.agent))
+          : undefined
         const subject = event.event_type.startsWith('tool.') && typeof fields.name === 'string' ? toolTitle(fields.name)
-          : event.event_type.startsWith('agent.') && isSpecialist(fields.agent) ? specialists[fields.agent].name
-            : event.event_type.startsWith('span.') && span ? spanTitle(span, documentRun)
-              : event.event_type === 'skill.loaded' && typeof fields.label === 'string' ? fields.label : undefined
+          : participant?.name ?? (event.event_type.startsWith('span.') && span ? spanPresentation(span, documentRun, profiles).title
+            : event.event_type === 'skill.loaded' && typeof fields.label === 'string' ? fields.label : undefined)
         const label = event.event_type === 'tool.completed' && fields.reused === true ? '已复用工具结果'
           : Object.hasOwn(eventLabels, event.event_type) ? eventLabels[event.event_type] : '运行事件'
         const description = [label, subject, group.length > 1 ? `${group.length} 段` : undefined].filter(Boolean).join(' · ')
@@ -855,7 +890,7 @@ function TraceEvents({ events, spans, documentRun }: {
           ? JSON.stringify(group.map(({ sequence, payload_json }) => ({ sequence, payload: readJson(payload_json) })))
           : event.payload_json
         const Icon = event.event_type.startsWith('tool.') && typeof fields.name === 'string' ? toolIcon(fields.name)
-          : event.event_type.startsWith('message.') ? FileTextOutlined : ClockCircleOutlined
+          : participant?.icon ?? (event.event_type.startsWith('message.') ? FileTextOutlined : ClockCircleOutlined)
         return (
           <li key={event.id} data-severity={event.severity}>
             <JsonEvidence event value={details} identifier={event.event_type} label={<>
@@ -891,6 +926,13 @@ function TraceDetail({ response, activeTab, onTabChange, title, conversation, on
   const documentRun = trace.operation_name === 'workspace.documents'
   const runs = trace.runs ?? []
   const spans = runs.flatMap(run => run.spans ?? [])
+  const profiles = new Map<string, SpecialistProfile>()
+  for (const event of trace.events ?? []) {
+    if (!/^(?:agent\.|skill\.loaded$|tool\.)/.test(event.event_type)) continue
+    const { agent, agent_profile: value } = readJsonFields(event.payload_json)
+    const profile = readSpecialistProfile(value)
+    if (isSpecialist(agent) && profile) profiles.set(agent, profile)
+  }
   const spanIds = new Set(spans.map(span => span.id))
   const callsBySpan = new Map<string, ToolCallRecord[]>()
   const unlinkedCalls: ToolCallRecord[] = []
@@ -903,6 +945,7 @@ function TraceDetail({ response, activeTab, onTabChange, title, conversation, on
   }
   const hasToolSteps = spans.some(span => span.kind === 'TOOL')
   const toolCount = trace.tool_calls?.length ?? 0
+  const models = [...new Set(trace.model_calls?.flatMap(call => recordedModelLabel(call) ?? []) ?? [])]
 
   return (
     <div className="obs-detail-body">
@@ -915,6 +958,10 @@ function TraceDetail({ response, activeTab, onTabChange, title, conversation, on
         <div><dt>总耗时</dt><dd>{duration(trace.duration_ms)}</dd></div>
         <div><dt>工具明细</dt><dd>{counter.format(toolCount)} 条</dd></div>
         <div><dt>模型调用</dt><dd>{counter.format(trace.model_calls?.length ?? 0)} 次</dd></div>
+      </dl>
+      <dl className="obs-trace-models">
+        <dt>记录的模型</dt>
+        <dd>{models.length ? models.join('、') : '此运行未记录模型'}</dd>
       </dl>
       <div className="obs-trace-actions">
         {conversation && onOpenConversation && (
@@ -946,7 +993,7 @@ function TraceDetail({ response, activeTab, onTabChange, title, conversation, on
                     <strong>{stepLabel(run.agent_name ?? run.workflow_name ?? run.trigger_type, documentRun)}</strong>
                     <small>{duration(run.duration_ms)}</small>
                   </summary>
-                  <SpanTree spans={run.spans ?? []} callsBySpan={callsBySpan} documentRun={documentRun} />
+                  <SpanTree spans={run.spans ?? []} callsBySpan={callsBySpan} documentRun={documentRun} profiles={profiles} />
                 </details>
               ))}
               {unlinkedCalls.length > 0 && <TraceToolCalls calls={unlinkedCalls} />}
@@ -960,7 +1007,7 @@ function TraceDetail({ response, activeTab, onTabChange, title, conversation, on
         },
         { key: 'tools', label: '工具调用', children: <TraceToolCalls calls={trace.tool_calls} /> },
         { key: 'prompts', label: '提示词', children: <TracePrompts calls={trace.model_calls} documentRun={documentRun} /> },
-        { key: 'events', label: '事件日志', children: <TraceEvents events={trace.events} spans={spans} documentRun={documentRun} /> },
+        { key: 'events', label: '事件日志', children: <TraceEvents events={trace.events} spans={spans} documentRun={documentRun} profiles={profiles} /> },
         {
           key: 'io', label: '输入 / 输出', children: (
             <>

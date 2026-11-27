@@ -6,7 +6,7 @@ import { Button, Input, Segmented } from 'antd'
 import { lazy, Suspense, useEffect, useMemo, useState } from 'react'
 
 import { listWorkspaceTasks } from '../services/agentApi'
-import { specialists } from '../specialists'
+import { specialistPresentation } from '../specialists'
 import { conversationStatus, taskStatus } from '../state/taskStatus'
 import type { ChatMessage, Conversation, ToolRun, WorkspaceTaskRow } from '../types/agent'
 import { sanitizeAssistantContent } from './assistantContentSanitizer'
@@ -265,7 +265,7 @@ export function WorkspaceActivity({ conversations, onOpen, recent = false }: {
       return {
         ...row,
         status: row.status === 'COMPLETED' && (row.partial ?? reply?.partial) ? 'PARTIAL' : row.status,
-        agent: reply?.agentRuns?.[0]?.agent,
+        specialist: reply?.agentRuns?.[0],
       }
     })
   }, [response, scope])
@@ -281,11 +281,11 @@ export function WorkspaceActivity({ conversations, onOpen, recent = false }: {
       {visibleRows.length ? (
         <ul className="workbench-task-list">
           {visibleRows.map(row => {
-            const Icon = row.agent ? specialists[row.agent].icon : ProfileOutlined
+            const { icon: Icon, name } = specialistPresentation(row.specialist?.agent, row.specialist?.profile)
             return (
               <li key={row.id}>
                 <button type="button" onClick={() => onOpen(row.conversation_id, row.current_run_id ?? undefined, row.title)}>
-                  <span className="workspace-row-icon"><Icon aria-hidden="true" /></span>
+                  <span className="workspace-row-icon" title={row.specialist ? name : undefined}><Icon aria-hidden="true" /></span>
                   <strong title={row.title}>{row.title}</strong>
                   <time dateTime={row.updated_at}>{formatActivityTime(row.updated_at)}</time>
                   <TaskStatus status={row.status} showIcon={recent} />

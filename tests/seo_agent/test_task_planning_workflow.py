@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy import func, insert, select, update
 
+from src.agent.providers.errors import ModelRequestError
 from src.core.exceptions import InternalProviderRequestError, InternalProviderResponseError
 from src.seo_agent.approvals.service import ApprovalService
 from src.seo_agent.db.database import SeoAgentDatabase
@@ -310,6 +311,17 @@ async def test_planning_api_uses_real_services_and_sanitizes_model_errors(planni
         assert unavailable.status_code == 503 and "private model failure" not in unavailable.text
         assert await db.fetch_value(select(func.count()).select_from(tasks_table)) == 0
         model.fail = False
+
+        async def unavailable_model():
+            raise ModelRequestError("openai", 401)
+
+        model.before_return = unavailable_model
+        authentication_failure = await client.post("/seo-agent/tasks/plan", json=request.model_dump())
+        assert authentication_failure.status_code == 503
+        assert "身份验证" in authentication_failure.json()["detail"]
+        assert await db.fetch_value(select(func.count()).select_from(tasks_table)) == 0
+
+        model.before_return = None
         result = await client.post("/seo-agent/tasks/plan", json=request.model_dump())
         assert result.status_code == 200 and result.json()["task_id"]
         missing = await client.post(

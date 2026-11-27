@@ -18,6 +18,7 @@ from pydantic import SecretStr
 
 from src.agent.harness.store import AgentChatHarnessStore
 from src.agent.providers.base import ModelChunk, ModelProvider, ToolCall
+from src.agent.providers.errors import ModelConfigurationError
 from src.agent.run_manager import RunManager
 from src.agent.tools.base import ToolResult
 from src.agent.workspace.routing import is_bare_page_reply
@@ -27,6 +28,7 @@ from src.education_agent.practice import MathPractice, question_bank
 from src.education_agent.resources import LearningResources
 from src.education_agent.teacher_exam import TeacherWrittenExam
 from src.facade.data_facade import DataFacade
+from src.followup_agent.store import FollowupCaseStore
 from src.followup_agent.workflow import FollowupCommand
 from src.healthcare_agent.postgraduate import POSTGRADUATE_TOOL, seed_postgraduate_corpus
 from src.models.common import Capability
@@ -409,7 +411,9 @@ async def test_trip_weather_is_available_before_the_other_trip_details(workspace
     from src.travel_agent.tools import travel_tools
 
     calls = []
-    monkeypatch.setattr(chat, "_travel_registry", travel_tools)
+    from src.travel_agent import specialist as travel_specialist
+
+    monkeypatch.setattr(travel_specialist, "travel_tools", lambda **_: travel_tools())
     monkeypatch.setattr("src.travel_agent.workflow.china_today", lambda: date(2026, 11, 23))
 
     async def forecast(city, start, end):
@@ -598,124 +602,291 @@ async def test_trip_collects_conditions_rechecks_time_and_saves_once(workspace, 
         assert stored["snapshot"]["selected_plan_id"] == selected["selected_plan_id"]
 
 
+def followup_answer(events, command, revision=None):
+    waiting = payloads(events, "run.waiting_for_input")[-1]
+    body = {"request_id": waiting["request_id"], "answer": command}
+    if revision is not None:
+        body["followup_revision"] = revision
+    return body
+
+
+@pytest.mark.asyncio
+async def test_followup_loads_demo_into_the_existing_waiting_run_without_a_model(workspace, monkeypatch):
+    def unavailable_model():
+        raise ModelConfigurationError("synthetic missing configuration")
+
+    monkeypatch.setattr(chat, "build_conversation_model", unavailable_model)
+    async with workspace.serve() as api:
+        receipt, waiting = await ask(api, "我下周要复诊，帮我整理要带的资料、已有的预约安排和想问医生的问题。")
+        assert waiting[-1]["type"] == "run.waiting_for_input"
+        base = f"/api/v1/chat/runs/{receipt['run_id']}"
+        case_path = f"{base}/followup"
+        headers = {"X-Followup-Key": receipt["followup_key"]}
+        assert (await api.get(case_path, headers=headers)).json()["files"] == []
+        demo_path = f"{case_path}/demo-materials"
+        assert (await api.post(demo_path, headers={"X-Followup-Key": "wrong"})).status_code == 404
+        seeded = await api.post(demo_path, headers=headers)
+        seeded.raise_for_status()
+        case = seeded.json()
+        assert case["demo"] and case["draft"] is None and case["revision"] == 1
+        assert len(case["files"]) == 3
+        assert (await api.post(demo_path, headers=headers)).json() == case
+        ready = await api.post(
+            f"{base}/input", headers=headers, json=followup_answer(waiting, FollowupCommand.PREPARE),
+        )
+        ready.raise_for_status()
+        assert ready.json()["run_id"] == receipt["run_id"]
+        assert (await read_events(api, ready.json()))[-1]["type"] == "run.waiting_for_input"
+        assert (await api.get(case_path, headers=headers)).json()["draft"]["revision"] == 1
+
+
 @pytest.mark.asyncio
 async def test_followup_reads_one_subject_then_confirms_only_the_current_draft(workspace):
     async with workspace.serve() as api:
         receipt, first = await ask(api, "用合成资料演示复诊准备 marker_do_not_log")
         assert first[-1]["type"] == "run.waiting_for_input"
         assert payloads(first, "agent.dispatched")[0]["agent"] == "followup"
-        assert "按现有资料整理" in payloads(first, "message.completed")[-1]["content"]
+        assert "复诊前准备清单已生成" in payloads(first, "message.completed")[-1]["content"]
         headers = {"X-Followup-Key": receipt["followup_key"]}
         run_id = receipt["run_id"]
         base = f"/api/v1/chat/runs/{run_id}"
-        case_path = f"{base}/followup"
+        case_path, input_path = f"{base}/followup", f"{base}/input"
         assert (await api.get(case_path, headers={"X-Followup-Key": "wrong"})).status_code == 404
-        waiting = payloads(first, "run.waiting_for_input")[-1]
-        assert (await api.post(f"{base}/input", json={
-            "request_id": waiting["request_id"], "answer": FollowupCommand.CONFIRM,
-        })).status_code == 404
-        assert (await api.post(f"{base}/input", headers=headers, json={
-            "request_id": waiting["request_id"], "answer": "marker_unsolicited_clinical_note",
-        })).status_code == 422
-        upload = await api.post(
-            f"{case_path}/materials",
-            headers={**headers, "X-Followup-Subject": "DEMO-001", "X-Followup-File": "other.json"},
-            content=json.dumps([
+        initial = await api.get(case_path, headers=headers)
+        assert initial.headers["cache-control"] == "private, no-store"
+        case = initial.json()
+        assert case["saved"] is None and case["draft"]["comparisons"] == []
+        assert [item["name"] for item in case["files"]] == [
+            "合成门诊小结.csv", "合成预约单.csv", "合成日常记录.csv",
+        ]
+        checklist = case["draft"]["checklist"]
+        assert len(checklist["materials_to_bring"]) == 3
+        assert any(item["title"] == "复诊预约" for item in checklist["existing_arrangements"])
+        assert checklist["questions_for_doctor"]
+        assert len(case["draft"]["pending_plans"]) == 2
+
+        revision = case["draft"]["revision"]
+        confirm = followup_answer(first, FollowupCommand.CONFIRM, revision)
+        assert (await api.post(input_path, json=confirm)).status_code == 404
+        missing = followup_answer(first, FollowupCommand.CONFIRM)
+        assert (await api.post(input_path, headers=headers, json=missing)).status_code == 422
+        wrong = {**confirm, "followup_revision": revision + 1}
+        assert (await api.post(input_path, headers=headers, json=wrong)).status_code == 409
+        unsolicited = followup_answer(first, "marker_unsolicited_clinical_note")
+        assert (await api.post(input_path, headers=headers, json=unsolicited)).status_code == 422
+
+        upload_headers = {
+            **headers, "X-Followup-Subject": "DEMO-001", "X-Followup-File": "other.json",
+        }
+        rejected = await api.post(
+            f"{case_path}/materials", headers=upload_headers, content=json.dumps([
                 {"subject_id": "DEMO-001", "kind": "report", "item": "should_not_merge"},
                 {"subject_id": "DEMO-999", "kind": "report", "item": "marker_other_subject"},
             ]),
         )
-        upload.raise_for_status()
-        case = upload.json()
+        rejected.raise_for_status()
+        case = rejected.json()
+        assert case["draft"] is None
         assert case["files"][-1]["rows"] == 0
         assert "对象编号不一致" in case["files"][-1]["error"]
         assert all(row["record"]["item"] != "should_not_merge" for row in case["records"])
-        assert len(case["records"]) == 13
-        added = await api.post(f"{case_path}/demo-supplement", headers=headers)
-        added.raise_for_status()
-        again = await api.post(f"{case_path}/demo-supplement", headers=headers)
-        assert again.json() == added.json()
-        assert len(added.json()["records"]) == 15
 
-    async def respond(api, events, command):
-        waiting = payloads(events, "run.waiting_for_input")[-1]
-        body = {"request_id": waiting["request_id"], "answer": command}
-        response = await api.post(f"{base}/input", headers=headers, json=body)
-        response.raise_for_status()
-        return response.json(), body, await read_events(api, response.json())
+        report = {
+            "subject_id": "DEMO-001", "kind": "report", "item": "marker_private_measure",
+            "unit": "mmol/L", "specimen": "plasma", "method": "assay",
+        }
+        report_rows = json.dumps([
+            {**report, "record_date": "2026-11-10", "value": "6.2"},
+            {**report, "record_date": "2026-11-20", "value": "5.9"},
+            {**report, "record_date": "2026-11-24", "value": "5.8", "method": None},
+        ])
+        report_headers = {**upload_headers, "X-Followup-File": "marker_private_report.json"}
+        upload = await api.post(
+            f"{case_path}/materials", headers=report_headers, content=report_rows,
+        )
+        upload.raise_for_status()
+        imported = upload.json()
+        repeated_upload = await api.post(
+            f"{case_path}/materials", headers=report_headers, content=report_rows,
+        )
+        assert repeated_upload.json() == imported
 
     async with workspace.serve() as api:
-        resumed, _, events = await respond(api, first, FollowupCommand.PREPARE)
-        assert resumed["run_id"] == run_id
+        assert (await api.get(case_path, headers=headers)).json() == imported
+        stale = await api.post(input_path, headers=headers, json=confirm)
+        stale.raise_for_status()
+        assert stale.json()["run_id"] == run_id
+        refreshed = await read_events(api, stale.json())
+        assert refreshed[-1]["type"] == "run.waiting_for_input"
+        assert "资料已更新" in payloads(refreshed, "message.completed")[-1]["content"]
         case = (await api.get(case_path, headers=headers)).json()
-        assert case["saved"] is None
-        comparisons = {row["item"]: row for row in case["draft"]["comparisons"]}
-        assert comparisons["空腹血糖"]["delta"] == "-0.3"
-        assert comparisons["肌酐"]["delta"] is None
-        assert comparisons["肌酐"]["reasons"] == ["单位缺失或不同"]
-        # Repair a missing date while the prior version is waiting for confirmation.
-        entry = next(row for row in case["records"] if row["record"]["kind"] == "medication_note")
-        updated = await api.patch(
-            f"{case_path}/records/{entry['id']}", headers=headers,
-            json={"revision": case["revision"], "fields": {"record_date": "2026-11-16"}},
-        )
+        assert case["saved"] is None and case["draft"]["revision"] > revision
+        [comparison] = case["draft"]["comparisons"]
+        assert comparison["delta"] == "-0.3"
+        report_records = [row for row in case["records"] if row["record"]["kind"] == "report"]
+        assert comparison["earlier"] == report_records[0]["id"]
+        assert comparison["later"] == report_records[1]["id"]
+
+        entry = report_records[2]
+        edit = {"revision": case["revision"], "fields": {"method": "assay"}}
+        updated = await api.patch(f"{case_path}/records/{entry['id']}", headers=headers, json=edit)
         updated.raise_for_status()
         case = updated.json()
         corrected = next(row for row in case["records"] if row["id"] == entry["id"])
-        assert corrected["record"]["record_date"] == "2026-11-16"
-        assert corrected["original"]["record_date"] is None and case["draft"] is None
+        assert corrected["record"]["method"] == "assay"
+        assert corrected["source"] == entry["source"] and corrected["original"] == entry["record"]
+        assert case["draft"] is None
 
-        _, _, refreshed = await respond(api, events, FollowupCommand.CONFIRM)
-        assert refreshed[-1]["type"] == "run.waiting_for_input"
-        assert (await api.get(case_path, headers=headers)).json()["saved"] is None
-        _, confirmation, completed = await respond(api, refreshed, FollowupCommand.CONFIRM)
+        prepare = followup_answer(refreshed, FollowupCommand.PREPARE)
+        preparing = await api.post(input_path, headers=headers, json=prepare)
+        preparing.raise_for_status()
+        prepared = await read_events(api, preparing.json())
+        assert prepared[-1]["type"] == "run.waiting_for_input"
+        current = (await api.get(case_path, headers=headers)).json()["draft"]
+        [comparison] = current["comparisons"]
+        assert comparison["delta"] == "-0.1" and comparison["later"] == entry["id"]
+        confirmation = followup_answer(prepared, FollowupCommand.CONFIRM, current["revision"])
+        final = await api.post(input_path, headers=headers, json=confirmation)
+        final.raise_for_status()
+        assert final.json()["run_id"] == run_id
+        completed = await read_events(api, final.json())
         assert completed[-1]["type"] == "run.completed"
-        saved = (await api.get(case_path, headers=headers)).json()["saved"]
+        saved_case = (await api.get(case_path, headers=headers)).json()
+        saved = saved_case["saved"]
+        assert saved_case["draft"] == current and saved["revision"] == current["revision"]
         assert [(item["title"], item["due_date"]) for item in saved["tasks"]] == [
-            ("带上两次检查报告", "2026-11-27"),
+            ("复诊时携带上次门诊小结", None), ("复诊预约", "2026-12-03"),
         ]
-        assert "第 2 行" in saved["tasks"][0]["source"]
-        replay = await api.post(f"{base}/input", headers=headers, json=confirmation)
-        assert replay.json()["replayed"] is True
-        assert (await api.get(case_path, headers=headers)).json()["saved"] == saved
-        detail = (await api.get(base)).text
-        for private in (
-            "marker_do_not_log", "marker_other_subject", "marker_unsolicited_clinical_note",
-            "空腹血糖", "合成补充报告.csv", receipt["followup_key"],
-        ):
-            assert private not in detail
+        assert [task["source"] for task in saved["tasks"]] == [
+            "合成门诊小结.csv · 第 3 行", "合成预约单.csv · 第 2 行",
+        ]
         tools = payloads(completed, "tool.completed")
         assert {tool["name"] for tool in tools} == {
             "followup_read_materials", "followup_prepare_materials", "followup_save_confirmed",
         }
         assert {tool["agent_run_id"] for tool in tools} == {tools[0]["agent_run_id"]}
-    assert not workspace.models.planner_inputs
-    assert not workspace.models.specialist_inputs
+
+    async with workspace.serve() as api:
+        assert (await api.get(case_path, headers=headers)).json() == saved_case
+        replay = await api.post(input_path, headers=headers, json=confirmation)
+        assert replay.json()["replayed"] is True and replay.json()["run_id"] == run_id
+        altered = {**confirmation, "followup_revision": current["revision"] - 1}
+        assert (await api.post(input_path, headers=headers, json=altered)).status_code == 409
+        assert (await api.get(case_path, headers=headers)).json() == saved_case
+        detail = (await api.get(base)).text
+        observer = chat.observability_client
+        traces = [await observer.get_trace(row["id"]) for row in await observer.list_traces(identifier=run_id)]
+        assert traces and all(not trace.get("model_calls") for trace in traces)
+        persisted = json.dumps([first, refreshed, prepared, completed, traces], default=str)
+        for private in (
+            "marker_do_not_log", "marker_other_subject", "marker_unsolicited_clinical_note",
+            "marker_private_measure", "marker_private_report.json", receipt["followup_key"],
+        ):
+            assert private not in detail and private not in persisted
+    assert not workspace.models.planner_inputs and not workspace.models.specialist_inputs
 
 
 @pytest.mark.asyncio
-async def test_followup_import_can_retry_a_document_with_the_correct_subject(workspace):
+async def test_followup_one_usable_import_is_enough_after_an_unreadable_upload(workspace):
     async with workspace.serve() as api:
         receipt, events = await ask(api, "整理下次复诊的资料")
         assert events[-1]["type"] == "run.waiting_for_input"
         headers = {"X-Followup-Key": receipt["followup_key"], "X-Followup-File": "supplied.json"}
-        case = f"/api/v1/chat/runs/{receipt['run_id']}/followup"
+        base = f"/api/v1/chat/runs/{receipt['run_id']}"
+        case = f"{base}/followup"
+        initial = (await api.get(case, headers=headers)).json()
+        assert initial["draft"] is None and initial["files"] == []
+        assert "导入" in payloads(events, "run.waiting_for_input")[-1]["questions"][0]
         data = json.dumps([{
             "subject_id": "CASE-01", "kind": "report", "item": "Glucose", "value": 5.9,
         }])
         wrong = await api.post(
-            f"{case}/materials", content=data,
-            headers={**headers, "X-Followup-Subject": "CASE-02"},
+            f"{case}/materials", content=data, headers={**headers, "X-Followup-Subject": "CASE-02"},
         )
-        assert wrong.json()["subject_id"] is None
+        assert wrong.json()["subject_id"] is None and wrong.json()["draft"] is None
+        no_evidence = await api.post(
+            f"{base}/input", headers=headers, json=followup_answer(events, FollowupCommand.PREPARE),
+        )
+        no_evidence.raise_for_status()
+        events = await read_events(api, no_evidence.json())
+        assert events[-1]["type"] == "run.waiting_for_input"
+        assert (await api.get(case, headers=headers)).json()["draft"] is None
         corrected = await api.post(
             f"{case}/materials", content=data, headers={**headers, "X-Followup-Subject": "CASE-01"},
         )
         corrected.raise_for_status()
-        assert corrected.json()["subject_id"] == "CASE-01"
-        assert corrected.json()["records"][0]["record"]["value"] == "5.9"
-        assert len(corrected.json()["files"]) == 1
-        assert corrected.json()["files"][0]["error"] is None
+        stored = corrected.json()
+        assert stored["subject_id"] == "CASE-01" and len(stored["files"]) == 1
+        assert stored["records"][0]["record"]["value"] == "5.9"
+        assert stored["files"][0]["error"] is None
+
+        # The retired action still resumes a pre-existing client on the same request.
+        prepared = await api.post(
+            f"{base}/input", headers=headers,
+            json=followup_answer(events, FollowupCommand.USE_AVAILABLE),
+        )
+        prepared.raise_for_status()
+        prepared_events = await read_events(api, prepared.json())
+        assert prepared_events[-1]["type"] == "run.waiting_for_input"
+        assert prepared.json()["run_id"] == receipt["run_id"]
+        draft = (await api.get(case, headers=headers)).json()["draft"]
+        assert draft["comparisons"] == [] and draft["pending_plans"] == []
+        assert draft["checklist"]["existing_arrangements"] == []
+        [material] = draft["checklist"]["materials_to_bring"]
+        [source] = material["sources"]
+        assert source["record_id"] == stored["records"][0]["id"]
+        assert source["source"] == "supplied.json · 第 1 条"
+        confirmation = followup_answer(prepared_events, FollowupCommand.CONFIRM, draft["revision"])
+        done = await api.post(f"{base}/input", headers=headers, json=confirmation)
+        done.raise_for_status()
+        assert (await read_events(api, done.json()))[-1]["type"] == "run.completed"
+        assert (await api.get(case, headers=headers)).json()["saved"]["tasks"] == []
+    assert not workspace.models.planner_inputs and not workspace.models.specialist_inputs
+
+
+@pytest.mark.asyncio
+async def test_followup_resume_keeps_the_first_save_after_a_post_commit_failure(
+    workspace, monkeypatch,
+):
+    save = FollowupCaseStore.confirm
+    interrupted = False
+
+    async def interrupted_save(store, run_id, revision):
+        nonlocal interrupted
+        result = await save(store, run_id, revision)
+        if result["saved"] and not interrupted:
+            interrupted = True
+            raise ValueError("synthetic failure before the tool receipt")
+        return result
+
+    monkeypatch.setattr(FollowupCaseStore, "confirm", interrupted_save)
+    async with workspace.serve() as api:
+        receipt, events = await ask(api, "用合成资料演示复诊前准备清单")
+        headers = {"X-Followup-Key": receipt["followup_key"]}
+        base = f"/api/v1/chat/runs/{receipt['run_id']}"
+        case_path = f"{base}/followup"
+        draft = (await api.get(case_path, headers=headers)).json()["draft"]
+        body = followup_answer(events, FollowupCommand.CONFIRM, draft["revision"])
+        confirmed = await api.post(f"{base}/input", headers=headers, json=body)
+        confirmed.raise_for_status()
+        failed = await read_events(api, confirmed.json())
+        assert failed[-1]["type"] == "run.failed"
+        saved = (await api.get(case_path, headers=headers)).json()["saved"]
+        assert saved["revision"] == draft["revision"] and len(saved["tasks"]) == 2
+
+    def unavailable_model():
+        raise ModelConfigurationError("synthetic missing configuration after restart")
+
+    monkeypatch.setattr(chat, "build_conversation_model", unavailable_model)
+    async with workspace.serve() as api:
+        resume = await api.post(f"{base}/resume")
+        resume.raise_for_status()
+        assert resume.json()["run_id"] == receipt["run_id"]
+        completed = await read_events(api, confirmed.json())
+        assert completed[-1]["type"] == "run.completed"
+        assert (await api.get(case_path, headers=headers)).json()["saved"] == saved
+        replay = await api.post(f"{base}/input", headers=headers, json=body)
+        assert replay.json()["replayed"] is True
 
 
 @pytest.mark.asyncio

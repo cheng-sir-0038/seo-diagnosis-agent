@@ -312,8 +312,12 @@ export function ChatPage() {
   const inspectingTask = Boolean(inspectedRunId)
   const inspectingOtherRun = inspectingTask && inspectedRunId !== conversationRunId
   const readingHistory = Boolean(historyTarget)
-  // Selecting a receipt does not transfer ownership of the conversation's live connection.
-  const readOnly = readingHistory || inspectingOtherRun && (running || !!pendingSubmission || reconnecting)
+  const conversationReply = conversationRunId && replies.filter(message => message.runId === conversationRunId).at(-1)
+  const followupWaitingInConversation = Boolean(conversationReply && conversationReply.followupKey
+    && replyStatus(conversationReply) === 'waiting_for_input')
+  // Inspecting an earlier receipt must leave the current run and its input controls intact.
+  const readOnly = readingHistory || inspectingOtherRun
+    && (running || !!pendingSubmission || reconnecting || followupWaitingInConversation)
   const actionRunId = inspectedRunId ?? conversationRunId
   const storedTaskReply = actionRunId ? replies.filter(message => message.runId === actionRunId).at(-1)
     : running ? undefined : latestAssistant
@@ -725,7 +729,8 @@ export function ChatPage() {
     const isCurrent = mountedRef.current && activeIdRef.current === active.id
 
     if (detail && submitted && submitted.payload.answer === user.content
-      && (submitted.payload.action ?? 'answer') === submission.action) {
+      && (submitted.payload.action ?? 'answer') === submission.action
+      && (submitted.payload.followup_revision ?? undefined) === submission.followupRevision) {
       const turn = savedTurn(submission.runId, submitted.sequence, `${user.id}-reply`, prior)
       const state = readTurn(detail, turn)
       setActiveConversation(conversation => {
@@ -880,8 +885,8 @@ export function ChatPage() {
     selectConversation(conversation.id)
   }
 
-  const send = async (action: 'answer' | 'use_available' = 'answer', followupAction?: FollowupAction) => {
-    if (awaitingFollowup && !followupAction) return
+  const send = async (action: 'answer' | 'use_available' = 'answer', followupAction?: FollowupAction, followupRevision?: number) => {
+    if (awaitingFollowup !== Boolean(followupAction)) return
     const documents = canAttach ? draftDocuments : []
     const content = followupAction ?? (action === 'use_available'
       ? '请先用现有事实生成草稿，未确认的内容保留待补充，结束本轮追问。'
@@ -918,7 +923,7 @@ export function ChatPage() {
     const request = waitingRequest
     const previousRunId = taskReply?.runId
     const submission = request && previousRunId
-      ? { runId: previousRunId, requestId: request.requestId, messageId: userMessage.id, action }
+      ? { runId: previousRunId, requestId: request.requestId, messageId: userMessage.id, action, followupRevision }
       : undefined
     const prior = submission ? { priorAgentRuns: taskReply?.agentRuns, priorSkills: taskReply?.skills } : undefined
     if (submission) submittingInputs.current.add(active.id)
@@ -934,7 +939,9 @@ export function ChatPage() {
 
     try {
       const followupKey = request ? taskReply?.followupKey : undefined
-      const access: [string?] = followupKey ? [followupKey] : []
+      const access: [string?, number?] = followupKey
+        ? followupRevision === undefined ? [followupKey] : [followupKey, followupRevision]
+        : []
       const created = submission
         ? await submitAgentInput(submission.runId, submission.requestId, content, action, ...access)
         : await createAgentRun(history, active.id)
@@ -1037,17 +1044,18 @@ export function ChatPage() {
   const openHistoryConversation = (id: string, messageId?: string) => selectConversation(id, undefined, undefined, messageId)
   const returnToConversation = () => selectConversation(active.id)
   const returnToLive = (
-    <Button size="small" onClick={returnToConversation}>{running ? '返回当前任务' : '返回当前对话'}</Button>
+    <Button size="small" onClick={returnToConversation}>{running || followupWaitingInConversation ? '返回当前任务' : '返回当前对话'}</Button>
   )
 
-  const startNewTask = waitingRequest && !pendingSubmission && !reconnecting && (
+  const followupControlsOnly = awaitingFollowup && !pendingSubmission && !running && !connectionIssue && !failed
+  const startNewTask = waitingRequest && !awaitingFollowup && !pendingSubmission && !reconnecting && (
     <Button type="link" size="small" onClick={newConversation}>开始新任务</Button>
   )
   const composer = readOnly || taskUnavailable ? (
     <div className="chat-composer-wrap">
       <div className="workspace-receipt-notice">
         <span role="status">{readingHistory ? '正在查看历史搜索结果。'
-          : running || pendingSubmission || reconnecting ? '正在查看所选任务。返回当前对话可操作正在处理的任务。'
+          : running || pendingSubmission || reconnecting || followupWaitingInConversation ? '正在查看所选任务，可返回当前任务继续。'
             : lookupFailure === actionRunId || verified?.id === actionRunId ? '暂时无法读取所选任务。' : '正在读取所选任务…'}</span>
         {taskUnavailable && (lookupFailure === actionRunId || verified?.id === actionRunId) && <Button size="small" onClick={() => {
           setLookupFailure(undefined)
@@ -1056,11 +1064,7 @@ export function ChatPage() {
         {returnToLive}
       </div>
     </div>
-  ) : awaitingFollowup && !pendingSubmission && !running && !connectionIssue && !failed ? (
-    <div className="chat-composer-wrap">
-      <small>通过上方的复诊资料区继续本次整理。</small>{startNewTask}{inspectingOtherRun && returnToLive}
-    </div>
-  ) : (
+  ) : followupControlsOnly ? null : (
     <div className="chat-composer-wrap">
       {pendingSubmission && !running && (
         <Alert type="warning" showIcon title="暂时无法确认补充是否已保存"
@@ -1462,6 +1466,7 @@ export function ChatPage() {
                   </div>
                 </div>
                 <div className="chat-title-actions">
+                  {followupControlsOnly && inspectingOtherRun && returnToLive}
                   {(currentStatus !== 'idle' || creationError) && <span className={`workspace-state workspace-state-${statusTone}`}>{statusLabel}</span>}
                   {!showDetails && (
                     <Button
@@ -1532,9 +1537,10 @@ export function ChatPage() {
                             {item.runId && item.followupKey && followupPanels.get(item.runId) === item.id && (
                               <Suspense fallback={replyLoading}>
                                 <FollowupPanel
-                                  runId={item.runId} access={item.followupKey}
-                                  canContinue={item.id === taskReply?.id && awaitingFollowup && !pendingSubmission && !running && !readOnly}
-                                  onContinue={choice => void send('answer', choice)}
+                                  runId={item.runId} access={item.followupKey} requestId={item.inputRequest?.requestId}
+                                  canContinue={item.id === taskReply?.id && followupControlsOnly && !reconnecting}
+                                  submissionError={item.id === taskReply?.id && awaitingFollowup && documentError?.conversationId === active.id ? documentError.message : undefined}
+                                  onContinue={(choice, revision) => void send('answer', choice, revision)}
                                 />
                               </Suspense>
                             )}

@@ -69,8 +69,15 @@ async def add_material(
     return _response(await _case_result(store.add(run_id, key, subject_id, material)))
 
 
-@router.post("/demo-supplement")
+@router.post("/demo-materials")
+async def load_demo(run_id: str, key: CaseKey, store: CaseStore) -> JSONResponse:
+    """Load the synthetic visit materials into this empty follow-up run."""
+    return _response(await _case_result(store.load_demo(run_id, key)))
+
+
+@router.post("/demo-supplement", deprecated=True)
 async def supplement_demo(run_id: str, key: CaseKey, store: CaseStore) -> JSONResponse:
+    """Keep the original demo supplement available for older clients."""
     case = await _case_result(store.view(run_id, key))
     if not case["demo"]:
         raise HTTPException(409, "补充样例用于演示任务。")
@@ -84,10 +91,11 @@ class Correction(BaseModel):
     fields: RecordEdit
 
 
-@router.patch("/records/{record_id}")
+@router.patch("/records/{record_id}", deprecated=True)
 async def edit_record(
     run_id: str, record_id: str, body: Correction, key: CaseKey, store: CaseStore,
 ) -> JSONResponse:
+    """Support legacy clients and preserve the imported original of an edited row."""
     return _response(await _case_result(
         store.edit(run_id, key, record_id, body.revision, body.fields),
     ))

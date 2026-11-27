@@ -17,6 +17,7 @@ from src.agent.harness.summary import compact_model_context
 from src.agent.models import AgentEvent, AgentRun, HumanInputRequest, HumanInputState, RunStatus
 from src.agent.observability import AgentRunObserver
 from src.agent.providers.base import ModelProvider, ToolCall
+from src.agent.providers.errors import ModelRequestError
 from src.agent.tools.base import ToolResult, ToolRuntimeContext, resolve_render_hint
 from src.agent.tools.registry import ToolRegistry
 from src.observability.context import (
@@ -47,12 +48,12 @@ _SPECIALIST_FAILED = "agent.failed"
 _SPECIALIST_LIFECYCLE = frozenset({
     _SPECIALIST_DISPATCHED, _SPECIALIST_COMPLETED, _SPECIALIST_FAILED, "run.waiting_for_input",
 })
-_active_specialist: ContextVar[tuple[str, dict[str, str]] | None] = ContextVar(
+_active_specialist: ContextVar[tuple[str, dict[str, Any]] | None] = ContextVar(
     "active_specialist", default=None,
 )
 
 
-def _specialist_payload(run: AgentRun) -> dict[str, str]:
+def _specialist_payload(run: AgentRun) -> dict[str, Any]:
     scope = _active_specialist.get()
     return scope[1] if scope is not None and scope[0] == run.id else {}
 
@@ -60,7 +61,7 @@ def _specialist_payload(run: AgentRun) -> dict[str, str]:
 class AgentExecutor:
     def __init__(
         self,
-        provider: ModelProvider,
+        provider: ModelProvider | None,
         tools: ToolRegistry,
         *,
         max_iterations: int = 8,
@@ -165,7 +166,9 @@ class AgentExecutor:
         )
 
     @asynccontextmanager
-    async def specialist(self, run: AgentRun, agent: str, *, sender: str) -> AsyncIterator[str]:
+    async def specialist(
+        self, run: AgentRun, agent: str, *, sender: str, profile: dict[str, str] | None = None,
+    ) -> AsyncIterator[str]:
         """Attribute receipts to one specialist and reuse its unfinished ID on resume."""
         previous = next(
             (event for event in reversed(run.events)
@@ -178,7 +181,9 @@ class AgentExecutor:
             if previous is not None and previous.type != _SPECIALIST_COMPLETED
             else f"agent_{uuid.uuid4().hex}"
         )
-        payload = {"agent": agent, "agent_run_id": agent_run_id}
+        payload: dict[str, Any] = {"agent": agent, "agent_run_id": agent_run_id}
+        if profile:
+            payload["agent_profile"] = profile
         token = _active_specialist.set((run.id, payload))
         try:
             if previous is None or previous.type != _SPECIALIST_DISPATCHED:
@@ -300,6 +305,9 @@ class AgentExecutor:
             if evidence_answer and (answer := evidence_answer(run)) is not None:
                 await self._complete(run, messages, answer, iteration, tool_count)
                 return
+            provider = self.provider
+            if provider is None:
+                raise RuntimeError("此本地工作流未配置文本模型。")
             repeated_tool_guard = _has_reused_tool_result(run)
             budget_exhausted = iteration >= self.max_iterations - 1
             force_summary = budget_exhausted or repeated_tool_guard
@@ -367,7 +375,7 @@ class AgentExecutor:
                 self.observer.span(
                     f"model.iteration.{iteration + 1}",
                     kind=SpanKind.MODEL,
-                    component_name=self.provider.provider_name,
+                    component_name=provider.provider_name,
                     input_data={
                         "message_count": len(model_messages),
                         "full_message_count": len(messages),
@@ -381,12 +389,16 @@ class AgentExecutor:
 
             async def consume_model() -> None:
                 nonlocal finish_reason, first_token_ms
-                async for chunk in self.provider.stream(
+                run.model_provider = provider.provider_name
+                run.model_name = provider.model_name
+                async for chunk in provider.stream(
                     model_messages,
                     tool_schemas,
                     tool_choice=tool_choice,
                 ):
                     self._check_cancel(run)
+                    if chunk.model:
+                        run.model_name = chunk.model
                     if chunk.text:
                         if first_token_ms is None:
                             first_token_ms = round((time.perf_counter() - started) * 1000, 3)
@@ -406,12 +418,14 @@ class AgentExecutor:
                     try:
                         await consume_model()
                     except Exception as exc:
-                        error = exc if capture_content else RuntimeError("资料问答模型请求失败")
+                        error = exc if capture_content or isinstance(exc, ModelRequestError) else (
+                            RuntimeError("资料问答模型请求失败")
+                        )
                         await record_model_failure(
                             span, error,
-                            component=f"model.{self.provider.provider_name}",
-                            provider=self.provider.provider_name,
-                            model=self.provider.model_name or "unknown",
+                            component=f"model.{provider.provider_name}",
+                            provider=provider.provider_name,
+                            model=run.model_name or "unknown",
                             operation="stream",
                             latency_ms=round((time.perf_counter() - started) * 1000, 3),
                             time_to_first_token_ms=first_token_ms,
@@ -425,8 +439,8 @@ class AgentExecutor:
                             raise error from None
                         raise
                     await span.model_call(
-                        provider=self.provider.provider_name,
-                        model=self.provider.model_name or "unknown",
+                        provider=provider.provider_name,
+                        model=run.model_name or "unknown",
                         operation="stream",
                         **model_usage_fields({key: usage[key] for key in usage_keys}),
                         latency_ms=round((time.perf_counter() - started) * 1000, 3),

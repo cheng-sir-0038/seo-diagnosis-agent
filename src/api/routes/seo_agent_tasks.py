@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from src.agent.providers.errors import ModelConfigurationError, ModelRequestError
 from src.core.exceptions import InternalAdapterError
 from src.seo_agent.runtime import task_delivery_service, task_planning_workflow
 from src.seo_agent.tasks.models import TaskPrdContent
@@ -84,6 +85,8 @@ async def plan_task(body: TaskPlanningRequest) -> dict:
         return await task_planning_workflow.execute(body)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (ModelConfigurationError, ModelRequestError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
     except InternalAdapterError as exc:
         raise HTTPException(status_code=503, detail="任务规划所需模型暂不可用") from exc
     except ValueError as exc:

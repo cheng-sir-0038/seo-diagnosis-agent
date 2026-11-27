@@ -182,6 +182,7 @@
 .workbench-tone-learning { --domain-accent: #6740db; --domain-paper: #f0ebff; --domain-line: #e4dafd; }
 .workbench-tone-travel { --domain-accent: #3266ca; --domain-paper: #eaf2fd; --domain-line: #d8e6fa; }
 .workbench-tone-procurement { --domain-accent: #b74d36; --domain-paper: #fdf0eb; --domain-line: #f8e3db; }
+.workbench-tone-neutral { --domain-accent: var(--desk-muted); --domain-paper: var(--desk-paper); --domain-line: var(--desk-line); }
 .workbench-domain {
   display: grid;
   align-content: center;
@@ -892,7 +893,7 @@
 .workspace-specialist-choices { grid-template-columns: repeat(7, minmax(0, 1fr)); margin: 0 0 18px; }
 .workspace-specialist-choices .workbench-domain { min-height: 106px; padding: 13px; gap: 8px; }
 .workspace-specialist-choices .workbench-domain-title { gap: 7px; }
-.workspace-specialist-choices .workbench-domain-title strong { font-size: clamp(14px, 1.05vw, 17px); text-wrap: balance; }
+.workspace-specialist-choices .workbench-domain-title strong { font-size: clamp(14px, 1.05vw, 17px); text-wrap: balance; overflow-wrap: anywhere; }
 .workspace-specialist-choices .workbench-domain-title .anticon { flex: none; font-size: 22px; }
 .workspace-specialist-choices .workbench-domain[aria-pressed="true"] { border-color: var(--domain-accent); box-shadow: var(--workspace-shadow); }
 .workspace-specialist-tools {
@@ -1060,7 +1061,8 @@
   padding: 9px 0;
   border-bottom: 1px solid #edf0f8;
 }
-.workspace-source-copy { flex: 1 1 auto; }
+.workspace-source-copy { flex: 1 1 auto; overflow-wrap: anywhere; }
+.workspace-source-copy > .workspace-source-model { color: #263c61; font-weight: 650; }
 .workspace-source-group li > small { color: #536078; white-space: nowrap; }
 .workspace-source-form { display: grid; gap: 12px; margin: 10px 0; }
 .workspace-source-form label { display: grid; gap: 5px; }

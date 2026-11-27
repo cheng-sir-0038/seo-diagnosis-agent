@@ -33,6 +33,7 @@ SubjectCode = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_-]{1,40}$")
 class RecordKind(StrEnum):
     REPORT = "report"
     VISIT_PLAN = "visit_plan"
+    VISIT_SUMMARY = "visit_summary"
     SELF_REPORT = "self_report"
     PURCHASE = "purchase"
     MEDICATION_NOTE = "medication_note"
@@ -85,6 +86,30 @@ class Material(BaseModel):
     error: str | None = None
 
 
+class ChecklistSource(BaseModel):
+    record_id: str
+    source: str
+
+
+class ChecklistItem(BaseModel):
+    id: str
+    title: str
+    sources: list[ChecklistSource]
+    detail: str | None = None
+    gaps: list[str] | None = None
+
+
+class ExistingArrangement(ChecklistItem):
+    due_date: date | None = None
+    plan_status: PlanStatus | None = None
+
+
+class PreparationChecklist(BaseModel):
+    materials_to_bring: list[ChecklistItem]
+    existing_arrangements: list[ExistingArrangement]
+    questions_for_doctor: list[ChecklistItem]
+
+
 def _delimited(text: str, filename: str, *, delimiter: str, page: int | None = None) -> list:
     reader = csv.DictReader(StringIO(text), delimiter=delimiter, strict=True)
     columns = reader.fieldnames or []
@@ -128,6 +153,7 @@ def _rows(filename: str, data: bytes) -> list:
 
 
 def read_material(filename: str, data: bytes, subject_id: str) -> Material:
+    """Parse a local import, retaining row locations and rejecting mixed subjects."""
     filename = PurePosixPath(filename.replace("\\", "/")).name.strip()[:100] or "未命名资料"
     digest = hashlib.sha256(data).hexdigest()
     material = Material(name=filename, digest=digest, uploaded_at=datetime.now(UTC))
@@ -154,10 +180,14 @@ def read_material(filename: str, data: bytes, subject_id: str) -> Material:
     return material
 
 
-def case_evidence(files: list[Material]) -> list[Evidence]:
+def case_evidence(files: list[Material], *, deduplicate: bool = True) -> list[Evidence]:
+    """Return dated evidence in order, optionally retaining every imported source row."""
     seen = set()
     result = []
     for entry in chain.from_iterable(file.evidence for file in files):
+        if not deduplicate:
+            result.append(entry)
+            continue
         key = entry.record.model_dump_json()
         if key not in seen:
             result.append(entry)
@@ -277,21 +307,78 @@ def review_reports(evidence: list[Evidence]) -> tuple[list[dict], list[dict]]:
     return comparisons, issues
 
 
-def prepare_case(evidence: list[Evidence]) -> dict:
-    comparisons, issues = review_reports(evidence)
-    plans = []
+def is_open_plan(record: MedicalRecord) -> bool:
+    """Only explicitly imported arrangements without recorded completion can become todos."""
+    return record.kind == RecordKind.VISIT_PLAN and record.plan_status in {None, PlanStatus.UNKNOWN}
+
+
+def _sources(entries: list[Evidence]) -> list[ChecklistSource]:
+    return [ChecklistSource(record_id=entry.id, source=entry.source) for entry in entries]
+
+
+def _arrangement(entry: Evidence) -> ExistingArrangement:
+    row = entry.record
+    appointment = any(word in row.item.casefold() for word in ("预约", "挂号", "appointment"))
+    gaps = None
+    if appointment and row.due_date is None and is_open_plan(row):
+        gaps = ["资料未注明预约日期，如已有完整的预约单，可以补充。"]
+    return ExistingArrangement(
+        id=f"arrangement:{entry.id}", title=row.item, sources=_sources([entry]),
+        detail=row.note, due_date=row.due_date, plan_status=row.plan_status, gaps=gaps,
+    )
+
+
+_QUESTION_TEMPLATES = {
+    RecordKind.REPORT: "关于「{item}」的报告，复诊时需要一起核对哪些原始信息？",
+    RecordKind.VISIT_SUMMARY: "「{item}」中的哪些内容需要在这次复诊时向医生确认？",
+    RecordKind.SELF_REPORT: "这些「{item}」里，哪些记录需要在复诊时向医生说明？",
+    RecordKind.MEDICATION_NOTE: "记录里提到的「{item}」，复诊时如何核对这份用药记录？",
+    RecordKind.VISIT_PLAN: "就「{item}」这项已有安排，需要和医生核对哪些资料？",
+}
+
+
+def _questions(evidence: list[Evidence]) -> list[ChecklistItem]:
+    topics: dict[tuple[RecordKind, str], list[Evidence]] = defaultdict(list)
     for entry in evidence:
         row = entry.record
-        if row.kind != RecordKind.REPORT and row.record_date is None:
-            issues.append({"item": row.item, "source": entry.source, "text": "记录日期待核对"})
-        if row.kind == RecordKind.VISIT_PLAN:
-            plans.append(entry)
+        if row.kind in _QUESTION_TEMPLATES and (
+            row.kind != RecordKind.VISIT_PLAN or is_open_plan(row)
+        ):
+            topics[row.kind, row.item].append(entry)
+
+    questions = []
+    for (kind, item), entries in topics.items():
+        gaps = None
+        if kind == RecordKind.SELF_REPORT and any(
+            entry.record.record_date is None for entry in entries
+        ):
+            gaps = ["部分日常记录未注明日期，如需按时间说明，可补充带日期的记录。"]
+        questions.append(ChecklistItem(
+            id=f"question:{entries[0].id}", title=_QUESTION_TEMPLATES[kind].format(item=item),
+            sources=_sources(entries), gaps=gaps,
+        ))
+    return questions
+
+
+def prepare_case(files: list[Material]) -> dict:
+    """Build a local checklist from imported evidence and keep report comparisons as detail."""
+    evidence = case_evidence(files)
+    comparisons, issues = review_reports(evidence)
+    plans = [entry for entry in evidence if entry.record.kind == RecordKind.VISIT_PLAN]
+    checklist = PreparationChecklist(
+        materials_to_bring=[
+            ChecklistItem(
+                id=f"material:{file.digest}", title=file.name, sources=_sources(file.evidence),
+            )
+            for file in files if file.evidence
+        ],
+        existing_arrangements=[_arrangement(entry) for entry in plans],
+        questions_for_doctor=_questions(evidence),
+    )
     return {
+        "checklist": checklist.model_dump(mode="json", exclude_none=True),
         "comparisons": comparisons,
         "issues": issues,
-        "plans": [plan.id for plan in plans],
-        "pending_plans": [
-            plan.id for plan in plans
-            if plan.record.plan_status in {None, PlanStatus.UNKNOWN}
-        ],
+        "plans": [entry.id for entry in plans],
+        "pending_plans": [entry.id for entry in plans if is_open_plan(entry.record)],
     }

@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -23,6 +25,30 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from src.core.source_settings import read_source_settings
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"
+TextModelProvider = Literal["openai", "deepseek"]
+
+
+def public_model_id(value: object, api_key: str = "") -> str | None:
+    """Allow only model identifiers in public metadata, never an echoed credential."""
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,199}", value):
+        return None
+    if value.lower().startswith("sk-") or (api_key and api_key in value):
+        return None
+    return value
+
+
+@dataclass(frozen=True)
+class TextModelConfig:
+    provider: TextModelProvider
+    model: str
+    api_key: SecretStr
+    base_url: str
+    timeout: float
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.model and self.api_key.get_secret_value() and self.base_url)
 
 
 class Settings(BaseSettings):
@@ -145,13 +171,19 @@ class Settings(BaseSettings):
     taobao_tbk_adzone_id: str = ""
     taobao_tbk_local_catalog: bool = False
 
-    # ---- Agent 模型 ----
-    deepseek_api_key: str = ""
+    # ---- Agent / SEO 文本模型 ----
+    agent_model_provider: Literal["auto", "openai", "deepseek"] = "auto"
+    deepseek_api_key: str = Field(default="", repr=False)
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-v4-flash"
     deepseek_request_timeout: float = 60.0
-    geo_a2a_url: str = ""
     openai_api_key: SecretStr = SecretStr("")
+    openai_model: str = DEFAULT_OPENAI_MODEL
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_request_timeout: float = 60.0
+
+    # ---- 独立的 GEO 联网引用采样与分享图 ----
+    geo_a2a_url: str = ""
     geo_openai_model: str = "gpt-6.2-astra"
     cloudflare_account_id: str = ""
     cloudflare_api_token: SecretStr = SecretStr("")
@@ -215,6 +247,29 @@ class Settings(BaseSettings):
     # ============================================================
     # 衍生属性 / 便捷方法
     # ============================================================
+
+    def text_model(self, provider: TextModelProvider | None = None) -> TextModelConfig | None:
+        """Resolve the main text model from startup settings without any network check."""
+        openai_key = self.openai_api_key.get_secret_value().strip()
+        deepseek_key = self.deepseek_api_key.strip()
+        if provider is None:
+            if self.agent_model_provider != "auto":
+                provider = self.agent_model_provider
+            elif openai_key:
+                provider = "openai"
+            elif deepseek_key:
+                provider = "deepseek"
+            else:
+                return None
+        if provider == "openai":
+            return TextModelConfig(
+                provider, public_model_id(self.openai_model.strip(), openai_key) or "",
+                SecretStr(openai_key), self.openai_base_url.strip(), self.openai_request_timeout,
+            )
+        return TextModelConfig(
+            provider, public_model_id(self.deepseek_model.strip(), deepseek_key) or "",
+            SecretStr(deepseek_key), self.deepseek_base_url.strip(), self.deepseek_request_timeout,
+        )
 
     @property
     def is_production(self) -> bool:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
@@ -154,6 +155,8 @@ class AgentChatHarnessStore:
                 site_id=site_id,
                 conversation_id=conversation_id,
                 dispatch_state=dict(dispatch_state or {}),
+                model_provider=model_provider,
+                model_name=model_name,
             )
             await _write_checkpoint(
                 session,
@@ -284,8 +287,10 @@ class AgentChatHarnessStore:
             return run
 
     async def submit_input(
-        self, run_id: str, answer: HumanInputAnswer
+        self, run_id: str, answer: HumanInputAnswer,
+        *, validate_pending: Callable[[HumanInputState], None] | None = None,
     ) -> tuple[AgentRun, bool, int]:
+        """Claim input once and validate the pending request under the same run lock."""
         async with self.database.orm_session(write=True) as session:
             # Serialize the receipt check and checkpoint on the run, across processes.
             saved, task, thread_key = await _run_records(session, run_id, lock=True)
@@ -298,6 +303,7 @@ class AgentChatHarnessStore:
                     if (
                         event.payload.get("answer") != answer.answer
                         or event.payload.get("action", "answer") != answer.action
+                        or event.payload.get("followup_revision") != answer.followup_revision
                     ):
                         raise ValueError("这次补充已提交，不能用同一请求替换回答")
                     return run, True, event.sequence
@@ -308,10 +314,12 @@ class AgentChatHarnessStore:
                 raise ValueError("补充请求已经变化，请刷新后回答当前问题")
             if answer.action == "use_available" and not pending.allow_use_available:
                 raise ValueError("当前步骤必须补充必要信息，不能直接跳过")
+            if validate_pending is not None:
+                validate_pending(pending)
             pending.answer, pending.action = answer.answer, answer.action
             run.messages.append({"role": "user", "content": answer.answer})
             run.status = RunStatus.RECOVERING
-            event = run.emit("input.submitted", answer.model_dump(mode="json"))
+            event = run.emit("input.submitted", answer.model_dump(mode="json", exclude_none=True))
             await _write_event(session, saved, task, run, event)
             run.survival_summary = await _write_checkpoint(
                 session,
@@ -497,6 +505,7 @@ def _set_stage(
 ) -> None:
     saved.status = task.status = run.status.value.upper()
     saved.current_stage = task.current_stage = stage
+    saved.model_provider, saved.model_name = run.model_provider, run.model_name
     saved.token_usage_json = _dump(token_usage)
     task.status_group, task.updated_at = _status_group(saved.status), _now()
     task.survival_summary_json = _dump(summary)
@@ -746,6 +755,8 @@ def _restore_run(detail: dict[str, Any]) -> AgentRun:
         token_usage=checkpoint["token_usage"],
         survival_summary=checkpoint["survival_summary"],
         dispatch_state=checkpoint["dispatch_state"],
+        model_provider=detail.get("model_provider"),
+        model_name=detail.get("model_name"),
         finished_at=datetime.fromisoformat(detail["completed_at"])
         if detail["completed_at"]
         else None,

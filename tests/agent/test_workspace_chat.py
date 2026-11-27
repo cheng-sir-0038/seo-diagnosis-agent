@@ -144,11 +144,11 @@ def test_bundled_skill_details_match_the_approved_directory_text():
 
 @pytest.mark.asyncio
 async def test_tool_directory_lists_the_live_registries_without_running_tools(monkeypatch):
-    from src.procurement_agent.models import INTAKE_PROMPT
-    from src.travel_agent.intake import TRAVEL_INTAKE_PROMPT
+    from src.healthcare_agent import build_healthcare_registry
+    from src.travel_agent import specialist as travel_specialist
     from src.travel_agent.tools import travel_tools
 
-    monkeypatch.setattr(chat, "_travel_registry", travel_tools)
+    monkeypatch.setattr(travel_specialist, "travel_tools", lambda **_: travel_tools())
     pages = Pages()
     monkeypatch.setattr(chat, "facade", pages)
     monkeypatch.setattr(chat, "seo_chat_harness_store", SimpleNamespace(
@@ -171,7 +171,7 @@ async def test_tool_directory_lists_the_live_registries_without_running_tools(mo
         assert medical["agent"] == "healthcare"
         assert {s["name"] for s in medical["skills"]} >= {"medicare-catalogue", "pubmed-literature"}
         medical_names = {t["name"] for t in medical["tools"]}
-        assert medical_names == set(chat.build_healthcare_registry().names())
+        assert medical_names == set(build_healthcare_registry().names())
         assert search["agent"] == "seo" and search["tools"] == [] and search["note"]
         assert learning["agent"] == "learning"
         assert {t["name"] for t in learning["tools"]} == {
@@ -181,6 +181,12 @@ async def test_tool_directory_lists_the_live_registries_without_running_tools(mo
         assert exam["agent"] == "exam_prep"
         assert exam["tools"][0]["name"] == "ntce_written_exam_lookup"
         assert followup["agent"] == "followup"
+        assert followup["skills"][0]["label"] == "复诊前准备清单"
+        [followup_prompt] = followup["default_prompts"]
+        assert followup_prompt["id"] == followup["skills"][0]["name"]
+        assert all(section in followup_prompt["text"] for section in (
+            "要带的资料", "已有安排", "要问医生的问题",
+        ))
         assert {tool["name"] for tool in followup["tools"]} == {
             "followup_read_materials", "followup_prepare_materials", "followup_save_confirmed",
         }
@@ -202,13 +208,14 @@ async def test_tool_directory_lists_the_live_registries_without_running_tools(mo
         }
         for row in (learning, exam, followup):
             assert "无专员提示词" in row["deterministic_path"]
-            assert all("分派指令" in prompt["label"] for prompt in row["default_prompts"])
-        assert {p["id"]: p["text"] for p in travel["default_prompts"]}[
-            "travel-intake"
-        ] == TRAVEL_INTAKE_PROMPT
-        assert {p["id"]: p["text"] for p in procurement["default_prompts"]}[
-            "procurement-intake"
-        ] == INTAKE_PROMPT
+            assert all("技能指令" in prompt["label"] for prompt in row["default_prompts"])
+        travel_prompts = {prompt["id"]: prompt["text"] for prompt in travel["default_prompts"]}
+        assert "中国时区" in travel_prompts["travel-intake"]
+        assert "城市、日期" in travel_prompts["business-trip-planning"]
+        assert all("travel" not in text and "seo" not in text for text in travel_prompts.values())
+        procurement_prompts = {prompt["id"]: prompt["text"] for prompt in procurement["default_prompts"]}
+        assert "起订量" in procurement_prompts["procurement-intake"]
+        assert "shopping_procurement" not in "".join(procurement_prompts.values())
         assert len(travel["skills"]) == 1 and len(travel["skills"][0]["tools"]) == 6
         limits = {tool["name"]: tool["availability_note"] for tool in travel["tools"]}
         assert "未配置" in limits["travel_transport"] and "未配置" in limits["travel_hotels"]
@@ -247,14 +254,23 @@ async def test_tool_directory_lists_the_live_registries_without_running_tools(mo
         assert "private-" not in response.text
         from src.api.routes.workspace.directory import bundled_skill_catalog
 
+        bundled_skills = bundled_skill_catalog()["skills"]
         bundled_usage = {
             (entry["agent"], name): usage
-            for entry in bundled_skill_catalog()
+            for entry in bundled_skills
             for name, usage in entry["usage"].items()
         }
         for row in scoped["specialists"]:
+            assert row["skill_catalog_version"] == 1 and row["profile"]["name"]
             for tool in row["tools"]:
-                assert set(tool) == {"name", "description", "guidance", "availability_note", "skill_usage"}
+                assert set(tool) == {
+                    "name", "description", "guidance", "availability_note", "skill_usage", "public_prompt_ids",
+                }
+                if row["agent"] == "seo":
+                    assert row["skill_catalog_version"] == 1 and row["profile"]["name"] == "SEO / GEO"
+                    assert tool["public_prompt_ids"] == (
+                        ["seo-course-editor"] if tool["name"] == "seo_page_metadata" else []
+                    )
                 assert tool["skill_usage"] == bundled_usage[(row["agent"], tool["name"])]
                 assert all(tool["skill_usage"].values())
         registration = bundled_usage[("healthcare", "medical_exam_registration")]
@@ -267,12 +283,23 @@ async def test_tool_directory_lists_the_live_registries_without_running_tools(mo
             bound_tools = set()
             prompt_ids = {prompt["id"] for prompt in row["default_prompts"]}
             for skill in row["skills"]:
-                assert set(skill) == {"name", "label", "summary", "tools"}
+                assert set(skill) == {"name", "label", "summary", "tools", "usage"}
                 assert skill["summary"] and skill["tools"] and skill["name"] in prompt_ids
+                published = next(entry for entry in bundled_skills
+                                 if entry["agent"] == row["agent"] and entry["name"] == skill["name"])
+                assert skill["usage"] == {
+                    name: published["usage"][name] for name in skill["tools"] if name in published["usage"]
+                }
                 bound_tools.update(skill["tools"])
             assert bound_tools == {tool["name"] for tool in row["tools"]}
+            assert all(set(tool["public_prompt_ids"]) <= prompt_ids for tool in row["tools"])
             for prompt in row["default_prompts"]:
                 assert set(prompt) == {"id", "label", "text"} and prompt["text"]
+        medical_original = next(
+            prompt["text"] for prompt in medical["default_prompts"] if prompt["id"] == "medical-exam-registration"
+        )
+        assert "实践技能考试免考核对" in medical_original
+        assert "skills_retake" not in medical_original and "registration" not in medical_original
         invalid = await api.get("/api/v1/chat/tools?conversation_id=invalid-target")
         assert invalid.status_code == 200
         assert "private-target" not in invalid.text

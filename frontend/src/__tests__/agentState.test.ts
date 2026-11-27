@@ -56,13 +56,35 @@ describe('reduceAgentEvent', () => {
     expect(completed.tools[0].render_hint).toBeUndefined()
   })
 
-  it('tracks actual dispatches in order and ignores replayed events and unknown agents', () => {
+  it('accepts new specialist IDs in dispatch order and rejects reserved or malformed IDs', () => {
     const first = event(1, 'agent.dispatched', { agent: 'healthcare', agent_run_id: 'medical' })
     const second = event(2, 'agent.dispatched', { agent: 'seo', agent_run_id: 'page' })
-    const state = [first, second, second, event(3, 'agent.dispatched', { agent: 'unknown', agent_run_id: 'unknown' })]
-      .reduce(reduceAgentEvent, initialRunState)
-    expect(state.agentRuns.map(run => run.agent)).toEqual(['healthcare', 'seo'])
+    const state = [
+      first, second, second,
+      event(3, 'agent.dispatched', { agent: 'archive_review', agent_run_id: 'archive' }),
+      ...['supervisor', 'clarify', 'course_review', '__start__', 'Archive', 'a'.repeat(65)].map((agent, index) =>
+        event(4 + index, 'agent.dispatched', { agent, agent_run_id: agent })),
+    ].reduce(reduceAgentEvent, initialRunState)
+    expect(state.agentRuns.map(run => run.agent)).toEqual(['healthcare', 'seo', 'archive_review'])
     expect(reduceAgentEvent(state, event(0, 'run.reset', { status: 'pending' })).agentRuns).toEqual([])
+  })
+
+  it('attaches a late specialist profile and preserves it in continuation state', () => {
+    const archive = { agent: 'archive_review', agent_run_id: 'archive' }
+    const profile = { name: '档案核验', icon: 'search', tone: 'indigo', directory_tone: 'learning' }
+    const state = [
+      event(1, 'agent.started', archive),
+      event(2, 'skill.loaded', { ...archive, skill: 'archive-scan', label: '核对档案', agent_profile: profile }),
+      event(3, 'tool.completed', { ...archive, tool_call_id: 'read', name: 'archive_read' }),
+      event(4, 'agent.completed', { ...archive, agent_profile: { name: 1 } }),
+    ].reduce(reduceAgentEvent, initialRunState)
+    const [run] = state.agentRuns
+    expect(run).toMatchObject({ agent: archive.agent, profile, status: 'completed' })
+    expect(state.skills[0]).toMatchObject({ agentRunId: run.id, name: 'archive-scan' })
+    expect(state.tools[0]).toMatchObject({ agentRunId: run.id, agent: archive.agent })
+    const resumed = reduceAgentEvent(state, event(0, 'run.reset', { priorAgentRuns: [run], priorSkills: state.skills }))
+    expect(resumed.agentRuns).toEqual([run])
+    expect(resumed.skills).toEqual(state.skills)
   })
 
   it('attributes interleaved calls by dispatch ID, including identical tool call IDs', () => {

@@ -8,6 +8,8 @@ from typing import Any, Protocol
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from src.agent.models import AgentRun
+from src.agent.providers.errors import ModelRequestError
 from src.observability.client import ObservabilityClient
 from src.observability.instrumentation import (
     model_usage_fields,
@@ -57,14 +59,18 @@ class StructuredModelRunner:
         business_object: dict[str, Any],
         model: StructuredModel | None = None,
         method: str | None = None,
+        application_run: AgentRun | None = None,
+        prompt_definition: dict[str, Any] | None = None,
     ) -> StructuredBusinessResult:
         prompt = (
             await self.prompt_registry.resolve_version(
                 prompt_key, environment=self.prompt_environment
             )
             if self.prompt_registry
-            else builtin_prompt(prompt_key)
+            else builtin_prompt(prompt_key, prompt_definition)
         )
+        if prompt_definition is not None and prompt["output_schema_data"] != prompt_definition["output_schema"]:
+            raise ValueError("工作台分派提示的输出约定与已登记专员不一致。请检查部署的提示词版本。")
         system = prompt["system_template"]
         if method == "json_mode":
             system += "\n仅输出符合以下 JSON Schema 的 JSON 对象，不要输出解释或 Markdown：\n"
@@ -84,6 +90,8 @@ class StructuredModelRunner:
             or getattr(model, "model", None)
             or model.__class__.__name__
         )
+        if application_run is not None:
+            application_run.model_provider, application_run.model_name = provider, name
         details = {
             "provider": provider,
             "model": name,
@@ -107,6 +115,10 @@ class StructuredModelRunner:
             invocation = None
             try:
                 invocation = await invoke_structured_model(model, schema, messages, method=method)
+                if invocation.model_name:
+                    details["model"] = invocation.model_name
+                    if application_run is not None:
+                        application_run.model_name = invocation.model_name
                 if invocation.parsing_error is not None:
                     raise invocation.parsing_error
                 validated = schema.model_validate(invocation.parsed)
@@ -114,7 +126,7 @@ class StructuredModelRunner:
                 if span is not None:
                     output = (
                         {"response": invocation.raw, "parsed": invocation.parsed}
-                        if invocation else {}
+                        if invocation and not isinstance(exc, ModelRequestError) else {}
                     )
                     span.output_data = output
                     await record_model_failure(

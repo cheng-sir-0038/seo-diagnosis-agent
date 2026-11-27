@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from src.agent.providers.errors import ModelConfigurationError, ModelRequestError
 from src.core.exceptions import InternalAdapterError
 from src.seo_agent.opportunities.models import OpportunityCandidate
 from src.seo_agent.opportunities.service import OpportunityRequestConflictError
@@ -61,11 +62,12 @@ async def discover_opportunities(run_id: str, body: OpportunityDiscoveryRequest)
         return await opportunity_discovery_workflow.execute(run_id, body)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (ModelConfigurationError, ModelRequestError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
     except InternalAdapterError as exc:
         raise HTTPException(status_code=503, detail="机会生成所需模型或数据源暂不可用") from exc
     except ValueError as exc:
-        code = 503 if "DEEPSEEK_API_KEY" in str(exc) else 400
-        raise HTTPException(status_code=code, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/opportunities/ingest", status_code=201)

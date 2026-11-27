@@ -1,0 +1,4 @@
+subject_id,kind,record_date,item,note
+DEMO-001,self_report,2026-11-22,日常记录,自述起床时间比平日晚一小时。
+DEMO-001,self_report,2026-11-23,日常记录,自述午后散步时觉得比平时容易累。
+DEMO-001,self_report,,日常记录,另有一条关于睡眠时长的记录，未写日期。

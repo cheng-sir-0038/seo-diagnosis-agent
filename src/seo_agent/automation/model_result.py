@@ -3,11 +3,32 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from openai import APIConnectionError, APIStatusError, APITimeoutError
+from pydantic import SecretStr
+
+from src.agent.providers.errors import ModelRequestError
+from src.core.config import public_model_id
+
 
 def model_provider_name(model: Any) -> str:
-    if getattr(model, "_llm_type", None) == "chat-deepseek":
-        return "deepseek"
-    return str(getattr(model, "provider_name", model.__class__.__name__)).lower()
+    match getattr(model, "_llm_type", None):
+        case "chat-deepseek":
+            return "deepseek"
+        case "openai-chat":
+            return "openai"
+        case _:
+            return str(getattr(model, "provider_name", model.__class__.__name__)).lower()
+
+
+def _request_error(provider: str, error: Exception) -> ModelRequestError:
+    if isinstance(error, APIStatusError):
+        reason = "insufficient_quota" if error.code == "insufficient_quota" else "unavailable"
+        return ModelRequestError(provider, error.status_code, reason=reason)
+    if isinstance(error, (APITimeoutError, TimeoutError)):
+        return ModelRequestError(provider, reason="timeout")
+    if isinstance(error, APIConnectionError):
+        return ModelRequestError(provider)
+    return ModelRequestError(provider, reason="invalid_response")
 
 
 @dataclass(slots=True)
@@ -17,6 +38,7 @@ class StructuredInvocationResult:
     parsing_error: BaseException | None = None
     usage: dict[str, int] = field(default_factory=dict)
     finish_reason: str | None = None
+    model_name: str | None = None
 
 
 async def invoke_structured_model(
@@ -32,34 +54,54 @@ async def invoke_structured_model(
     简单 Fake 或兼容实现若直接返回解析值，也可以继续使用。
     """
 
+    provider = model_provider_name(model)
+    known_provider = provider in {"openai", "deepseek"}
+    if provider == "openai" and method is None:
+        method = "function_calling"
     try:
-        runnable = model.with_structured_output(
-            schema, include_raw=True, **({"method": method} if method else {})
-        )
-    except TypeError:
-        runnable = model.with_structured_output(schema)
-    result = await runnable.ainvoke(messages)
-    if (
-        isinstance(result, dict)
-        and "parsed" in result
-        and ("raw" in result or "parsing_error" in result)
-    ):
-        raw = result.get("raw")
-        parsed = result.get("parsed")
-        parsing_error = result.get("parsing_error")
-        if parsed is None and parsing_error is None:
+        try:
+            runnable = model.with_structured_output(
+                schema, include_raw=True, **({"method": method} if method else {})
+            )
+        except TypeError:
+            if known_provider:
+                raise
+            runnable = model.with_structured_output(schema)
+        result = await runnable.ainvoke(messages)
+        if (
+            isinstance(result, dict)
+            and "parsed" in result
+            and ("raw" in result or "parsing_error" in result)
+        ):
+            raw = result.get("raw")
+            parsed = result.get("parsed")
+            parsing_error = result.get("parsing_error")
+        else:
+            raw, parsed, parsing_error = None, result, None
+        if known_provider and (parsing_error is not None or parsed is None):
+            parsing_error = ModelRequestError(provider, reason="invalid_response")
+        elif parsed is None and parsing_error is None:
             parsing_error = ValueError("模型未返回可解析的结构化结果")
-    else:
-        raw = None
-        parsed = result
-        parsing_error = None
-    return StructuredInvocationResult(
-        parsed=parsed,
-        raw=raw,
-        parsing_error=parsing_error,
-        usage=_extract_usage(raw),
-        finish_reason=_extract_finish_reason(raw),
-    )
+        return StructuredInvocationResult(
+            parsed=parsed,
+            raw=raw,
+            parsing_error=parsing_error,
+            usage=_extract_usage(raw),
+            finish_reason=_extract_finish_reason(raw),
+            model_name=_extract_model_name(raw, model),
+        )
+    except Exception as error:
+        if known_provider:
+            raise _request_error(provider, error) from None
+        raise
+
+
+def _extract_model_name(raw: Any, model: Any) -> str | None:
+    metadata = getattr(raw, "response_metadata", None) or {}
+    key = getattr(model, "openai_api_key", None) or getattr(model, "api_key", None)
+    if isinstance(key, SecretStr):
+        key = key.get_secret_value()
+    return public_model_id(metadata.get("model_name"), key if isinstance(key, str) else "")
 
 
 def _extract_usage(raw: Any) -> dict[str, int]:
@@ -98,4 +140,6 @@ def _extract_finish_reason(raw: Any) -> str | None:
         return None
     metadata = dict(getattr(raw, "response_metadata", None) or {})
     reason = metadata.get("finish_reason")
-    return str(reason) if reason is not None else None
+    if reason in ("stop", "length", "tool_calls", "content_filter", "insufficient_system_resource"):
+        return reason
+    return None
